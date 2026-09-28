@@ -89,6 +89,8 @@ class ChannelRouter:
         agent = self.handlers.find_by_channel(channel, external_id)
         if not agent:
             return {"agent_id": None, "reply": "This number is not linked to a KenyaBidder agent. Link it from the web app first."}
+        if self.handlers.owner_suspended(agent):
+            return {"agent_id": agent["agent_id"], "reply": "This account is suspended. Please contact support."}
         agent["durable_memory"]["last_channel"] = channel
         return {"agent_id": agent["agent_id"], "reply": await self.converse(agent, channel, text)}
 
@@ -148,23 +150,38 @@ async def handle_whatsapp_webhook(router: ChannelRouter, raw_body: bytes, signat
         allow_unsigned = os.environ.get("KENYABIDDER_INSECURE_WEBHOOK") == "1"
     if secret:
         expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-        if not signature or not hmac.compare_digest(signature, expected):
+        if not signature or not hmac.compare_digest(signature.encode(), expected.encode()):  # bytes: a non-ASCII header must be a 403, not a crash
             raise AppError("BAD_SIGNATURE", "invalid webhook signature", 403)
     elif not allow_unsigned:
         raise AppError("WEBHOOK_NOT_CONFIGURED", "set WHATSAPP_APP_SECRET to accept WhatsApp webhooks", 403)
     try:
         body = json.loads(raw_body)
-        msg = body["entry"][0]["changes"][0]["value"]["messages"][0]
-        sender, text = msg["from"], msg["text"]["body"]
-    except (KeyError, IndexError, TypeError, ValueError):
-        try:
-            body = json.loads(raw_body)
-            sender, text = body.get("from"), body.get("text")
-        except (ValueError, AttributeError):
-            raise AppError("INVALID_JSON", "body is not valid JSON", 400) from None
-    if not sender or not isinstance(text, str):
+    except ValueError:
+        raise AppError("INVALID_JSON", "body is not valid JSON", 400) from None
+    messages = _whatsapp_messages(body)
+    if not messages:
         return {"ok": True, "ignored": True}
-    out = await router.handle_inbound("WHATSAPP", str(sender), text)
-    if out["agent_id"]:
-        router.whatsapp.send_nowait(str(sender), out["reply"])
-    return {"ok": True, "reply": out["reply"]}
+    reply = None
+    for sender, text in messages:  # Meta batches deliveries: EVERY message must run (an 'approve' may not be the first)
+        out = await router.handle_inbound("WHATSAPP", str(sender), text)
+        reply = out["reply"]
+        if out["agent_id"]:
+            router.whatsapp.send_nowait(str(sender), out["reply"])
+    return {"ok": True, "handled": len(messages), "reply": reply}
+
+
+def _whatsapp_messages(body) -> list[tuple[str, str]]:
+    """(sender, text) pairs from a Cloud API payload (all entries / changes / messages) or the simple {from, text} dev shape."""
+    out: list[tuple[str, str]] = []
+    try:
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                for m in change.get("value", {}).get("messages", []):
+                    text = (m.get("text") or {}).get("body")
+                    if m.get("from") and isinstance(text, str):
+                        out.append((m["from"], text))
+    except (AttributeError, TypeError):
+        return []
+    if not out and isinstance(body, dict) and body.get("from") and isinstance(body.get("text"), str):
+        out.append((body["from"], body["text"]))
+    return out

@@ -67,6 +67,15 @@ class BillingService:
         self.store.settings["token_policy"] = policy
         self.log_admin(admin, "set_token_policy", policy=policy)
 
+    def set_limits(self, admin: dict | None, *, signup_grants_per_day: int | None = None, max_llm_decisions_per_hour: int | None = None) -> None:
+        wanted = {k: v for k, v in (("signup_grants_per_day", signup_grants_per_day), ("max_llm_decisions_per_hour", max_llm_decisions_per_hour)) if v is not None}
+        for key, v in wanted.items():  # validate ALL before writing ANY
+            if not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100_000):
+                raise bad("INVALID_LIMIT", f"{key} must be a whole number from 0 to 100,000 (0 = unlimited)")
+        if wanted:
+            self.store.settings.update(wanted)
+            self.log_admin(admin, "set_limits", **wanted)
+
     def manual_instructions(self) -> str:
         return self.store.settings.get("manual_payment_instructions", "")
 
@@ -155,7 +164,12 @@ class BillingService:
     def grant_signup_tokens(self, user: dict) -> list[dict]:
         """Free trial tokens, once per *phone number* (so re-registering does not farm grants). Idempotent."""
         phone = normalize_phone(user.get("phone"))
-        if not phone:
+        if not phone or not self.signup_grants():
+            return []
+        if self.db.has_signup_grant(user["id"]):  # one free trial per ACCOUNT (changing the phone number must not earn another)…
+            return []
+        budget = self.store.settings.get("signup_grants_per_day", 100)  # …and phones are unverified, so bound what fake sign-ups can extract
+        if budget and self.db.signup_grants_since(self.clock.now() - 24 * 3600_000) >= budget:
             return []
         out = []
         for llm_id, tokens in self.signup_grants().items():
@@ -274,13 +288,13 @@ class BillingService:
 
     def submit_receipt(self, user: dict, order_id: str, receipt: str) -> dict:
         o = self.owned_order(user["id"], order_id)
-        if o["provider"] != "manual" or o["status"] != "PENDING":
+        if o["provider"] != "manual" or o["status"] not in ("PENDING", "EXPIRED"):  # a slow customer who paid the Till is still credited
             raise bad("INVALID_STATE", "this order is not waiting for a payment code")
         code = re.sub(r"\s", "", receipt or "").upper()
         if not RECEIPT_RE.match(code):
             raise bad("INVALID_RECEIPT", "enter the M-Pesa confirmation code from your SMS (8–14 letters and digits, e.g. SGH7X2K9LP)")
         try:
-            ok = self._set_status(order_id, ("PENDING",), "AWAITING_REVIEW", receipt=code)
+            ok = self._set_status(order_id, ("PENDING", "EXPIRED"), "AWAITING_REVIEW", receipt=code)
         except sqlite3.IntegrityError:
             raise conflict("DUPLICATE_RECEIPT", "that payment code has already been submitted") from None
         if not ok:
@@ -357,7 +371,7 @@ class BillingService:
         an attacker who forged it (or replayed it) cannot mint tokens: only Safaricom's authenticated answer can."""
         if not self.mpesa:
             raise AppError("MPESA_DISABLED", "M-Pesa is not configured", 503)
-        if not hmac.compare_digest(str(secret), self.mpesa.cfg.callback_secret):
+        if not hmac.compare_digest(str(secret).encode(), self.mpesa.cfg.callback_secret.encode()):
             raise forbidden("BAD_CALLBACK_SECRET", "invalid callback path")
         ack = {"ResultCode": 0, "ResultDesc": "Accepted"}
         try:
@@ -385,7 +399,8 @@ class BillingService:
                 self._set_status(o["id"], ("PENDING", "EXPIRED", "CANCELLED"), "AWAITING_REVIEW", note="M-Pesa confirmed payment but the receipt code is already used")
                 return self.get_order(o["id"])
         if q["state"] == "FAILED":
-            self._set_status(o["id"], ("PENDING",), "FAILED", note=(q["desc"] or "payment was not completed")[:200])
+            # final answer from Safaricom: also retire EXPIRED/CANCELLED orders so reconcile() stops re-querying them
+            self._set_status(o["id"], ("PENDING", "EXPIRED", "CANCELLED"), "FAILED", note=(q["desc"] or "payment was not completed")[:200])
         return self.get_order(o["id"])
 
     async def check_order(self, user: dict, order_id: str) -> dict:
@@ -412,10 +427,15 @@ class BillingService:
                 continue
         return settled
 
+    MANUAL_ORDER_TTL_MS = 7 * 24 * 3600_000
+
     def expire_stale(self) -> int:
+        """STK prompts lapse after 30 min. Manual orders wait a week: people pay the Till first and type the code later."""
+        now = self.clock.now()
         with self.db.tx() as c:
-            return c.execute("UPDATE orders SET status='EXPIRED', updated_at=? WHERE status='PENDING' AND created_at<?",
-                             (self.clock.now(), self.clock.now() - self.ORDER_TTL_MS)).rowcount
+            return c.execute("UPDATE orders SET status='EXPIRED', updated_at=? WHERE status='PENDING' AND "
+                             "((provider!='manual' AND created_at<?) OR (provider='manual' AND created_at<?))",
+                             (now, now - self.ORDER_TTL_MS, now - self.MANUAL_ORDER_TTL_MS)).rowcount
 
     # ------------------------------------------------------------------ reporting
 

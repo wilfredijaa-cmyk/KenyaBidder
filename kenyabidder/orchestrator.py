@@ -90,7 +90,8 @@ class Orchestrator:
         now = self.clock.now()
         if now - self._blocked_notified.get(agent["agent_id"], -10**18) >= 6 * 3600_000:  # one nudge per 6h, not one per auction
             self._blocked_notified[agent["agent_id"]] = now
-            hint = "Top up in Wallet and it will pick up the open auctions automatically." if code == "NO_TOKENS" else "It resumes when its 24-hour window frees up."
+            hint = {"NO_TOKENS": "Top up in Wallet and it will pick up the open auctions automatically.",
+                    "RATE_LIMITED": "It resumes automatically when its hourly decision allowance frees up."}.get(code, "It resumes when its 24-hour window frees up.")
             self.notify(agent["agent_id"], "no_tokens", f"Your agent is waiting — {reason}. {hint}", auction_id=a["auction_id"])
 
     def prefilter(self, agent: dict, a: dict, *, spec: bool = True) -> str | None:

@@ -57,6 +57,12 @@ class InsufficientTokens(AppError):
         self.llm_name, self.needed, self.available = llm_name, needed, available
 
 
+class AgentRateLimited(AppError):
+    def __init__(self, decisions: int, limit: int):
+        super().__init__("RATE_LIMITED", f"this agent already made {decisions} LLM decisions in the last hour (limit {limit}) — pausing to protect your tokens", 429)
+        self.decisions, self.limit = decisions, limit
+
+
 class AgentTokenCap(AppError):
     def __init__(self, used: int, cap: int):
         super().__init__("TOKEN_CAP", f"this agent reached its daily token cap ({used:,} of {cap:,} used in the last 24h)", 429)
@@ -213,6 +219,15 @@ class WalletDB:
                                      "WHERE user_id=? AND kind='USAGE' AND at>=? GROUP BY agent_id, llm_id ORDER BY used DESC", (user_id, since_ms)).fetchall()
         return [dict(r) for r in rows]
 
+    def has_signup_grant(self, user_id: str) -> bool:
+        with self._lock:
+            return self.conn.execute("SELECT 1 FROM ledger WHERE user_id=? AND kind='GRANT' AND ref LIKE 'signup:%' LIMIT 1", (user_id,)).fetchone() is not None
+
+    def signup_grants_since(self, since_ms: int) -> int:
+        """How many distinct signup grants were issued recently (the platform-wide free-trial budget)."""
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(DISTINCT user_id) FROM ledger WHERE kind='GRANT' AND ref LIKE 'signup:%' AND at>=?", (since_ms,)).fetchone()[0]
+
     def recent_usage_avg(self, agent_id: str, n: int = 20) -> int | None:
         with self._lock:
             rows = self.conn.execute("SELECT used FROM ledger WHERE agent_id=? AND kind='USAGE' AND used>0 ORDER BY seq DESC LIMIT ?", (agent_id, n)).fetchall()
@@ -270,6 +285,25 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 3 + 1
 
 
+class Decision:
+    """One LLM decision (possibly several provider calls). Spends hourly allowance on its first successful reservation."""
+
+    def __init__(self, meter: "TokenMeter", agent_id: str):
+        self.meter, self.agent_id, self.committed, self.closed = meter, agent_id, False, False
+
+    def commit(self) -> None:
+        if not self.committed and not self.closed:
+            self.committed = True
+            self.meter._inflight[self.agent_id] = max(0, self.meter._inflight.get(self.agent_id, 0) - 1)
+            self.meter._decisions.setdefault(self.agent_id, []).append(self.meter.clock.now())
+
+    def finish(self) -> None:
+        if not self.closed:
+            self.closed = True
+            if not self.committed:
+                self.meter._inflight[self.agent_id] = max(0, self.meter._inflight.get(self.agent_id, 0) - 1)
+
+
 class Reservation:
     """A hold on some of a user's tokens for one in-flight provider call."""
 
@@ -302,6 +336,8 @@ class TokenMeter:
         self.notify = notify or (lambda *a, **k: None)
         self._holds: dict[tuple[str, str], int] = {}
         self._low_notified: dict[tuple[str, str], int] = {}
+        self._decisions: dict[str, list[int]] = {}
+        self._inflight: dict[str, int] = {}
 
     # ----- policy / config -----
 
@@ -347,8 +383,26 @@ class TokenMeter:
             self._holds[(user_id, llm_id)] = self._holds.get((user_id, llm_id), 0) + hold
         return Reservation(self, user_id, llm_id, hold if metered else 0, agent_id, metered)
 
-    def wrap(self, provider, entry: dict, agent: dict, purpose: str = "decision") -> "MeteredProvider":
-        return MeteredProvider(provider, self, entry, agent["principal_user_id"], agent["agent_id"], purpose)
+    def decisions_last_hour(self, agent_id: str) -> int:
+        """Decisions that reached the LLM in the last hour, plus those currently in flight."""
+        now = self.clock.now()
+        w = [t for t in self._decisions.get(agent_id, []) if now - t < 3600_000]
+        self._decisions[agent_id] = w
+        return len(w) + self._inflight.get(agent_id, 0)
+
+    def begin_decision(self, agent_id: str) -> "Decision":
+        """Call ONCE per LLM decision, before any provider call. In-flight decisions are counted immediately (so a burst of
+        concurrent listings cannot slip past), but a decision only *spends* allowance when it actually reaches the LLM — being
+        blocked for lack of tokens must not burn the hourly budget. Always call ``finish()`` on the returned Decision."""
+        limit = self.store.settings.get("max_llm_decisions_per_hour", 60)
+        n = self.decisions_last_hour(agent_id)
+        if limit and n >= limit:
+            raise AgentRateLimited(n, limit)
+        self._inflight[agent_id] = self._inflight.get(agent_id, 0) + 1
+        return Decision(self, agent_id)
+
+    def wrap(self, provider, entry: dict, agent: dict, purpose: str = "decision", decision: "Decision | None" = None) -> "MeteredProvider":
+        return MeteredProvider(provider, self, entry, agent["principal_user_id"], agent["agent_id"], purpose, decision)
 
     # ----- status (for UI and pre-checks) -----
 
@@ -382,7 +436,9 @@ class TokenMeter:
         cap = agent["config"].get("max_tokens_per_day")
         used24 = self.db.used_since(agent["agent_id"], self.clock.now() - 24 * 3600_000) if cap else 0
         cap_hit = bool(cap) and used24 >= cap
-        return {"ok": ok and not cap_hit, "llms": rows, "cap": cap, "used_24h": used24, "cap_reached": cap_hit,
+        limit = self.store.settings.get("max_llm_decisions_per_hour", 60)
+        rate_hit = bool(limit) and self.decisions_last_hour(agent["agent_id"]) >= limit
+        return {"ok": ok and not cap_hit and not rate_hit, "rate_limited": rate_hit, "llms": rows, "cap": cap, "used_24h": used24, "cap_reached": cap_hit,
                 "avg_decision_tokens": self.db.recent_usage_avg(agent["agent_id"])}
 
     # ----- after usage -----
@@ -406,14 +462,16 @@ class TokenMeter:
 class MeteredProvider:
     """Wraps an LLM provider: reserve → call → settle the provider-reported usage (or a pessimistic estimate)."""
 
-    def __init__(self, inner, meter: TokenMeter, entry: dict, user_id: str, agent_id: str, purpose: str):
-        self.inner, self.meter, self.entry, self.user_id, self.agent_id, self.purpose = inner, meter, entry, user_id, agent_id, purpose
+    def __init__(self, inner, meter: TokenMeter, entry: dict, user_id: str, agent_id: str, purpose: str, decision: "Decision | None" = None):
+        self.inner, self.meter, self.entry, self.user_id, self.agent_id, self.purpose, self.decision = inner, meter, entry, user_id, agent_id, purpose, decision
 
     async def complete(self, system, messages, tools, *, max_tokens=1024, temperature=None, force_tool=None):
         mult = billing_of(self.entry)["output_multiplier"]
         prompt = system + json.dumps(messages, default=str) + json.dumps([{"n": t.name, "d": t.description, "s": t.input_schema} for t in tools])
         est_in = estimate_tokens(prompt)
         res = self.meter.reserve(self.user_id, self.entry, est_in + max_tokens * mult, self.agent_id)
+        if self.decision:
+            self.decision.commit()  # tokens were reserved: this decision is really going to the LLM
         try:
             comp = await self.inner.complete(system, messages, tools, max_tokens=max_tokens, temperature=temperature, force_tool=force_tool)
         except BaseException:  # provider error / timeout / cancellation: the user is not charged

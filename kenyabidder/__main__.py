@@ -36,7 +36,7 @@ def build(runtime: runtime_mod.Runtime) -> None:
     def wa_verify(request: Request):
         token = os.environ.get("WHATSAPP_VERIFY_TOKEN")
         q = request.query_params
-        if token and hmac.compare_digest(q.get("hub.verify_token", ""), token):
+        if token and hmac.compare_digest(q.get("hub.verify_token", "").encode(), token.encode()):
             return PlainTextResponse(q.get("hub.challenge", ""))
         raise HTTPException(403, "webhook verification failed")
 
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     rt = runtime_mod.Runtime(data_file=args.data or None, mcp_port=args.mcp_port or None)
     build(rt)
-    ui.run(host=args.host, port=args.port, title="KenyaBidder", storage_secret=rt.storage_secret, reload=False, show=False, dark=None, favicon="🔨")
+    ui.run(host=args.host, port=args.port, title="KenyaBidder", storage_secret=rt.storage_secret, reload=False, show=False, dark=None, favicon="🔨", uvicorn_logging_level="warning", access_log=False)  # no access log: the M-Pesa callback secret is in the URL path
 
 
 if __name__ in {"__main__", "__mp_main__"}:

@@ -363,12 +363,12 @@ def matches_page():
                 empty("No matches yet. When an auction closes with a winner, the match appears here.")
             for m in ms:
                 side = "seller" if m["seller_agent_id"] == agent["agent_id"] else "buyer"
-                reached = 3 if m["status"] in ("CONTACT_REVEALED", "COMPLETED", "FELL_THROUGH", "NO_RESPONSE") else STEPS.index(m["status"])
+                reached = 3 if m["status"] in ("CONTACT_REVEALED", "COMPLETED", "FELL_THROUGH", "NO_RESPONSE", "DISPUTED") else STEPS.index(m["status"])
                 with ui.card().classes("w-full"):
                     with ui.row().classes("w-full items-center"):
                         ui.label(f"{m['agreed_terms']['title']} — {kes(m['agreed_terms']['price'])}").classes("font-medium")
                         ui.space()
-                        badge(pretty(m["status"]), {"COMPLETED": "positive", "FELL_THROUGH": "negative", "NO_RESPONSE": "negative"}.get(m["status"], "grey"))
+                        badge(pretty(m["status"]), {"COMPLETED": "positive", "FELL_THROUGH": "negative", "NO_RESPONSE": "negative", "DISPUTED": "warning"}.get(m["status"], "grey"))
                     with ui.row().classes("gap-1"):
                         for i, s in enumerate(["Proposed", "Seller confirmed", "Buyer confirmed", "Contact revealed"]):
                             ui.badge(s).props(f"{'color=primary' if i <= reached else 'color=grey-5'}")
@@ -385,7 +385,14 @@ def matches_page():
                         for k, label in (("seller_contact", "Seller"), ("buyer_contact", "Buyer")):
                             c = cr[k]
                             ui.label(f"{label}: {c['name']} · {c['phone'] or 'no phone'} · {c['email'] or 'no email'}")
-                    if m["status"] == "CONTACT_REVEALED" and not any(r["agent_id"] == agent["agent_id"] for r in m["outcome_reports"]):
+                    if m["status"] == "DISPUTED":
+                        ui.label("You and the other party reported different outcomes. KenyaBidder does not judge disputes, so neither reputation is affected.").classes("text-sm text-amber-700")
+                    mine_reported = any(r["agent_id"] == agent["agent_id"] for r in m["outcome_reports"])
+                    if m["status"] == "CONTACT_REVEALED" and mine_reported:
+                        ui.label("Thanks — waiting for the other party to report their side. Nothing is decided until they do (or 72 hours pass).").classes("text-sm opacity-70")
+                    elif m["status"] == "CONTACT_REVEALED" and m["outcome_reports"]:
+                        ui.label("The other party has already reported. Please give your side below — you have 72 hours from their report.").classes("text-sm text-amber-700")
+                    if m["status"] == "CONTACT_REVEALED" and not mine_reported:
                         with ui.row().classes("items-center"):
                             ui.label("How did it go?").classes("opacity-70")
                             for o in ("COMPLETED", "FELL_THROUGH", "NO_RESPONSE"):

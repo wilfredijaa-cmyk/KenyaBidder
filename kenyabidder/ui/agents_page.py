@@ -142,6 +142,9 @@ def brain_tab(agent: dict) -> None:
     role, cfg = agent["agent_type"], agent["config"]
     llms = core().llms.list(enabled_only=True, role=role)
     llm_opts = {"": "— none —", **{l["id"]: f"{l['name']} ({l['model']})" for l in llms}}
+    for lid in {cfg["llm_id"], (cfg.get("advisor") or {}).get("llm_id"), *(v.get("llm_id") for v in cfg["algorithms"].values())} - {None, ""}:
+        if lid not in llm_opts and lid in core().store.llms:  # keep an assigned-but-now-disabled model visible instead of a blank select
+            llm_opts[lid] = f"{core().store.llms[lid]['name']} (disabled)"
     st = {"cap": cfg.get("max_tokens_per_day"), "llm": cfg["llm_id"] or "", "algos": {t: dict(v) for t, v in cfg["algorithms"].items()}, "advisor": dict(cfg["advisor"] or {"strategy": "rules", "llm_id": None}),
           "tools": set(cfg["tools"]), "kbs": set(cfg["kb_ids"]), "steps": cfg["max_tool_steps"]}
 

@@ -63,10 +63,10 @@ class SellerService:
             mem = agent["durable_memory"]
             if agent["agent_type"] != "SELLER" or agent["status"] != "ACTIVE" or not mem.get("daily_summary") or mem.get("last_summary_day") == day:
                 continue
-            mem["last_summary_day"] = day
             st = self.stats(agent["agent_id"])
             if st["sold"] + st["unsold"] + st["live"] == 0:
-                continue
+                continue  # nothing to report yet: try again later this evening
+            mem["last_summary_day"] = day
             self.notify(agent["agent_id"], "summary", self.summary(agent["agent_id"]))
             n += 1
         return n

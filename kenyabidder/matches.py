@@ -11,10 +11,11 @@ PRE_REVEAL = ("PROPOSED", "SELLER_CONFIRMED", "BUYER_CONFIRMED")
 
 
 class MatchService:
-    def __init__(self, store, clock, engine, notify=None, match_ttl_ms: int = 24 * 3600_000):
+    def __init__(self, store, clock, engine, notify=None, match_ttl_ms: int = 24 * 3600_000, report_grace_ms: int = 72 * 3600_000):
         self.store, self.clock = store, clock
         self.notify = notify or (lambda *a, **k: None)
         self.match_ttl_ms = match_ttl_ms
+        self.report_grace_ms = report_grace_ms  # how long the other side has to answer a first report
         # create_match is triggered by the deterministic layer when an auction closes with a winner.
         engine.events.on("auction.settled", self._on_settled)
 
@@ -113,28 +114,47 @@ class MatchService:
             rep.update(outcome=outcome, notes=notes, reported_at=now)
         else:
             m["outcome_reports"].append({"agent_id": agent_id, "outcome": outcome, "notes": notes, "reported_at": now})
+        m["first_report_at"] = m.get("first_report_at") or now
         m["updated_at"] = now
-        self._finalize(m)
+        if not self._finalize(m):
+            other = m["buyer_agent_id"] if agent_id == m["seller_agent_id"] else m["seller_agent_id"]
+            days = self.report_grace_ms // (24 * 3600_000)
+            self.notify(other, "match", f"The other party reported \"{outcome.replace('_', ' ').lower()}\" for this deal. Please report your side within {days} day(s) — "
+                        "nothing affects your reputation until you have had the chance to answer.", match_id=match_id)
         return m
 
-    def _finalize(self, m: dict) -> None:
-        """Fault assumption: a FELL_THROUGH / NO_RESPONSE report counts against the reporter's
-        counterparty; if both report FELL_THROUGH, both are at fault."""
+    def _finalize(self, m: dict, *, force: bool = False) -> bool:
+        """Decide the outcome — but only when BOTH sides have reported (or the other side stayed silent past the grace period).
+
+        A single unilateral report never damages anyone's reputation. Contradictory reports are DISPUTED: the platform does not
+        adjudicate (spec §2), so neither side is penalised or credited. Where both blame each other, both are at fault."""
         reports = m["outcome_reports"]
+        if len(reports) < 2 and not force:
+            return False
 
         def other(i):
             return m["buyer_agent_id"] if i == m["seller_agent_id"] else m["seller_agent_id"]
 
         bad_reports = [r for r in reports if r["outcome"] in ("FELL_THROUGH", "NO_RESPONSE")]
-        if bad_reports:
-            m["status"] = "FELL_THROUGH" if any(r["outcome"] == "FELL_THROUGH" for r in reports) else "NO_RESPONSE"
-            m["fault_agent_ids"] = sorted({other(r["agent_id"]) for r in bad_reports})
-        elif len(reports) == 2:
-            m["status"] = "COMPLETED"
-        else:
-            return
+        kind = "FELL_THROUGH" if any(r["outcome"] == "FELL_THROUGH" for r in bad_reports) else "NO_RESPONSE"
+        m["fault_agent_ids"] = []
+        if len(reports) == 2:
+            if not bad_reports:
+                m["status"] = "COMPLETED"
+            elif len(bad_reports) == 1:
+                m["status"] = "DISPUTED"  # one says it fell through, the other says it completed: nobody is penalised
+            else:
+                m["status"], m["fault_agent_ids"] = kind, sorted({other(r["agent_id"]) for r in bad_reports})
+        else:  # one report, the counterparty stayed silent through the grace period
+            r = reports[0]
+            if r["outcome"] == "COMPLETED":
+                m["status"] = "COMPLETED"
+            else:
+                m["status"], m["fault_agent_ids"] = kind, [other(r["agent_id"])]
+        m["updated_at"] = self.clock.now()
         recompute_reputation(self.store, m["seller_agent_id"])
         recompute_reputation(self.store, m["buyer_agent_id"])
+        return True
 
     def expire_stale(self) -> None:
         """Unconfirmed matches lapse into NO_RESPONSE, attributed to whoever did not confirm."""
@@ -148,3 +168,6 @@ class MatchService:
             m["updated_at"] = now
             recompute_reputation(self.store, m["seller_agent_id"])
             recompute_reputation(self.store, m["buyer_agent_id"])
+        for m in self.store.matches.values():  # a lone report stands once the other side has been silent for the whole grace period
+            if m["status"] == "CONTACT_REVEALED" and len(m["outcome_reports"]) == 1 and now - m.get("first_report_at", now) >= self.report_grace_ms:
+                self._finalize(m, force=True)

@@ -97,9 +97,13 @@ def wallet_page():
         # ---- orders
         ui.label("My orders").classes("text-lg font-medium mt-2")
 
+        typed: dict[str, str] = {}   # M-Pesa codes being typed survive any rebuild of the list
+        seen = {"sig": None}
+
         @ui.refreshable
         def orders():
             rows = c.billing.list_orders(user_id=user["id"], limit=20)
+            seen["sig"] = tuple((o["id"], o["status"]) for o in rows)
             if not rows:
                 empty("No orders yet.")
             for o in rows:
@@ -111,12 +115,13 @@ def wallet_page():
                         ui.label(fmt_datetime(o["created_at"])).classes("text-xs opacity-60")
                     if o["note"]:
                         ui.label(o["note"]).classes("text-xs opacity-70")
-                    order_actions(user, o, orders.refresh, balances.refresh)
+                    order_actions(user, o, orders.refresh, balances.refresh, typed)
         orders()
 
         def tick():
             balances.refresh()
-            orders.refresh()
+            if tuple((o["id"], o["status"]) for o in c.billing.list_orders(user_id=user["id"], limit=20)) != seen["sig"]:
+                orders.refresh()   # never rebuild the list (and wipe an input mid-typing) unless something actually changed
         ui.timer(4.0, tick)
 
         # ---- usage & history
@@ -144,7 +149,7 @@ def wallet_page():
             ui.button("Download orders (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.orders_csv(user_id=user["id"]), "kenyabidder-orders.csv", "text/csv")).props("outline no-caps")
 
 
-def order_actions(user: dict, o: dict, refresh_orders, refresh_balances) -> None:
+def order_actions(user: dict, o: dict, refresh_orders, refresh_balances, typed: dict) -> None:
     c = core()
 
     @guard
@@ -159,10 +164,10 @@ def order_actions(user: dict, o: dict, refresh_orders, refresh_balances) -> None
         refresh_orders()
         refresh_balances()
 
-    if o["status"] == "PENDING" and o["provider"] == "manual":
+    if o["status"] in ("PENDING", "EXPIRED") and o["provider"] == "manual":
         ui.label(c.billing.manual_instructions()).classes("text-sm font-medium whitespace-pre-line")
         ui.label(f"Use {o['reference']} as the account/reference, then enter the M-Pesa confirmation code from your SMS:").classes("text-xs opacity-70")
-        code = ui.input("M-Pesa code", placeholder="SGH7X2K9LP").props("dense").classes("w-56")
+        code = ui.input("M-Pesa code", placeholder="SGH7X2K9LP", value=typed.get(o["id"], ""), on_change=lambda e, i=o["id"]: typed.__setitem__(i, e.value or "")).props("dense").classes("w-56")
 
         @guard
         def submit(i=o["id"]):

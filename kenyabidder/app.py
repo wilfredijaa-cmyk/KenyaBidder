@@ -35,7 +35,7 @@ from .strategy import BaselineStrategy, HeuristicStrategy, LlmStrategy, SellerAd
 
 
 def create_app(*, store=None, clock=None, guardrail_config=None, transport=None, whatsapp=None, match_ttl_ms=None,
-               llm_provider_factory=None, allow_stdio=None, wallet_path=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
+               llm_provider_factory=None, allow_stdio=None, report_grace_ms=None, wallet_path=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
     store = store or Store()
     clock = clock or SystemClock()
     events = Events()
@@ -47,7 +47,7 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
     audit = AuditLog(store, clock)
     guardrail = GuardrailInterceptor(store, clock, engine, intel, guardrail_config)
     execution = ExecutionEngine(store, clock, engine, guardrail, audit, notify, transport)
-    matches = MatchService(store, clock, engine, notify, **({"match_ttl_ms": match_ttl_ms} if match_ttl_ms else {}))
+    matches = MatchService(store, clock, engine, notify, **({"match_ttl_ms": match_ttl_ms} if match_ttl_ms else {}), **({"report_grace_ms": report_grace_ms} if report_grace_ms else {}))
     sellers = SellerService(store, clock, engine, notify)
 
     llms = LlmRegistry(store, clock, llm_provider_factory)
@@ -98,7 +98,8 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
         find_by_channel=app.agents.find_by_channel, set_status=app.agents.set_status,
         update=lambda agent_id, constraints=None: app.agents.update(agent_id, constraints=constraints),
         find_approval=app.orchestrator.find_approval, resolve_approval=app.orchestrator.resolve_approval,
-        seller_summary=sellers.summary, status=status))
+        seller_summary=sellers.summary, status=status,
+        owner_suspended=lambda agent: bool(store.users.get(agent["principal_user_id"], {}).get("suspended"))))
 
     def tick() -> None:
         """Periodic maintenance: advance clocks, evaluate time-based triggers, expire stale matches."""

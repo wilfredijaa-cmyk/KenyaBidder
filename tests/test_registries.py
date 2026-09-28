@@ -437,3 +437,14 @@ async def test_seller_advisor_rules_llm_and_guards(env):
     assert r["source"] == "rules" and "fallback" in r["reasoning"]
     env.llms.set_provider_override(e["id"], ScriptedProvider([LlmError("down")]))
     assert "fallback" in (await env.app.advisor.recommend(s, "electronics"))["reasoning"]
+
+
+async def test_heuristic_dutch_threshold_is_never_below_the_floor(env):
+    """Regression: value 1020 with floor 1000 gave threshold 969 — a plan that could never fire."""
+    from kenyabidder.strategy import HeuristicStrategy
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=50_000)
+    a = env.engine.create_listing(seller_agent_id=s["agent_id"], product_spec={"category": "electronics", "title": "T", "quantity": 1}, auction_type="DUTCH",
+                                  reserve_price=1000, duration_ms=100_000, dutch={"start_price": 5000, "floor_price": 1000, "decrement": 100, "interval_ms": 1000})
+    p = await HeuristicStrategy().propose({"agent": b, "auction": env.engine.get_auction(a["auction_id"]), "intel": {"stats": {"median": 971, "count": 5}}})   # value 1019
+    assert p["action"] == "BID" and p["params"]["threshold"] >= 1000

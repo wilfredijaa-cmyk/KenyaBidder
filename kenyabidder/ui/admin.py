@@ -528,6 +528,22 @@ def billing_panel():
         ui.radio({"block": "Block — the agent stops making LLM decisions until its owner tops up (recommended)", "fallback": "Fall back — the agent keeps working with the free deterministic heuristic"},
                  value=c.billing.policy, on_change=set_policy)
 
+    # ---- abuse limits
+    with ui.card().classes("w-full"):
+        ui.label("Abuse limits (0 = unlimited)").classes("font-medium")
+        g = ui.number("Free-trial grants per 24h, platform-wide", value=c.store.settings.get("signup_grants_per_day", 100), min=0, precision=0).classes("w-72")
+        h = ui.number("LLM decisions per agent per hour", value=c.store.settings.get("max_llm_decisions_per_hour", 60), min=0, precision=0).classes("w-72")
+
+        @guard_admin
+        def save_limits():
+            if g.value is None or h.value is None:  # a cleared box must not silently mean "0 = unlimited"
+                ui.notify("Enter a number in both fields (0 means unlimited)", type="negative")
+                return
+            c.billing.set_limits(admin_user(), signup_grants_per_day=int(g.value), max_llm_decisions_per_hour=int(h.value))
+            ui.notify("Saved", type="positive")
+        ui.label("Phone numbers are not verified yet, so the grant budget bounds what fake sign-ups can claim. The decision limit stops one agent burning its owner's wallet during a listing flood.").classes("text-xs opacity-60")
+        ui.button("Save limits", on_click=save_limits).props("outline no-caps dense")
+
     # ---- payments
     with ui.card().classes("w-full"):
         ui.label("Payment methods").classes("font-medium")

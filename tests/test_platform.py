@@ -92,6 +92,9 @@ def test_match_flow_and_reputation_tiers(env):
     env.matches.confirm_match(bad["match_id"], s["agent_id"])
     env.matches.confirm_match(bad["match_id"], b["agent_id"])
     env.matches.report_outcome(bad["match_id"], s["agent_id"], "FELL_THROUGH")
+    assert bad["status"] == "CONTACT_REVEALED" and bad["fault_agent_ids"] == []      # one side's word alone changes nothing yet
+    env.clock.advance(73 * 3600_000)                                                   # …until the buyer stayed silent for the grace period
+    env.app.tick()
     assert bad["status"] == "FELL_THROUGH" and bad["fault_agent_ids"] == [b["agent_id"]]
     assert s["reputation"]["fell_through_count"] == 0 and b["reputation"]["fell_through_count"] == 1
 
@@ -264,3 +267,122 @@ async def test_whatsapp_webhook_requires_valid_signature(env):
     with pytest.raises(AppError) as e:
         await handle_whatsapp_webhook(env.router, b"not json", None, secret="", allow_unsigned=True)
     assert e.value.code == "INVALID_JSON"
+
+
+def _revealed(env, s, b):
+    m = settle_match(env, s, b)
+    env.matches.confirm_match(m["match_id"], s["agent_id"])
+    env.matches.confirm_match(m["match_id"], b["agent_id"])
+    return m
+
+
+def test_a_single_report_never_hurts_anyone_and_the_other_side_can_answer(env):
+    _, s = env.seller()
+    _, b = env.bidder()
+    m = _revealed(env, s, b)
+    env.matches.report_outcome(m["match_id"], b["agent_id"], "FELL_THROUGH")
+    assert m["status"] == "CONTACT_REVEALED" and s["reputation"]["fell_through_count"] == 0
+    assert any("Please report your side" in n["message"] for n in env.router.notifications_for(s["agent_id"]))
+    env.matches.report_outcome(m["match_id"], s["agent_id"], "COMPLETED")            # right of reply: they contradict each other
+    assert m["status"] == "DISPUTED" and m["fault_agent_ids"] == []
+    assert s["reputation"]["completed_matches"] == 0 and s["reputation"]["fell_through_count"] == 0 and b["reputation"]["fell_through_count"] == 0
+
+
+def test_mutual_blame_faults_both_and_lone_completed_report_stands_after_grace(env):
+    _, s = env.seller()
+    _, b = env.bidder()
+    m = _revealed(env, s, b)
+    env.matches.report_outcome(m["match_id"], s["agent_id"], "FELL_THROUGH")
+    env.matches.report_outcome(m["match_id"], b["agent_id"], "FELL_THROUGH")
+    assert m["status"] == "FELL_THROUGH" and sorted(m["fault_agent_ids"]) == sorted([s["agent_id"], b["agent_id"]])
+    m2 = _revealed(env, s, b)
+    env.matches.report_outcome(m2["match_id"], s["agent_id"], "COMPLETED")
+    env.clock.advance(71 * 3600_000)
+    env.app.tick()
+    assert m2["status"] == "CONTACT_REVEALED"
+    env.clock.advance(2 * 3600_000)
+    env.app.tick()
+    assert m2["status"] == "COMPLETED" and s["reputation"]["completed_matches"] == 1
+
+
+async def test_suspended_users_cannot_resume_via_whatsapp_or_service(env):
+    admin = env.agents.create_user(name="Root Admin", password="password123")
+    u, b = env.bidder(name="Banned One")
+    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254799000111")
+    env.agents.set_suspended(u["id"], True, by=admin["id"])
+    r = await env.router.handle_inbound("WHATSAPP", "254799000111", "resume")
+    assert "suspended" in r["reply"] and b["status"] == "SUSPENDED"
+    with pytest.raises(AppError) as e:
+        env.agents.set_status(b["agent_id"], "ACTIVE")
+    assert e.value.code == "ACCOUNT_SUSPENDED"
+    env.agents.set_suspended(u["id"], False, by=admin["id"])
+    assert b["status"] == "PAUSED"                                                    # reinstated accounts restart deliberately
+    env.agents.set_status(b["agent_id"], "ACTIVE")
+    assert b["status"] == "ACTIVE"
+
+
+async def test_whatsapp_batched_deliveries_run_every_message_and_odd_headers_are_403(env):
+    import hashlib, hmac, json
+    from kenyabidder.channels import handle_whatsapp_webhook
+    _, b = env.bidder(ceiling=1000)
+    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254711000222")
+    msgs = lambda *texts: [{"from": "254711000222", "text": {"body": t}} for t in texts]
+    body = json.dumps({"entry": [{"changes": [{"value": {"messages": msgs("status", "ceiling 4000")}}]}, {"changes": [{"value": {"messages": msgs("pause")}}]}]}).encode()
+    out = await handle_whatsapp_webhook(env.router, body, None, secret="", allow_unsigned=True)
+    assert out["handled"] == 3 and b["constraints"]["budget_ceiling"] == 4000 and b["status"] == "PAUSED"   # not just the first message
+    with pytest.raises(AppError) as e:
+        await handle_whatsapp_webhook(env.router, body, "sha256=\u00e9\u2603", secret="appsecret")
+    assert e.value.code == "BAD_SIGNATURE"
+
+
+def test_evening_summary_waits_for_news_instead_of_giving_up_for_the_day(env):
+    from kenyabidder.timeutil import eat
+    _, s = env.seller()
+    day_start = env.clock.now() - env.clock.now() % (24 * 3600_000) - 3 * 3600_000
+    env.clock.t = day_start + 18 * 3600_000 + 20_000                                  # 18:00:20 EAT, nothing happened today
+    assert env.sellers.send_daily_summaries() == 0
+    env.english(s["agent_id"], duration_ms=10 * 3600_000)                              # a listing appears at 18:00:20…
+    env.clock.advance(60_000)
+    assert env.sellers.send_daily_summaries() == 1                                     # …and the same evening's summary still goes out
+    assert eat(env.clock.now()).hour == 18
+
+
+async def test_disabled_llm_does_not_trap_the_agent_configuration(env):
+    llm = env.llms.add(name="Later Disabled", provider="anthropic", model="m", api_key="k", billing_mode="free")
+    cfg = {"llm_id": llm["id"], "algorithms": {"ENGLISH": {"strategy": "llm", "llm_id": None}}}
+    _, b = env.bidder(config=cfg)
+    env.llms.update(llm["id"], enabled=False)
+    env.agents.update(b["agent_id"], config={"max_tokens_per_day": 5_000})           # unrelated edit still works
+    assert b["config"]["max_tokens_per_day"] == 5_000 and b["config"]["llm_id"] == llm["id"]
+    other = env.llms.add(name="Fresh", provider="anthropic", model="m", api_key="k")
+    env.llms.update(other["id"], enabled=False)
+    with pytest.raises(AppError):                                                     # but you cannot newly *assign* a disabled one
+        env.agents.update(b["agent_id"], config={"llm_id": other["id"]})
+
+
+async def test_blocked_retries_do_not_burn_the_hourly_decision_budget(env):
+    """Regression: begin_decision counted before tokens were reserved, so a no-token agent retrying every 30s exhausted its budget."""
+    llm = env.llms.add(name="Claude", provider="anthropic", model="m", api_key="k")
+    _, s = env.seller()
+    from tests.test_metering import llm_bidder
+    u, b = llm_bidder(env, llm)
+    a = env.english(s["agent_id"], duration_ms=10 * 3600_000)
+    env.store.settings["max_llm_decisions_per_hour"] = 2
+    for _ in range(10):
+        assert (await env.orchestrator.consider(b["agent_id"], a["auction_id"], manual=True))["code"] == "NO_TOKENS"
+    assert env.meter.decisions_last_hour(b["agent_id"]) == 0 and env.meter._inflight.get(b["agent_id"], 0) == 0
+    from kenyabidder.llm.providers import ScriptedProvider
+    from tests.test_metering import bid
+    env.llms.set_provider_override(llm["id"], ScriptedProvider([bid()]))
+    env.wallet.credit(u["id"], llm["id"], 10**6, "GRANT")
+    assert (await env.orchestrator.consider(b["agent_id"], a["auction_id"], manual=True))["status"] == "PLANNED"   # not RATE_LIMITED
+
+
+async def test_heuristic_skips_a_dutch_lot_whose_floor_exceeds_its_valuation(env):
+    from kenyabidder.strategy import HeuristicStrategy
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=100_000)
+    a = env.engine.create_listing(seller_agent_id=s["agent_id"], product_spec={"category": "electronics", "title": "T", "quantity": 1}, auction_type="DUTCH",
+                                  reserve_price=24_000, duration_ms=100_000, dutch={"start_price": 40_000, "floor_price": 24_000, "decrement": 1000, "interval_ms": 1000})
+    p = await HeuristicStrategy().propose({"agent": b, "auction": env.engine.get_auction(a["auction_id"]), "intel": {"stats": {"median": 9_524, "count": 5}}})   # value ≈ 10,000
+    assert p["action"] == "SKIP"                                                       # never raises its offer up to the floor

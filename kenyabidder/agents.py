@@ -171,6 +171,10 @@ class AgentService:
         if suspended and u["role"] == "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin" and not x.get("suspended")) <= 1:
             raise bad("LAST_ADMIN", "there must always be at least one active administrator")
         u["suspended"] = bool(suspended)
+        if not suspended:
+            for a in self.agents_for(user_id):
+                if a["status"] == "SUSPENDED":
+                    a["status"] = "PAUSED"  # reinstated accounts restart deliberately, never automatically
         if suspended:
             for a in self.agents_for(user_id):
                 self.set_status(a["agent_id"], "SUSPENDED")
@@ -274,13 +278,15 @@ class AgentService:
         base = agent.get("config") or default_config(role)
         merged = {**base, **{k: v for k, v in c.items() if k in out}}
 
+        already = {base.get("llm_id"), (base.get("advisor") or {}).get("llm_id"), *(v.get("llm_id") for v in (base.get("algorithms") or {}).values())} - {None}
+
         def check_llm(llm_id, what):
             if llm_id in (None, ""):
                 return None
             if not self.llms:
                 raise bad("INVALID_LLM", "no LLM registry available")
             e = self.llms.get(llm_id)  # raises if unknown
-            if not e["enabled"]:
+            if not e["enabled"] and llm_id not in already:  # an LLM disabled *after* assignment must not stop other edits
                 raise bad("INVALID_LLM", f"{what}: LLM {e['name']!r} is disabled")
             if role not in e["roles"]:
                 raise bad("INVALID_LLM", f"{what}: LLM {e['name']!r} is not enabled for {role} agents")
@@ -367,6 +373,8 @@ class AgentService:
         if status not in ("ACTIVE", "PAUSED", "SUSPENDED"):
             raise bad("INVALID_STATUS", "status must be ACTIVE|PAUSED|SUSPENDED")
         agent = self.get_agent(agent_id)
+        if status == "ACTIVE" and self.store.users.get(agent["principal_user_id"], {}).get("suspended"):
+            raise forbidden("ACCOUNT_SUSPENDED", "this account is suspended — an administrator must reinstate it first")
         agent["status"] = status
         if status != "ACTIVE" and self.execution:
             self.execution.cancel_agent_triggers(agent_id)  # revocation is immediate (spec §12)

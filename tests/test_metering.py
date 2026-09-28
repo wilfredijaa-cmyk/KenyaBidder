@@ -169,3 +169,71 @@ async def test_concurrent_decisions_cannot_overspend_one_wallet(env):
     done = [r for r in res if r["status"] != "BLOCKED"]
     assert 1 <= len(done) <= 2 and len(res) - len(done) >= 8
     assert env.wallet.balance(u["id"], llm["id"]) >= 0 and env.wallet.verify_integrity() == []
+
+
+async def test_hourly_decision_limit_stops_a_listing_flood_from_draining_a_wallet(world):
+    env, b, u = world.env, world.agent, world.user
+    env.wallet.credit(u["id"], world.llm["id"], 10**7, "GRANT")
+    env.store.settings["max_llm_decisions_per_hour"] = 3
+    env.llms.set_provider_override(world.llm["id"], ScriptedProvider([bid() for _ in range(10)]))
+    results = []
+    for _ in range(6):
+        a = env.english(world.seller["agent_id"], duration_ms=10 * 3600_000)
+        results.append((await env.orchestrator.consider(b["agent_id"], a["auction_id"], manual=True))["status"])
+    assert results == ["PLANNED"] * 3 + ["BLOCKED"] * 3
+    assert env.orchestrator.blocked and "hourly" in next(n for n in env.router.notifications_for(b["agent_id"]) if n["kind"] == "no_tokens")["message"]
+    assert env.meter.status_for_agent(b)["rate_limited"] and not env.meter.status_for_agent(b)["ok"]
+    env.clock.advance(3600_001)
+    a = env.english(world.seller["agent_id"], duration_ms=10 * 3600_000)
+    assert (await env.orchestrator.consider(b["agent_id"], a["auction_id"], manual=True))["status"] == "PLANNED"
+    env.billing.set_limits(env.agents.create_user(name="Boss", password="password123"), max_llm_decisions_per_hour=0)
+    assert env.store.settings["max_llm_decisions_per_hour"] == 0
+
+
+async def test_burst_of_concurrent_listings_cannot_beat_the_hourly_limit(world):
+    """Regression: the limit only counted *settled* calls, so a burst that all started at once slipped straight through.
+    Here the burst arrives the way it does in production — 8 new listings each spawn the watching agent's decision at once."""
+    import asyncio
+    env, b, u = world.env, world.agent, world.user
+    env.wallet.credit(u["id"], world.llm["id"], 10**7, "GRANT")
+    env.store.settings["max_llm_decisions_per_hour"] = 3
+
+    class Slow(ScriptedProvider):
+        async def complete(self, *a, **k):
+            await asyncio.sleep(0.02)
+            return bid()
+    env.llms.set_provider_override(world.llm["id"], Slow())
+    for _ in range(8):
+        env.english(world.seller["agent_id"], duration_ms=10 * 3600_000)   # each creation spawns a decision task immediately
+    await env.orchestrator.idle()
+    planned = [t for t in env.execution.triggers_for(b["agent_id"])]
+    assert len(planned) == 3 and len(env.orchestrator.blocked) == 5
+    assert len(env.wallet.ledger(agent_id=b["agent_id"])) == 3               # and only three decisions were ever paid for
+
+
+async def test_limit_is_per_decision_so_it_never_trips_in_the_middle_of_research(world):
+    env, b, u = world.env, world.agent, world.user
+    await env.mcps.refresh_tools("builtin")
+    env.agents.update(b["agent_id"], config={"tools": ["builtin:get_demand_signal"]})
+    env.wallet.credit(u["id"], world.llm["id"], 10**7, "GRANT")
+    env.store.settings["max_llm_decisions_per_hour"] = 1                       # one DECISION allowed — but it makes 2 provider calls
+    research = Completion(tool_calls=[ToolCall("r", "kb__get_demand_signal", {"category": "electronics"})], usage={"input": 500, "output": 50})
+    env.llms.set_provider_override(world.llm["id"], ScriptedProvider([research, bid()]))
+    a = env.english(world.seller["agent_id"], duration_ms=10 * 3600_000)
+    r = await env.orchestrator.consider(b["agent_id"], a["auction_id"], manual=True)
+    assert r["status"] == "PLANNED" and len(env.wallet.ledger(agent_id=b["agent_id"])) == 2
+
+
+def test_signup_grant_budget_bounds_fake_signups(env):
+    admin = env.agents.create_user(name="Boss", password="password123")
+    llm = env.llms.add(name="C", provider="anthropic", model="m", api_key="k")
+    env.billing.set_signup_grant(admin, llm["id"], 1_000)
+    env.billing.set_limits(admin, signup_grants_per_day=3)
+    got = []
+    for i in range(6):
+        u = env.agents.create_user(name=f"Fake {i}", password="password123", phone=f"07120000{i:02d}")
+        got.append(env.wallet.balance(u["id"], llm["id"]))
+    assert got == [1_000] * 3 + [0] * 3
+    env.clock.advance(24 * 3600_000 + 1)
+    late = env.agents.create_user(name="Next Day", password="password123", phone="0722999888")
+    assert env.wallet.balance(late["id"], llm["id"]) == 1_000

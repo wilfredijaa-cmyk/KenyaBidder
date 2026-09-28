@@ -66,11 +66,11 @@ class Runtime:
                     await step()
                 except Exception:  # noqa: BLE001
                     log.exception("%s failed", name)
-            try:
-                a.billing.expire_stale()
-                a.sellers.send_daily_summaries()
-            except Exception:  # noqa: BLE001
-                log.exception("maintenance failed")
+            for name, sync_step in (("order expiry", a.billing.expire_stale), ("evening summaries", a.sellers.send_daily_summaries)):
+                try:
+                    sync_step()
+                except Exception:  # noqa: BLE001  one failing job must not skip the others
+                    log.exception("%s failed", name)
 
     def save(self) -> None:
         if self.data_file:

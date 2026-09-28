@@ -151,11 +151,76 @@ async def test_manual_rejection_and_cancel_and_open_order_limit(shop):
     assert e.value.code == "TOO_MANY_ORDERS"
 
 
-def test_order_expiry_and_receipt_reuse_after_reject(shop):
+def test_stk_orders_expire_quickly_but_manual_orders_wait_a_week(shop):
     env = shop.env
-    o = env.billing._insert_order(shop.user, shop.pack, "manual", None)
+    stk = env.billing._insert_order(shop.user, shop.pack, "mpesa", "+254712000001")
+    manual = env.billing._insert_order(shop.user, shop.pack, "manual", None)
     env.clock.advance(31 * 60_000)
-    assert env.billing.expire_stale() == 1 and env.billing.get_order(o["id"])["status"] == "EXPIRED"
+    assert env.billing.expire_stale() == 1
+    assert env.billing.get_order(stk["id"])["status"] == "EXPIRED" and env.billing.get_order(manual["id"])["status"] == "PENDING"
+    env.clock.advance(7 * 24 * 3600_000)
+    assert env.billing.expire_stale() == 1 and env.billing.get_order(manual["id"])["status"] == "EXPIRED"
+
+
+async def test_slow_customer_who_paid_the_till_can_still_be_credited(shop):
+    """Regression: a manual order expired after 30 min and then had no path to being credited."""
+    env, b = shop.env, shop.env.billing
+    o = await b.checkout(shop.user, shop.pack["id"], "manual")
+    env.clock.advance(8 * 24 * 3600_000)
+    b.expire_stale()
+    assert b.get_order(o["id"])["status"] == "EXPIRED"
+    b.submit_receipt(shop.user, o["id"], "LATEPAY001")
+    assert b.admin_review(shop.admin, o["id"], True)["status"] == "PAID"
+    assert env.wallet.balance(shop.user["id"], shop.llm["id"]) == 100_000
+
+
+async def test_reconcile_is_not_starved_by_dead_expired_orders(mpesa_shop):
+    """Regression: EXPIRED orders whose STK query said FAILED stayed EXPIRED and were re-queried forever, crowding out real ones."""
+    s, b, env = mpesa_shop, mpesa_shop.env.billing, mpesa_shop.env
+    dead = [b._insert_order(s.env.bidder(name=f"Abandoner{i}")[0], s.pack, "mpesa", f"+2547120000{i:02d}") for i in range(25)]
+    for o in dead:
+        b._set_status(o["id"], ("PENDING",), "EXPIRED", external_ref=f"ws_dead_{o['id'][:6]}")
+    env.clock.advance(60_000)
+    s.fake.query_result = {"code": "1032", "desc": "cancelled"}
+    await b.reconcile(limit=20)
+    await b.reconcile(limit=20)
+    assert sum(b.get_order(o["id"])["status"] == "FAILED" for o in dead) == 25       # every dead order was retired
+    real = await b.checkout(s.user, s.pack["id"], "mpesa", "0722000999")             # a real customer whose callback was lost
+    env.clock.advance(60_000)
+    s.fake.query_result = {"code": "0", "desc": "ok"}
+    assert await b.reconcile() == 1 and b.get_order(real["id"])["status"] == "PAID"
+
+
+async def test_non_ascii_callback_path_is_a_403_not_a_crash(mpesa_shop):
+    with pytest.raises(AppError) as e:
+        await mpesa_shop.env.billing.handle_mpesa_callback("s\u00e9cret\u2603", {})
+    assert e.value.status == 403
+
+
+def test_set_limits_is_atomic_and_logs_only_what_changed(shop):
+    b, env = shop.env.billing, shop.env
+    with pytest.raises(AppError):
+        b.set_limits(shop.admin, signup_grants_per_day=5, max_llm_decisions_per_hour=-1)
+    assert "signup_grants_per_day" not in env.store.settings                          # nothing half-applied
+    n = len(env.store.admin_log)
+    b.set_limits(shop.admin, max_llm_decisions_per_hour=30)
+    assert env.store.settings["max_llm_decisions_per_hour"] == 30 and env.store.admin_log[-1]["detail"] == {"max_llm_decisions_per_hour": 30} and len(env.store.admin_log) == n + 1
+    b.set_limits(shop.admin)
+    assert len(env.store.admin_log) == n + 1                                          # a no-op is not logged
+
+
+def test_one_free_trial_per_account_even_if_the_phone_changes(shop):
+    """Regression: changing the phone number re-fired the grant under a new ref, and an admin grant bypassed the budget."""
+    env = shop.env
+    env.billing.set_signup_grant(shop.admin, shop.llm["id"], 5_000)
+    u = env.agents.create_user(name="Phone Hopper", password="password123", phone="0701000001")
+    for n in ("0701000002", "0701000003", "0701000004"):
+        env.agents.set_phone(u["id"], n)
+    assert env.wallet.balance(u["id"], shop.llm["id"]) == 5_000
+    env.billing.set_limits(shop.admin, signup_grants_per_day=1)                       # budget is now exhausted…
+    env.billing.admin_grant(shop.admin, shop.user["id"], shop.llm["id"], 10, "support gesture")  # …an admin grant must not exempt anyone
+    other = env.agents.create_user(name="Latecomer", password="password123", phone="0701000009")
+    assert env.wallet.balance(other["id"], shop.llm["id"]) == 0
 
 
 async def test_refund_reclaims_only_unspent_tokens(shop):

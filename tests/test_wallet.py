@@ -199,7 +199,7 @@ def test_agent_token_status(env):
     env.wallet.credit(u["id"], llm["id"], env.meter.min_balance(llm), "GRANT")
     assert env.meter.status_for_agent(b)["ok"]
     _, plain = env.bidder()  # a deterministic-only agent never needs tokens
-    assert env.meter.status_for_agent(plain) == {"ok": True, "llms": [], "cap": None, "used_24h": 0, "cap_reached": False, "avg_decision_tokens": None}
+    assert env.meter.status_for_agent(plain) == {"ok": True, "rate_limited": False, "llms": [], "cap": None, "used_24h": 0, "cap_reached": False, "avg_decision_tokens": None}
 
 
 async def test_low_balance_alert_fires_once(env):
