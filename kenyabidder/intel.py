@@ -19,10 +19,12 @@ class MarketIntel:
     def historical_clearing_prices(self, category: str, auction_type: str | None = None, since_ms: int | None = None) -> dict:
         cat = (category or "").lower()
         since = self.clock.now() - since_ms if since_ms is not None else float("-inf")
-        prices = sorted(r["price"] for r in self.store.market_history
-                        if r["category"] == cat and (not auction_type or r["auction_type"] == auction_type) and r["at"] >= since)
+        rows = [r for r in self.store.market_history if r["category"] == cat and (not auction_type or r["auction_type"] == auction_type) and r["at"] >= since]
+        prices = sorted(r["price"] for r in rows)
+        units = sorted(r["price"] / max(1, r.get("quantity") or 1) for r in rows)  # price per unit: lots of different sizes are comparable
         return {"category": cat, "count": len(prices), "min": prices[0] if prices else None, "p25": _pct(prices, 0.25),
-                "median": _pct(prices, 0.5), "p75": _pct(prices, 0.75), "max": prices[-1] if prices else None}
+                "median": _pct(prices, 0.5), "p75": _pct(prices, 0.75), "max": prices[-1] if prices else None,
+                "unit_median": _pct(units, 0.5), "unit_p25": _pct(units, 0.25)}
 
     def demand_signal(self, category: str) -> dict:
         cat = (category or "").lower()

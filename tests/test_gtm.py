@@ -146,3 +146,98 @@ def test_terms_are_editable_with_a_sensible_default(env):
     assert get_terms(env.store) == DEFAULT_TERMS
     with pytest.raises(AppError):
         set_terms(env.store, "x" * 20_001)
+
+
+# ------------------------------------------------------------------ review round 3 regressions
+
+def test_store_prune_bounds_everything_that_only_ever_grew(env):
+    from kenyabidder.store import Store
+    st = env.store
+    for i in range(20_050):
+        st.idempotency[f"k{i}"] = {"ok": True}
+    st.audit.extend({"n": i} for i in range(50_100))
+    st.settings["login_failures"] = {f"ghost{i}": [1] for i in range(100)}                     # long-expired lockout entries
+    st.triggers["old"] = {"id": "old", "status": "DONE", "created_at": 0}
+    st.triggers["live"] = {"id": "live", "status": "ACTIVE", "created_at": 0}
+    st.approvals["old"] = {"id": "old", "status": "REJECTED", "created_at": 0, "resolved_at": 1}
+    st.prune(env.clock.now())
+    assert len(st.idempotency) == 20_000 and "k0" not in st.idempotency and "k20049" in st.idempotency
+    assert len(st.audit) == 50_000 and st.audit[-1] == {"n": 50_099}
+    assert st.settings["login_failures"] == {} and "old" not in st.triggers and "live" in st.triggers and "old" not in st.approvals
+    assert isinstance(st, Store)
+
+
+def test_idempotency_keeps_a_small_record_not_the_whole_auction(env):
+    _, s = env.seller()
+    _, b = env.bidder()
+    a = env.english(s["agent_id"])
+    env.engine.submit_bid(auction_id=a["auction_id"], agent_id=b["agent_id"], amount=1000, idempotency_key="k")
+    saved = env.store.idempotency[f"{b['agent_id']}:k"]
+    assert set(saved) == {"ok", "bid"}                                                            # no embedded auction view (was O(N^2) memory)
+    assert env.engine.submit_bid(auction_id=a["auction_id"], agent_id=b["agent_id"], amount=1000, idempotency_key="k")["replayed"]
+
+
+def test_login_failure_book_is_pruned_when_attackers_invent_names(env, monkeypatch):
+    monkeypatch.setattr("kenyabidder.agents.verify_password", lambda *a: False)                # scrypt is slow; this test is about bookkeeping
+    for i in range(2_100):
+        env.agents.authenticate(f"invented-{i}", "x")
+    env.clock.advance(6 * 60_000)
+    env.agents.authenticate("one-more", "x")
+    assert len(env.store.settings["login_failures"]) <= 2
+
+
+def test_update_is_all_or_nothing(env):
+    _, b = env.bidder(ceiling=1_000)
+    with pytest.raises(AppError):
+        env.agents.update(b["agent_id"], constraints={"budget_ceiling": 999_999}, memory={"preferred_channel": "WHATSAPP"}, config={"llm_id": "no-such-llm"})
+    assert b["constraints"]["budget_ceiling"] == 1_000 and b["durable_memory"]["preferred_channel"] == "WEB"   # nothing half-applied
+
+
+def test_anthropic_usage_includes_cache_tokens():
+    import asyncio, json
+    import httpx2
+    from kenyabidder.llm.providers import AnthropicProvider
+    handler = lambda req: httpx2.Response(200, json={"id": "m", "type": "message", "role": "assistant", "model": "x", "stop_reason": "end_turn", "content": [{"type": "text", "text": "hi"}],
+                                                     "usage": {"input_tokens": 100, "output_tokens": 20, "cache_creation_input_tokens": 3000, "cache_read_input_tokens": 500}})
+    p = AnthropicProvider("k", "m", base_url="http://a.test", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+    r = asyncio.run(p.complete("s", [{"role": "user", "content": "x"}], []))
+    assert r.usage == {"input": 3600, "output": 20}                                              # cached tokens are processed tokens: bill them
+
+
+def test_cannot_delete_an_llm_customers_have_paid_for(env):
+    admin = env.agents.create_user(name="Boss", password="password123")
+    llm = env.llms.add(name="Paid", provider="anthropic", model="m", api_key="k")
+    u = env.agents.create_user(name="Customer One", password="password123")
+    env.wallet.credit(u["id"], llm["id"], 5_000, "TOPUP", ref="o1")
+    with pytest.raises(AppError) as e:
+        env.llms.remove(llm["id"])
+    assert e.value.code == "IN_USE" and "5,000 tokens" in e.value.message
+    env.wallet.adjust(u["id"], llm["id"], -5_000)
+    pack = env.billing.add_pack(admin, name="P", llm_id=llm["id"], tokens=5_000, price_kes=100)
+    with pytest.raises(AppError) as e:
+        env.llms.remove(llm["id"])
+    assert "packs" in e.value.message
+    env.billing.remove_pack(admin, pack["id"])
+    env.llms.remove(llm["id"])
+    assert llm["id"] not in env.store.llms
+
+
+async def test_async_login_verifies_off_the_event_loop_and_behaves_identically(env):
+    import asyncio, threading
+    u = env.agents.create_user(name="Async Login", password="password123")
+    seen = []
+    import kenyabidder.agents as ag
+    real = ag.verify_password
+    ag.verify_password = lambda *a: (seen.append(threading.current_thread() is threading.main_thread()), real(*a))[1]
+    try:
+        assert (await env.agents.authenticate_async("async login", "password123"))["id"] == u["id"]
+        assert await env.agents.authenticate_async("Async Login", "nope") is None
+        assert await env.agents.authenticate_async("ghost", "nope") is None
+    finally:
+        ag.verify_password = real
+    assert seen == [False, False, False]                                                        # never on the main (event-loop) thread
+    for _ in range(4):
+        await env.agents.authenticate_async("Async Login", "nope")
+    with pytest.raises(AppError) as e:
+        await env.agents.authenticate_async("Async Login", "password123")
+    assert e.value.code == "TOO_MANY_ATTEMPTS"

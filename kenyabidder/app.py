@@ -80,6 +80,18 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
     app.billing = BillingService(store, clock, wallet, llms, meter, notify, mpesa_client, dev_payments, on_credit)
     app.agents.on_identity_change = app.billing.grant_signup_tokens
 
+    def llm_deletion_blockers(llm_id: str) -> list[str]:
+        out = []
+        held = wallet.outstanding_liability().get(llm_id, 0)
+        if held:
+            out.append(f"customers still hold {held:,} tokens for it")
+        if any(p["llm_id"] == llm_id for p in store.packs.values()):
+            out.append("token packs are defined for it")
+        if any(o["llm_id"] == llm_id for o in app.billing.list_orders(limit=100_000) if o["status"] in ("PENDING", "AWAITING_REVIEW")):
+            out.append("there are unfinished payment orders for it")
+        return out
+    llms.deletion_blockers.append(llm_deletion_blockers)
+
     def status(agent: dict) -> str:
         live = [t for t in execution.triggers_for(agent["agent_id"]) if t["status"] in ("ACTIVE", "AWAITING_APPROVAL")]
         pending = [a for a in store.approvals.values() if a["agent_id"] == agent["agent_id"] and a["status"] == "PENDING"]
@@ -103,9 +115,12 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
 
     def tick() -> None:
         """Periodic maintenance: advance clocks, evaluate time-based triggers, expire stale matches."""
-        engine.tick()
-        execution.evaluate_all()
-        matches.expire_stale()
+        import logging
+        for name, step in (("engine", engine.tick), ("triggers", execution.evaluate_all), ("matches", matches.expire_stale)):
+            try:
+                step()
+            except Exception:  # noqa: BLE001  a failure in one step must never stop bids being evaluated
+                logging.getLogger("kenyabidder").exception("tick step %s failed", name)
 
     def manual_bid(agent_id: str, auction_id: str, amount: int) -> dict:
         """Human override: an explicit user decision still passes the Guardrail Interceptor and is audited."""

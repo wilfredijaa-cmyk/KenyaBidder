@@ -36,7 +36,7 @@ async def test_unauthorized_type_requests_participation_then_starts(env):
 
 async def test_heuristic_uses_market_history(env):
     for p in (8000, 9000, 10_000):
-        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": p, "quantity": 1, "at": 1})
+        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": p, "quantity": 10, "at": 1})   # same lot size as the listing
     _, s = env.seller()
     _, b = env.bidder(ceiling=50_000)
     cheap = env.english(s["agent_id"], start_price=1000, reserve_price=1000)
@@ -386,3 +386,14 @@ async def test_heuristic_skips_a_dutch_lot_whose_floor_exceeds_its_valuation(env
                                   reserve_price=24_000, duration_ms=100_000, dutch={"start_price": 40_000, "floor_price": 24_000, "decrement": 1000, "interval_ms": 1000})
     p = await HeuristicStrategy().propose({"agent": b, "auction": env.engine.get_auction(a["auction_id"]), "intel": {"stats": {"median": 9_524, "count": 5}}})   # value ≈ 10,000
     assert p["action"] == "SKIP"                                                       # never raises its offer up to the floor
+
+
+async def test_valuation_scales_per_unit_history_to_the_size_of_the_lot(env):
+    """Regression: the heuristic and anomaly breaker compared lot totals of different sizes."""
+    for p in (1000, 1100, 900):
+        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": p, "quantity": 1, "at": 1})   # ~KES 1,000 per unit
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=1_000_000)
+    lot = env.english(s["agent_id"], product_spec={"category": "electronics", "title": "Bulk phones", "quantity": 100}, start_price=1000, reserve_price=1000)
+    r = await env.orchestrator.consider(b["agent_id"], lot["auction_id"], manual=True)
+    assert r["trigger"]["params"]["max_bid"] == 105_000                            # 1,000/unit x 100 units x 1.05, not 1,050

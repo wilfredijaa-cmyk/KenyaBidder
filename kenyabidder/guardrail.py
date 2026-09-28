@@ -50,14 +50,16 @@ class GuardrailInterceptor:
             return reject("AUCTION_NOT_OPEN", f"auction is {a['status']}", permanent=True)
 
         cat = a["product_spec"]["category"]
-        if self._breaker_active(cat, now):
-            return reject("MARKET_ANOMALY", "autonomous bidding halted for this category (circuit breaker)", permanent=True, notify=True)
-        if self._is_anomalous(a, amount):
-            self.store.breakers[cat.lower()] = {
-                "reason": f"bid {amount} is more than {self.config['anomaly_multiple']}x the historical median",
-                "tripped_at": now, "until": now + self.config["breaker_cooldown_ms"]}
-            return reject("MARKET_ANOMALY", "price is anomalous versus recent clearing prices; autonomous bidding halted",
-                          permanent=True, notify=True)
+        # The breaker protects AUTONOMOUS bidding. A human's explicit bid is theirs to make (and must never halt everyone else's agents).
+        # Rejections are NOT permanent: the trigger stays live and resumes by itself when the cooldown ends.
+        if p["source"] != "user":
+            if self._breaker_active(cat, now):
+                return reject("MARKET_ANOMALY", "autonomous bidding halted for this category (circuit breaker)", notify=True)
+            if self._is_anomalous(a, amount):
+                self.store.breakers[cat.lower()] = {
+                    "reason": f"bid {amount} is more than {self.config['anomaly_multiple']}x the typical per-unit price",
+                    "tripped_at": now, "until": now + self.config["breaker_cooldown_ms"]}
+                return reject("MARKET_ANOMALY", "price is anomalous versus recent clearing prices; autonomous bidding halted", notify=True)
 
         one_off = agent["durable_memory"].get("one_off_authorizations", [])
         if (a["auction_type"] not in c["authorized_auction_types"] and a["auction_id"] not in one_off
@@ -81,12 +83,23 @@ class GuardrailInterceptor:
         self.store.rate_windows[p["agent_id"]] = window
         return {"decision": "APPROVED", "code": "OK", "reason": "passed all guardrails"}
 
+    def soft_cap(self, agent: dict, approved_up_to: int = 0) -> int:
+        """Highest amount an autonomous bid can take WITHOUT being rejected or escalated. Strategies clamp their *stepped*
+        bids to this so a 20% step past the ceiling becomes 'bid the ceiling', not a permanently blocked plan."""
+        c = agent["constraints"]
+        cap = c["budget_ceiling"]
+        if agent["reputation"]["tier"] == "NEW":
+            cap = min(cap, self.config["low_stakes_ceiling"])
+        return max(min(cap, int(c["budget_ceiling"] * c["escalation_threshold_pct"] / 100)), min(cap, approved_up_to))
+
     def _is_anomalous(self, a: dict, amount: int) -> bool:
         if a["auction_type"] == "DUTCH":
             return False  # Dutch price follows the seller's own descending schedule
         s = self.intel.historical_clearing_prices(a["product_spec"]["category"])
-        return (s["count"] >= self.config["anomaly_min_samples"] and s["median"] > 0
-                and amount > s["median"] * self.config["anomaly_multiple"])
+        if s["count"] < self.config["anomaly_min_samples"] or not s["unit_median"]:
+            return False
+        qty = max(1, a["product_spec"]["quantity"])  # compare PER UNIT: a 100-unit lot is not "anomalous" next to single-unit history
+        return amount / qty > s["unit_median"] * self.config["anomaly_multiple"]
 
     def _breaker_active(self, category: str, now: int) -> bool:
         b = self.store.breakers.get(category.lower())

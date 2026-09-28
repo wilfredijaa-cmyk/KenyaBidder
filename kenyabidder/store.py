@@ -36,6 +36,31 @@ class Store:
         s.settings = data.get("settings", {})
         return s
 
+    def prune(self, now: int) -> dict:
+        """Bound everything that only ever grew. The scaling path is a real database; until then, nothing may grow forever."""
+        n = {}
+        if len(self.idempotency) > 20_000:
+            for k in list(self.idempotency)[: len(self.idempotency) - 20_000]:  # dicts keep insertion order: oldest first
+                del self.idempotency[k]
+            n["idempotency"] = True
+        for name, cap in (("audit", 50_000), ("notifications", 5_000), ("market_history", 20_000), ("outbox", 1_000), ("admin_log", 5_000), ("reveal_log", 20_000)):
+            lst = getattr(self, name)
+            if len(lst) > cap:
+                del lst[: len(lst) - cap]
+                n[name] = True
+        week = 7 * 24 * 3600_000
+        for tid in [t["id"] for t in self.triggers.values() if t["status"] in ("DONE", "CANCELLED", "EXHAUSTED", "BLOCKED") and now - t["created_at"] > week]:
+            del self.triggers[tid]
+        for aid in [a["id"] for a in self.approvals.values() if a["status"] != "PENDING" and now - (a.get("resolved_at") or a["created_at"]) > 30 * 24 * 3600_000]:
+            del self.approvals[aid]
+        fails = self.settings.get("login_failures", {})
+        for k in [k for k, ts in fails.items() if not [t for t in ts if now - t < 5 * 60_000]]:
+            del fails[k]  # expired lockout entries (incl. names that never existed) must not accumulate
+        if len(fails) > 10_000:
+            for k in list(fails)[: len(fails) - 10_000]:
+                del fails[k]
+        return n
+
     def serialize(self) -> str:
         """Consistent point-in-time JSON (call on the event-loop thread that owns the state)."""
         return json.dumps(self.snapshot(), default=str)

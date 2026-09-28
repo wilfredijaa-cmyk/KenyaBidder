@@ -21,6 +21,8 @@ HISTORY = {
     "building": [61_000, 63_500, 59_800, 64_200, 62_100],
 }
 
+LOT_SIZE = {"electronics": 10, "furniture": 8, "agriculture": 40, "building": 60}  # typical lot each history price refers to
+
 SELLERS = [
     ("Demo - Nairobi Electronics Hub", "electronics"),
     ("Demo - Kisumu Office Supplies", "furniture"),
@@ -58,7 +60,7 @@ def seed_demo(app, *, seed: int | None = None) -> dict:
     for cat, prices in HISTORY.items():
         for i, price in enumerate(prices):
             store.market_history.append({"category": cat, "auction_type": rnd.choice(["ENGLISH", "DUTCH", "SECOND_PRICE_SEALED"]), "price": price + rnd.randint(-400, 400),
-                                         "quantity": 1, "at": now - (i + 1) * 2 * DAY, "demo": True})
+                                         "quantity": LOT_SIZE[cat], "at": now - (i + 1) * 2 * DAY, "demo": True})
     created = []
     for idx, title, cat, qty, typ, reserve, start, extra in LISTINGS:
         dur = rnd.choice([2, 3, 4, 6]) * HOUR

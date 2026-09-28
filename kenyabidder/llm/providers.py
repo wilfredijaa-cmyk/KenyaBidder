@@ -109,7 +109,10 @@ class AnthropicProvider:
             raise LlmError(f"{type(e).__name__}: {e}") from e
         text = "".join(b.text for b in r.content if b.type == "text")
         calls = [ToolCall(b.id, b.name, dict(b.input or {})) for b in r.content if b.type == "tool_use"]
-        usage = {"input": getattr(r.usage, "input_tokens", 0), "output": getattr(r.usage, "output_tokens", 0)}
+        u = r.usage
+        # with prompt caching, input_tokens is only the UNCACHED remainder — cache writes/reads are processed tokens too
+        usage = {"input": (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "cache_creation_input_tokens", 0) or 0) + (getattr(u, "cache_read_input_tokens", 0) or 0),
+                 "output": getattr(u, "output_tokens", 0) or 0}
         return Completion(text, calls, r.stop_reason or "", usage)
 
 

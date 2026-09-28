@@ -10,12 +10,15 @@ Trigger kinds:
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
 import uuid
 
 from .engine import effective_end, is_open
 from .errors import bad, forbidden, not_found
+
+log = logging.getLogger("kenyabidder.execution")
 
 KIND_FOR_TYPE = {"ENGLISH": "ENGLISH_INCREMENTAL", "DUTCH": "DUTCH_ACCEPT",
                  "FIRST_PRICE_SEALED": "SEALED_BID", "SECOND_PRICE_SEALED": "SEALED_BID"}
@@ -65,7 +68,7 @@ class ExecutionEngine:
         _validate_params(kind, params)
         for t in self.store.triggers.values():
             if t["agent_id"] == agent_id and t["auction_id"] == auction_id and t["status"] in LIVE:
-                t["status"] = "CANCELLED"
+                self._cancel(t, "superseded by a newer plan")
         t = {"id": str(uuid.uuid4()), "agent_id": agent_id, "auction_id": auction_id, "kind": kind,
              "params": dict(params), "status": "ACTIVE", "reasoning": reasoning, "source": source,
              "fired_count": 0, "approval_id": None, "approved_up_to": 0, "last_rejection": None,
@@ -78,9 +81,16 @@ class ExecutionEngine:
         n = 0
         for t in self.store.triggers.values():
             if t["agent_id"] == agent_id and t["status"] in LIVE:
-                t["status"], t["last_error"] = "CANCELLED", reason
+                self._cancel(t, reason)
                 n += 1
         return n
+
+    def _cancel(self, t: dict, reason: str) -> None:
+        """Cancel a plan AND withdraw its pending approval card, so nobody is asked to approve something that no longer exists."""
+        t["status"], t["last_error"] = "CANCELLED", reason
+        ap = self.store.approvals.get(t.get("approval_id") or "")
+        if ap and ap["status"] == "PENDING":
+            ap["status"], ap["resolved_at"] = "EXPIRED", self.clock.now()
 
     def triggers_for(self, agent_id: str) -> list[dict]:
         return [t for t in self.store.triggers.values() if t["agent_id"] == agent_id]
@@ -88,8 +98,23 @@ class ExecutionEngine:
     # ---------- evaluation loop ----------
 
     def evaluate_all(self) -> None:
-        for auction_id in {t["auction_id"] for t in list(self.store.triggers.values()) if t["status"] == "ACTIVE"}:
-            self.evaluate_auction(auction_id)
+        for auction_id in {t["auction_id"] for t in list(self.store.triggers.values()) if t["status"] in LIVE}:
+            try:
+                self.evaluate_auction(auction_id)
+            except Exception:  # noqa: BLE001
+                log.exception("evaluating auction %s failed", auction_id)
+
+    def _retire_dangling(self, auction_id: str) -> None:
+        """A plan waiting for approval on an auction that has since closed can never fire: retire it and its approval card."""
+        a = self.store.auctions.get(auction_id)
+        if a and a["status"] not in ("SETTLED", "CANCELLED"):
+            return
+        for t in self.store.triggers.values():
+            if t["auction_id"] == auction_id and t["status"] == "AWAITING_APPROVAL":
+                t["status"], t["last_error"] = "CANCELLED", "auction closed while waiting for approval"
+                ap = self.store.approvals.get(t.get("approval_id") or "")
+                if ap and ap["status"] == "PENDING":
+                    ap["status"], ap["resolved_at"] = "EXPIRED", self.clock.now()
 
     def evaluate_auction(self, auction_id: str) -> None:
         """Evaluate to a fixed point; events raised by our own bids are absorbed by the loop."""
@@ -97,11 +122,16 @@ class ExecutionEngine:
             return
         self._evaluating.add(auction_id)
         try:
+            self._retire_dangling(auction_id)
             for _ in range(10_000):
                 fired = False
                 for t in list(self.store.triggers.values()):
                     if t["auction_id"] == auction_id and t["status"] == "ACTIVE":
-                        fired = self._evaluate(t) or fired
+                        try:
+                            fired = self._evaluate(t) or fired
+                        except Exception:  # noqa: BLE001  one poisoned record must not starve every other trigger on every tick
+                            log.exception("trigger %s failed; blocking it", t["id"])
+                            t["status"], t["last_error"] = "BLOCKED", "INTERNAL_ERROR"
                 if not fired:
                     break
         finally:
@@ -142,7 +172,8 @@ class ExecutionEngine:
             last = a["bids"][-1] if a["bids"] else None
             # increment_pct may be fractional (LLMs say 2.5): always land on an integer amount
             stepped = math.ceil(last["amount"] * (100 + (p.get("increment_pct") or 0)) / 100) if last else needed
-            return self._fire(t, a, int(min(p["max_bid"], max(needed, stepped))))
+            cap = min(p["max_bid"], self.guardrail.soft_cap(agent, t["approved_up_to"]))  # a step must never overshoot the agent's own limits
+            return self._fire(t, a, int(max(needed, min(stepped, cap))))
         if t["kind"] == "DUTCH_ACCEPT":
             price = self.engine.current_price(a, now)
             return self._fire(t, a, price) if price <= p["threshold"] else False
@@ -236,6 +267,12 @@ class ExecutionEngine:
             raise not_found("APPROVAL_NOT_FOUND", "approval not found")
         if ap["status"] != "PENDING":
             raise bad("APPROVAL_RESOLVED", f"approval already {ap['status']}")
+        a = self.store.auctions.get(ap["auction_id"])
+        if a:
+            self.engine._advance(a)  # judge by the clock, not by a status the tick loop has not refreshed yet
+        if approve and (not a or a["status"] in ("SETTLED", "CANCELLED")):
+            ap["status"], ap["resolved_at"] = "EXPIRED", self.clock.now()
+            raise bad("AUCTION_CLOSED", "that auction has already closed — nothing to approve")
         ap["status"] = "APPROVED" if approve else "REJECTED"
         ap["resolved_at"] = self.clock.now()
         t = self.store.triggers.get(ap["trigger_id"])

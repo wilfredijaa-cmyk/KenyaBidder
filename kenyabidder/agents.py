@@ -118,30 +118,47 @@ class AgentService:
         return u
 
     MAX_FAILURES, LOCKOUT_MS = 5, 5 * 60_000
+    _DUMMY_HASH = "scrypt$" + "00" * 16 + "$" + "00" * 32
 
-    def authenticate(self, name: str, password: str) -> dict | None:
-        """Verify credentials. After 5 failures for a name (existing or not) further attempts are refused for 5 minutes."""
-        key = (name or "").strip().lower()
-        now = self.clock.now()
-        fails = [t for t in self.store.settings.setdefault("login_failures", {}).get(key, []) if now - t < self.LOCKOUT_MS]
+    def _lockout_check(self, key: str, now: int) -> list[int]:
+        book = self.store.settings.setdefault("login_failures", {})
+        if len(book) > 2_000:  # attackers can invent endless names: drop expired entries whenever the book gets big
+            for k in [k for k, ts in book.items() if not [t for t in ts if now - t < self.LOCKOUT_MS]]:
+                del book[k]
+        fails = [t for t in book.get(key, []) if now - t < self.LOCKOUT_MS]
         if len(fails) >= self.MAX_FAILURES:
             raise AppError("TOO_MANY_ATTEMPTS", "too many failed sign-in attempts — try again in a few minutes", 429)
-        u = self._authenticate(name, password)
-        if u and u.get("suspended"):  # only revealed to someone who knows the password
-            raise AppError("ACCOUNT_SUSPENDED", "this account has been suspended — contact support", 403)
-        if u:
-            self.store.settings["login_failures"].pop(key, None)
-        else:
-            self.store.settings["login_failures"][key] = [*fails, now]
-        return u
+        return fails
 
-    def _authenticate(self, name: str, password: str) -> dict | None:
-        u = next((u for u in self.store.users.values() if u["name"].lower() == (name or "").strip().lower()), None)
-        # verify against a dummy hash when the user is unknown so timing does not reveal which names exist
-        if not u:
-            verify_password(password or "", "scrypt$" + "00" * 16 + "$" + "00" * 32)
-            return None
-        return u if verify_password(password or "", u["password_hash"]) else None
+    def _find(self, name: str) -> dict | None:
+        return next((u for u in self.store.users.values() if u["name"].lower() == (name or "").strip().lower()), None)
+
+    def _login_result(self, key: str, fails: list[int], now: int, u: dict | None, ok: bool) -> dict | None:
+        if u and ok and u.get("suspended"):  # only revealed to someone who knows the password
+            raise AppError("ACCOUNT_SUSPENDED", "this account has been suspended — contact support", 403)
+        book = self.store.settings["login_failures"]
+        if u and ok:
+            book.pop(key, None)
+            return u
+        book[key] = [*fails, now]
+        return None
+
+    def authenticate(self, name: str, password: str) -> dict | None:
+        """Verify credentials (blocking; fine for scripts/tests). After 5 failures for a name (existing or not) further
+        attempts are refused for 5 minutes. Unknown names cost the same scrypt time, so timing reveals nothing."""
+        key, now = (name or "").strip().lower(), self.clock.now()
+        fails = self._lockout_check(key, now)
+        u = self._find(name)
+        return self._login_result(key, fails, now, u, verify_password(password or "", u["password_hash"] if u else self._DUMMY_HASH))
+
+    async def authenticate_async(self, name: str, password: str) -> dict | None:
+        """Same as authenticate, but the ~50ms scrypt runs on a worker thread so a flood of logins can never stall bidding."""
+        import asyncio
+        key, now = (name or "").strip().lower(), self.clock.now()
+        fails = self._lockout_check(key, now)
+        u = self._find(name)
+        ok = await asyncio.to_thread(verify_password, password or "", u["password_hash"] if u else self._DUMMY_HASH)
+        return self._login_result(key, fails, now, u, ok)
 
     def change_password(self, user_id: str, old: str, new: str) -> None:
         u = self.store.users.get(user_id)
@@ -359,12 +376,17 @@ class AgentService:
     def update(self, agent_id: str, *, constraints: dict | None = None, memory: dict | None = None,
                config: dict | None = None, status: str | None = None) -> dict:
         agent = self.get_agent(agent_id)
-        if constraints:
-            agent["constraints"] = self._constraints(agent["agent_type"], {**agent["constraints"], **constraints})
-        if memory:
-            self._apply_memory(agent, memory)
-        if config is not None:
-            agent["config"] = self._config(agent, config)
+        before = copy.deepcopy((agent["constraints"], agent["durable_memory"], agent["config"]))
+        try:  # all-or-nothing: an error in the config must not leave the (already applied) raised ceiling live
+            if constraints:
+                agent["constraints"] = self._constraints(agent["agent_type"], {**agent["constraints"], **constraints})
+            if memory:
+                self._apply_memory(agent, memory)
+            if config is not None:
+                agent["config"] = self._config(agent, config)
+        except Exception:
+            agent["constraints"], agent["durable_memory"], agent["config"] = before
+            raise
         if status is not None:
             self.set_status(agent_id, status)
         return agent

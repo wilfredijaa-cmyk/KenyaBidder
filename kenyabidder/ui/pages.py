@@ -44,7 +44,7 @@ def login_page():
 
                     @guard
                     def sign_in():
-                        u = core().agents.authenticate(name.value, pw.value)
+                        u = await core().agents.authenticate_async(name.value, pw.value)
                         if not u:
                             ui.notify("Wrong name or password", type="negative")
                             return

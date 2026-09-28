@@ -22,6 +22,7 @@ class LlmRegistry:
         self._factory = provider_factory  # tests inject fakes
         self._overrides: dict[str, Provider] = {}
         self._cache: dict[str, tuple[tuple, Provider]] = {}
+        self.deletion_blockers: list = []  # callables(llm_id) -> list[str] of reasons (wallet balances, packs, open orders)
 
     # ---------- CRUD ----------
 
@@ -56,6 +57,9 @@ class LlmRegistry:
         users = [a["agent_id"][:6] for a in self.store.agents.values() if llm_id in _llm_refs(a)]
         if users:
             raise conflict("IN_USE", f"LLM is assigned to agent(s): {', '.join(users)} — unassign it first")
+        reasons = [r for check in self.deletion_blockers for r in check(llm_id)]
+        if reasons:
+            raise conflict("IN_USE", "cannot delete this LLM — " + "; ".join(reasons) + ". Disable it instead.")
         del self.store.llms[llm_id]
         self._overrides.pop(llm_id, None)
         self._cache.pop(llm_id, None)

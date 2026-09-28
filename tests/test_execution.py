@@ -175,16 +175,88 @@ def test_kind_and_params_validation(env):
         assert e.value.code == code
 
 
-def test_market_anomaly_trips_circuit_breaker(env):
+def test_market_anomaly_pauses_autonomous_bidding_and_resumes_after_the_cooldown(env):
+    _, s = env.seller()
+    for _ in range(5):
+        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": 1000, "quantity": 1, "at": 1})   # ~1,000 per unit
+    _, b = env.bidder(ceiling=1_000_000)
+    a = env.english(s["agent_id"], start_price=50_000, reserve_price=50_000, duration_ms=3600_000, product_spec={"category": "electronics", "title": "T", "quantity": 10})  # 5,000/unit
+    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 900_000})
+    assert t["status"] == "ACTIVE" and t["last_rejection"] == "MARKET_ANOMALY"          # paused, NOT permanently blocked
+    assert "electronics" in env.store.breakers and any(n["kind"] == "anomaly" for n in env.router.notifications_for(b["agent_id"]))
+    assert not env.engine.get_auction(a["auction_id"])["bids"]
+    env.clock.advance(11 * 60_000)                                                       # cooldown over
+    env.guardrail.config["anomaly_multiple"] = 10**6                                     # (the price itself is still 5x — disarm the check)
+    env.app.tick()
+    assert env.engine.get_auction(a["auction_id"])["bids"][-1]["agent_id"] == b["agent_id"]   # the same plan resumed by itself
+
+
+def test_a_manual_bid_can_neither_trip_nor_be_stopped_by_the_breaker(env):
     _, s = env.seller()
     for _ in range(5):
         env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": 1000, "quantity": 1, "at": 1})
-    _, b = env.bidder(ceiling=1_000_000)
-    a = env.english(s["agent_id"], start_price=50_000, reserve_price=50_000)
-    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 900_000})
-    assert t["status"] == "BLOCKED" and t["last_error"] == "MARKET_ANOMALY"
-    assert "electronics" in env.store.breakers
-    assert any(n["kind"] == "anomaly" for n in env.router.notifications_for(b["agent_id"]))
+    _, human = env.bidder(ceiling=1_000_000)
+    a = env.english(s["agent_id"], start_price=1000, reserve_price=1000, product_spec={"category": "electronics", "title": "T", "quantity": 1})
+    r = env.app.manual_bid(human["agent_id"], a["auction_id"], 90_000)                   # 90x the median: the human's call
+    assert r["ok"] and "electronics" not in env.store.breakers                           # and nobody else's agents were halted
+
+
+def test_a_100_unit_lot_is_not_mistaken_for_an_anomaly(env):
+    _, s = env.seller()
+    for _ in range(5):
+        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": 1000, "quantity": 1, "at": 1})
+    _, b = env.bidder(ceiling=10**7)
+    a = env.english(s["agent_id"], start_price=100_000, reserve_price=100_000, product_spec={"category": "electronics", "title": "Pallet", "quantity": 100})
+    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 500_000})
+    assert env.engine.get_auction(a["auction_id"])["bids"][-1]["amount"] == 100_000 and not env.store.breakers
+
+
+def test_stepped_bids_never_overshoot_the_agents_own_ceiling(env):
+    """Regression: a 20% step past the ceiling was rejected as permanent, so a valid bid up to the ceiling was never placed."""
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=1000)
+    _, rival = env.bidder(ceiling=10**6)
+    a = env.english(s["agent_id"], start_price=900, reserve_price=900, min_increment=1)
+    env.engine.submit_bid(auction_id=a["auction_id"], agent_id=rival["agent_id"], amount=900)
+    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 5000, "increment_pct": 20, "snipe_window_ms": 0})
+    top = env.engine.get_auction(a["auction_id"])["bids"][-1]
+    assert t["status"] != "BLOCKED" and top["agent_id"] == b["agent_id"] and top["amount"] == 1000   # 900*1.2=1080 clamped to the ceiling
+
+
+def test_a_poisoned_trigger_cannot_starve_the_rest(env):
+    _, s = env.seller()
+    _, good = env.bidder()
+    _, bad = env.bidder()
+    a = env.english(s["agent_id"])
+    tg = trig(env, good, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 5000, "snipe_window_ms": 5000})
+    tb = trig(env, bad, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 5000, "snipe_window_ms": 5000})
+    del env.store.agents[bad["agent_id"]]["reputation"]["tier"]                            # a record restored from an old snapshot
+    env.clock.advance(56_000)
+    env.app.tick()
+    assert tb["status"] == "BLOCKED" and tb["last_error"] == "INTERNAL_ERROR"
+    assert env.engine.get_auction(a["auction_id"])["bids"][-1]["agent_id"] == good["agent_id"] and tg["status"] == "ACTIVE"
+
+
+def test_cancelled_or_closed_plans_withdraw_their_approval_cards(env):
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=10_000, constraints={"escalation_threshold_pct": 50})
+    a = env.english(s["agent_id"], start_price=6000, reserve_price=6000)
+    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 9000})
+    ap = env.store.approvals[t["approval_id"]]
+    env.agents.set_status(b["agent_id"], "PAUSED")                                         # revoking authority withdraws the pending card
+    assert t["status"] == "CANCELLED" and ap["status"] == "EXPIRED"
+    env.agents.set_status(b["agent_id"], "ACTIVE")
+    a2 = env.english(s["agent_id"], start_price=6000, reserve_price=6000, duration_ms=1000)
+    t2 = trig(env, b, a2["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 9000})
+    ap2 = env.store.approvals[t2["approval_id"]]
+    env.clock.advance(2000)
+    env.app.tick()                                                                         # the auction closed while waiting
+    assert t2["status"] == "CANCELLED" and ap2["status"] == "EXPIRED"
+    ap3_t = trig(env, b, env.english(s["agent_id"], start_price=6000, reserve_price=6000, duration_ms=1000)["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 9000})
+    env.clock.advance(2000)
+    with pytest.raises(AppError) as e:                                                     # approving something that no longer exists is refused
+        env.execution.resolve_approval(ap3_t["approval_id"], True)
+    assert e.value.code == "AUCTION_CLOSED"
 
 
 def test_sealed_trigger_submits_once_and_wins(env):

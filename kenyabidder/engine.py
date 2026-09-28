@@ -313,7 +313,7 @@ class AuctionEngine:
             return {**self.store.idempotency[key], "replayed": True}
         res = self._submit(auction_id, agent_id, amount, bid_type, idempotency_key)
         if key and res["ok"]:
-            self.store.idempotency[key] = res
+            self.store.idempotency[key] = {"ok": True, "bid": res["bid"]}  # small on purpose: a replay needs the outcome, not the auction
         return res
 
     def _submit(self, auction_id, agent_id, amount, bid_type, idempotency_key) -> dict:

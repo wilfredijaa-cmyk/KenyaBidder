@@ -48,10 +48,12 @@ class HeuristicStrategy:
         a, ceiling = ctx["auction"], ctx["agent"]["constraints"]["budget_ceiling"]
         stats = (ctx.get("intel") or {}).get("stats") or {}
         floor_price = a["dutch"]["floor_price"] if a["auction_type"] == "DUTCH" else (a["start_price"] if a["start_price"] is not None else a["reserve_price"])
-        value = _clamp(stats["median"] * 1.05 if stats.get("median") else ceiling, 1, ceiling)
+        qty = max(1, a["product_spec"]["quantity"])
+        est = stats["unit_median"] * qty if stats.get("unit_median") else stats.get("median")  # per-unit history scaled to THIS lot's size
+        value = _clamp(est * 1.05 if est else ceiling, 1, ceiling)
         if value < floor_price:
             return {"action": "SKIP", "reasoning": f"Estimated value {value} is below the opening/floor price {floor_price}."}
-        basis = f"median clearing price {stats['median']} (n={stats['count']})" if stats.get("median") else "no price history, using the budget ceiling"
+        basis = (f"typical clearing price {round(est)} for {qty} unit(s) (n={stats['count']})" if est else "no price history, using the budget ceiling")
         t = a["auction_type"]
         if t == "ENGLISH":
             snipe = _clamp((a["ends_at"] - a["starts_at"]) * 0.1, 0, 10_000)

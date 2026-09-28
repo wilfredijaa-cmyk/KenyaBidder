@@ -23,6 +23,7 @@ class Runtime:
         self.app = create_app(store=self.store, clock=SystemClock(), wallet_path=wallet_path)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
+        self._last_payload: str | None = None
         s = self.store.settings
         s.setdefault("storage_secret", secrets.token_hex(32))
         s.setdefault("mcp_key", secrets.token_urlsafe(24))
@@ -52,7 +53,9 @@ class Runtime:
             await asyncio.sleep(5)
             try:
                 payload = self.store.serialize()  # consistent snapshot on the loop thread…
-                await asyncio.to_thread(self.store.write_atomic, self.data_file, payload)  # …disk I/O off it (bid latency)
+                if payload != self._last_payload:  # …skip the disk write entirely when nothing changed
+                    await asyncio.to_thread(self.store.write_atomic, self.data_file, payload)  # …disk I/O off the loop (bid latency)
+                    self._last_payload = payload
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
 
@@ -66,7 +69,8 @@ class Runtime:
                     await step()
                 except Exception:  # noqa: BLE001
                     log.exception("%s failed", name)
-            for name, sync_step in (("order expiry", a.billing.expire_stale), ("evening summaries", a.sellers.send_daily_summaries)):
+            for name, sync_step in (("order expiry", a.billing.expire_stale), ("evening summaries", a.sellers.send_daily_summaries),
+                                    ("pruning", lambda: self.store.prune(a.clock.now()))):
                 try:
                     sync_step()
                 except Exception:  # noqa: BLE001  one failing job must not skip the others
