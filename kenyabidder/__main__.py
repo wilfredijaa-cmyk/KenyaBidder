@@ -14,7 +14,7 @@ from nicegui import ui
 from . import runtime as runtime_mod
 from .channels import handle_whatsapp_webhook
 from .errors import AppError
-from .ui import admin, agents_page, common, pages
+from .ui import admin, agents_page, common, pages, wallet_page
 
 
 def build(runtime: runtime_mod.Runtime) -> None:
@@ -22,6 +22,7 @@ def build(runtime: runtime_mod.Runtime) -> None:
     common.bind(runtime)
     pages.register()
     agents_page.register()
+    wallet_page.register()
     admin.register()
     ng_app.on_startup(runtime.start)
     ng_app.on_shutdown(runtime.stop)
@@ -38,6 +39,17 @@ def build(runtime: runtime_mod.Runtime) -> None:
         if token and hmac.compare_digest(q.get("hub.verify_token", ""), token):
             return PlainTextResponse(q.get("hub.challenge", ""))
         raise HTTPException(403, "webhook verification failed")
+
+    @ng_app.post("/webhooks/mpesa/{secret}")
+    async def mpesa_callback(secret: str, request: Request):
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            payload = {}
+        try:
+            return await core.billing.handle_mpesa_callback(secret, payload)
+        except AppError as e:
+            raise HTTPException(e.status, e.message) from None
 
     @ng_app.post("/webhooks/whatsapp")
     async def wa_inbound(request: Request):

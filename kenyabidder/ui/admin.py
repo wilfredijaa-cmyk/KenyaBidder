@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import shlex
 
+from ..demo import clear_demo, seed_demo
+from ..terms import DEFAULT_TERMS, get_terms, set_terms
+
 from nicegui import ui
 
 from ..llm.registry import PROVIDERS
-from .common import badge, core, empty, frame, guard, pretty, require_admin, rt
+from ..wallet import billing_of
+from .common import (admin_user, badge, core, empty, fmt_datetime, frame, guard, guard_admin, kes, pretty, require_admin, rt)
 
 ROLE_OPTS = {"BIDDER": "buyer agents", "SELLER": "seller agents"}
 
@@ -22,7 +26,8 @@ def admin_page():
     with frame(user, "/admin"):
         ui.label("Administration").classes("text-lg font-medium")
         with ui.tabs().classes("w-full") as tabs:
-            t_llm, t_mcp, t_kb, t_users, t_ep = ui.tab("LLMs"), ui.tab("MCP servers"), ui.tab("Knowledge bases"), ui.tab("Users"), ui.tab("Our MCP endpoint")
+            t_llm, t_mcp, t_kb, t_bill, t_users, t_setup, t_log, t_ep = (ui.tab("LLMs"), ui.tab("MCP servers"), ui.tab("Knowledge bases"), ui.tab("Billing"),
+                                                                          ui.tab("Users"), ui.tab("Legal & demo"), ui.tab("Audit log"), ui.tab("Our MCP endpoint"))
         with ui.tab_panels(tabs, value=t_llm).classes("w-full"):
             with ui.tab_panel(t_llm):
                 llm_panel()
@@ -30,8 +35,14 @@ def admin_page():
                 mcp_panel()
             with ui.tab_panel(t_kb):
                 kb_panel()
+            with ui.tab_panel(t_bill):
+                billing_panel()
             with ui.tab_panel(t_users):
                 users_panel(user)
+            with ui.tab_panel(t_setup):
+                setup_panel()
+            with ui.tab_panel(t_log):
+                log_panel()
             with ui.tab_panel(t_ep):
                 endpoint_panel()
 
@@ -58,13 +69,15 @@ def llm_panel():
                     badge(PROVIDERS[e["provider"]]["label"].split(" (")[0])
                     badge(e["model"])
                     badge("enabled" if e["enabled"] else "disabled", "positive" if e["enabled"] else "warning")
+                    b = billing_of(e)
+                    badge("free (platform-funded)" if b["billing_mode"] == "free" else f"metered · output ×{b['output_multiplier']}", "grey" if b["billing_mode"] == "free" else "primary")
                     ui.space()
                     ui.label(_used_by("llm", e["id"])).classes("text-xs opacity-60")
                 key = "key stored" if e.get("api_key") else (f"key from ${e['api_key_env']}" if e.get("api_key_env") else "no key set")
                 ui.label(f"{e['base_url'] or 'default endpoint'} · {key} · roles: {', '.join(pretty(r) for r in e['roles'])} · max {e['max_tokens']} tokens · timeout {e['timeout_s']}s").classes("text-xs opacity-70")
                 out = ui.label().classes("text-sm")
 
-                @guard
+                @guard_admin
                 async def test(i=e["id"], out=out):
                     out.set_text("Testing…")
                     r = await core().llms.test(i)
@@ -73,12 +86,12 @@ def llm_panel():
                     ui.button("Test", icon="wifi_tethering", on_click=test).props("outline no-caps dense")
                     ui.button("Edit", icon="edit", on_click=lambda i=e["id"]: llm_dialog(i, listing.refresh)).props("outline no-caps dense")
 
-                    @guard
+                    @guard_admin
                     def flip(i=e["id"], en=e["enabled"]):
                         core().llms.update(i, enabled=not en)
                         listing.refresh()
 
-                    @guard
+                    @guard_admin
                     def delete(i=e["id"]):
                         core().llms.remove(i)
                         listing.refresh()
@@ -92,7 +105,8 @@ def llm_dialog(llm_id: str | None, done) -> None:
     cur = core().llms.get(llm_id) if llm_id else None
     f = {"name": cur["name"] if cur else "", "provider": cur["provider"] if cur else "anthropic", "model": cur["model"] if cur else PROVIDERS["anthropic"]["default_model"],
          "base_url": cur["base_url"] if cur else "", "api_key": "", "api_key_env": cur["api_key_env"] if cur else "", "max_tokens": cur["max_tokens"] if cur else 1024,
-         "temperature": cur["temperature"] if cur else None, "timeout_s": cur["timeout_s"] if cur else 30, "roles": cur["roles"] if cur else ["BIDDER", "SELLER"], "notes": cur["notes"] if cur else ""}
+         "temperature": cur["temperature"] if cur else None, "timeout_s": cur["timeout_s"] if cur else 30, "roles": cur["roles"] if cur else ["BIDDER", "SELLER"], "notes": cur["notes"] if cur else "",
+         **(billing_of(cur) if cur else {"billing_mode": "metered", "output_multiplier": 1, "cost_per_1k_kes": 0.0})}
     with ui.dialog() as d, ui.card().classes("w-[36rem] max-w-full"):
         ui.label("Edit LLM" if cur else "Add LLM").classes("text-lg font-medium")
         ui.input("Display name", value=f["name"], on_change=lambda e: f.update(name=e.value)).classes("w-full")
@@ -111,9 +125,18 @@ def llm_dialog(llm_id: str | None, done) -> None:
             ui.number("Temperature", value=f["temperature"], min=0, max=2, step=0.1, on_change=lambda e: f.update(temperature=e.value)).classes("w-36")
             ui.number("Timeout (s)", value=f["timeout_s"], min=1, on_change=lambda e: f.update(timeout_s=e.value)).classes("w-36")
         ui.select(ROLE_OPTS, value=f["roles"], multiple=True, label="May be used by", on_change=lambda e: f.update(roles=e.value)).props("use-chips").classes("w-full")
+        ui.separator()
+        ui.label("Billing").classes("font-medium")
+        ui.select({"metered": "Metered — users buy tokens for this model", "free": "Free — platform pays, no tokens needed"}, value=f["billing_mode"], label="Who pays for this model?",
+                  on_change=lambda e: f.update(billing_mode=e.value)).classes("w-full")
+        with ui.row().classes("w-full"):
+            ui.number("Output token weight", value=f["output_multiplier"], min=1, max=50, precision=0, on_change=lambda e: f.update(output_multiplier=int(e.value or 1))).classes("w-44").tooltip(
+                "Output tokens count this many times. Providers charge ~5x more for output than input, so 5 keeps your margin honest.")
+            ui.number("Your cost per 1k tokens (KES)", value=f["cost_per_1k_kes"], min=0, step=0.1, on_change=lambda e: f.update(cost_per_1k_kes=float(e.value or 0))).classes("w-60").tooltip(
+                "What the provider charges you. Used only for the margin report.")
         ui.textarea("Notes", value=f["notes"], on_change=lambda e: f.update(notes=e.value)).classes("w-full")
 
-        @guard
+        @guard_admin
         def save():
             if cur:
                 core().llms.update(llm_id, **f)
@@ -150,23 +173,23 @@ def mcp_panel():
                 if m["last_error"]:
                     ui.label(f"⚠ {m['last_error']}").classes("text-sm text-negative")
 
-                @guard
+                @guard_admin
                 async def refresh(i=m["id"]):
                     tools = await core().mcps.refresh_tools(i)
                     ui.notify(f"Discovered {len(tools)} tool(s)", type="positive")
                     listing.refresh()
 
-                @guard
+                @guard_admin
                 def flip(i=m["id"], en=m["enabled"]):
                     core().mcps.update(i, enabled=not en)
                     listing.refresh()
 
-                @guard
+                @guard_admin
                 def delete(i=m["id"]):
                     core().mcps.remove(i)
                     listing.refresh()
 
-                @guard
+                @guard_admin
                 def set_roles(e, i=m["id"]):
                     if e.value:
                         core().mcps.update(i, roles=e.value)
@@ -189,7 +212,7 @@ def mcp_panel():
     ui.button("Add MCP server", icon="add", on_click=lambda: mcp_dialog(listing.refresh)).props("unelevated color=primary")
     listing()
 
-    @guard
+    @guard_admin
     async def first_discovery():
         b = core().mcps.ensure_builtin()
         if not b["tools"]:
@@ -223,7 +246,7 @@ def mcp_dialog(done) -> None:
         form()
         ui.select(ROLE_OPTS, value=f["roles"], multiple=True, label="Available to", on_change=lambda e: f.update(roles=e.value)).props("use-chips").classes("w-full")
 
-        @guard
+        @guard_admin
         async def save():
             env = {}
             for line in f["env"].splitlines():
@@ -266,17 +289,17 @@ def kb_panel():
                 if kb["description"]:
                     ui.label(kb["description"]).classes("text-sm opacity-70")
 
-                @guard
+                @guard_admin
                 def flip(i=kb["id"], en=kb["enabled"]):
                     core().kb.update(i, enabled=not en)
                     listing.refresh()
 
-                @guard
+                @guard_admin
                 def delete(i=kb["id"]):
                     core().kb.remove(i)
                     listing.refresh()
 
-                @guard
+                @guard_admin
                 def set_roles(e, i=kb["id"]):
                     if e.value:
                         core().kb.update(i, roles=e.value)
@@ -292,7 +315,7 @@ def kb_panel():
                         ui.label(f"{doc['chars']:,} chars · {len(doc['chunks'])} chunks · {doc['source'][:60]}").classes("text-xs opacity-60")
                         ui.space()
 
-                        @guard
+                        @guard_admin
                         def rm(k=kb["id"], dd=doc["id"]):
                             core().kb.remove_doc(k, dd)
                             listing.refresh()
@@ -305,7 +328,7 @@ def kb_panel():
         q = ui.input("Search all enabled knowledge bases").classes("w-full")
         res = ui.column().classes("w-full gap-1")
 
-        @guard
+        @guard_admin
         def run():
             res.clear()
             hits = core().kb.search(q.value, None, 5)
@@ -327,7 +350,7 @@ def kb_dialog(done) -> None:
         ui.textarea("Description", on_change=lambda e: f.update(description=e.value)).classes("w-full")
         ui.select(ROLE_OPTS, value=f["roles"], multiple=True, label="Available to", on_change=lambda e: f.update(roles=e.value)).props("use-chips").classes("w-full")
 
-        @guard
+        @guard_admin
         def save():
             core().kb.create(f["name"], f["description"], f["roles"])
             d.close()
@@ -349,7 +372,7 @@ def doc_dialog(kb_id: str, done) -> None:
                 ui.input("Title", on_change=lambda e: f.update(title=e.value)).classes("w-full")
                 ui.textarea("Text", on_change=lambda e: f.update(text=e.value)).props("rows=8").classes("w-full")
 
-                @guard
+                @guard_admin
                 def add_text():
                     core().kb.add_text(kb_id, f["title"], f["text"])
                     d.close()
@@ -359,7 +382,7 @@ def doc_dialog(kb_id: str, done) -> None:
             with ui.tab_panel(t2):
                 ui.label("Plain text, markdown, CSV, JSON or HTML (PDF if pypdf is installed). Max ~500k characters.").classes("text-xs opacity-70")
 
-                @guard
+                @guard_admin
                 async def on_upload(e):
                     data = await e.file.read()
                     core().kb.add_file(kb_id, e.file.name, data)
@@ -371,7 +394,7 @@ def doc_dialog(kb_id: str, done) -> None:
                 ui.input("URL", placeholder="https://…", on_change=lambda e: f.update(url=e.value)).classes("w-full")
                 ui.label("Only public http(s) addresses are fetched; internal/private hosts are blocked.").classes("text-xs opacity-70")
 
-                @guard
+                @guard_admin
                 async def add_url():
                     await core().kb.add_url(kb_id, f["url"], f["title"])
                     d.close()
@@ -385,22 +408,87 @@ def doc_dialog(kb_id: str, done) -> None:
 # ============================================================================= users + endpoint
 
 def users_panel(me: dict):
+    c = core()
+
     @ui.refreshable
     def listing():
-        for u in sorted(core().store.users.values(), key=lambda x: x["created_at"]):
+        for u in sorted(c.store.users.values(), key=lambda x: x["created_at"]):
             with ui.card().classes("w-full"):
                 with ui.row().classes("w-full items-center gap-2"):
                     ui.label(u["name"]).classes("font-medium")
                     badge(u["role"], "primary" if u["role"] == "admin" else "grey")
-                    ui.label(f"{len(core().agents.agents_for(u['id']))} agent(s)").classes("text-xs opacity-60")
-                    ui.space()
+                    if u.get("suspended"):
+                        badge("suspended", "negative")
+                    if u.get("demo"):
+                        badge("demo")
+                    ui.label(f"{len(c.agents.agents_for(u['id']))} agent(s) · {u.get('phone') or 'no phone'}").classes("text-xs opacity-60")
+                if u.get("demo"):
+                    continue
 
-                    @guard
-                    def flip(i=u["id"], r=u["role"]):
-                        core().agents.set_role(i, "user" if r == "admin" else "admin")
-                        listing.refresh()
-                    ui.button("Make user" if u["role"] == "admin" else "Make admin", on_click=flip).props("outline no-caps dense")
+                @guard_admin
+                def flip_role(i=u["id"], r=u["role"]):
+                    c.agents.set_role(i, "user" if r == "admin" else "admin")
+                    c.billing.log_admin(admin_user(), "set_role", user=c.store.users[i]["name"], role="user" if r == "admin" else "admin")
+                    listing.refresh()
+
+                @guard_admin
+                def flip_susp(i=u["id"], s=bool(u.get("suspended"))):
+                    c.agents.set_suspended(i, not s, by=admin_user()["id"])
+                    c.billing.log_admin(admin_user(), "suspend_user" if not s else "reinstate_user", user=c.store.users[i]["name"])
+                    listing.refresh()
+                with ui.row().classes("gap-1"):
+                    ui.button("Make user" if u["role"] == "admin" else "Make admin", on_click=flip_role).props("outline no-caps dense")
+                    ui.button("Reinstate" if u.get("suspended") else "Suspend", on_click=flip_susp).props("outline no-caps dense color=" + ("primary" if u.get("suspended") else "negative"))
+                    ui.button("Reset password", on_click=lambda i=u["id"]: reset_dialog(i)).props("outline no-caps dense")
+                    ui.button("Grant tokens", icon="bolt", on_click=lambda i=u["id"]: grant_dialog(i, listing.refresh)).props("outline no-caps dense")
+                bal = c.wallet.balances(u["id"])
+                if bal:
+                    ui.label("Tokens: " + " · ".join(f"{c.store.llms.get(k, {}).get('name', '?')}: {v:,}" for k, v in bal.items())).classes("text-xs opacity-70")
     listing()
+
+
+def reset_dialog(user_id: str) -> None:
+    c = core()
+    with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
+        ui.label(f"Reset password for {c.store.users[user_id]['name']}").classes("text-lg font-medium")
+        ui.label("There is no email reset yet: set a temporary password and pass it on securely.").classes("text-xs opacity-70")
+        pw = ui.input("Temporary password (8+ characters)", password=True, password_toggle_button=True).classes("w-full")
+
+        @guard_admin
+        def go():
+            c.agents.admin_reset_password(user_id, pw.value)
+            c.billing.log_admin(admin_user(), "reset_password", user=c.store.users[user_id]["name"])
+            d.close()
+            ui.notify("Password reset", type="positive")
+        with ui.row().classes("justify-end w-full"):
+            ui.button("Cancel", on_click=d.close).props("flat")
+            ui.button("Reset", on_click=go).props("unelevated color=primary")
+    d.open()
+
+
+def grant_dialog(user_id: str, done) -> None:
+    c = core()
+    llms = [e for e in c.llms.list() if c.meter.is_metered(e)]
+    f = {"llm": llms[0]["id"] if llms else None, "n": 50_000, "why": ""}
+    with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
+        ui.label(f"Grant tokens to {c.store.users[user_id]['name']}").classes("text-lg font-medium")
+        ui.select({e["id"]: e["name"] for e in llms}, value=f["llm"], label="LLM", on_change=lambda e: f.update(llm=e.value)).classes("w-full")
+        ui.number("Tokens (negative to deduct)", value=f["n"], precision=0, on_change=lambda e: f.update(n=int(e.value or 0))).classes("w-full")
+        ui.input("Reason (required)", on_change=lambda e: f.update(why=e.value)).classes("w-full")
+
+        @guard_admin
+        def go():
+            if f["n"] >= 0:
+                c.billing.admin_grant(admin_user(), user_id, f["llm"], f["n"], f["why"])
+            else:
+                c.billing.admin_adjust(admin_user(), user_id, f["llm"], f["n"], f["why"])
+            d.close()
+            done()
+            ui.notify("Done", type="positive")
+        with ui.row().classes("justify-end w-full"):
+            ui.button("Cancel", on_click=d.close).props("flat")
+            ui.button("Apply", on_click=go).props("unelevated color=primary")
+    d.open()
 
 
 def endpoint_panel():
@@ -420,3 +508,228 @@ def endpoint_panel():
             ui.label("Bound to 127.0.0.1 by default; put it behind a TLS reverse proxy before exposing it.").classes("text-xs opacity-60")
         else:
             ui.label("The HTTP endpoint is disabled. Start with --mcp-port 8765 (or KENYABIDDER_MCP_PORT) to enable it.").classes("text-sm")
+
+
+# ============================================================================= billing
+
+def billing_panel():
+    c = core()
+    ui.label("Sell LLM tokens. Metered LLMs can only be used by agents whose owner holds tokens for that model. This is the platform's own revenue and is separate from "
+             "auction settlement — buyers and sellers still pay each other directly.").classes("text-sm opacity-70")
+
+    # ---- policy
+    with ui.card().classes("w-full"):
+        ui.label("When an agent has no tokens").classes("font-medium")
+
+        @guard_admin
+        def set_policy(e):
+            c.billing.set_policy(admin_user(), e.value)
+            ui.notify("Saved", type="positive")
+        ui.radio({"block": "Block — the agent stops making LLM decisions until its owner tops up (recommended)", "fallback": "Fall back — the agent keeps working with the free deterministic heuristic"},
+                 value=c.billing.policy, on_change=set_policy)
+
+    # ---- payments
+    with ui.card().classes("w-full"):
+        ui.label("Payment methods").classes("font-medium")
+        ui.label("M-Pesa STK push: " + ("configured" if c.billing.mpesa else "not configured — set MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY and MPESA_CALLBACK_BASE_URL"
+                                        + " (see README)")).classes("text-sm")
+        if c.billing.mpesa:
+            ui.label(f"Callback URL to register with Safaricom: {c.billing.mpesa.callback_url}").classes("text-xs font-mono opacity-70")
+        ui.label("Test payments: " + ("ENABLED (KENYABIDDER_DEV_PAYMENTS=1) — never in production" if c.billing.dev_payments else "off")).classes("text-sm" + ("" if not c.billing.dev_payments else " text-negative"))
+        instr = ui.textarea("Manual payment instructions (shown to buyers, e.g. \"Pay to Till 123456, KenyaBidder Ltd\")", value=c.billing.manual_instructions()).classes("w-full")
+
+        @guard_admin
+        def save_instr():
+            c.billing.set_manual_instructions(admin_user(), instr.value)
+            ui.notify("Saved" + ("" if instr.value.strip() else " — manual payments are now off"), type="positive")
+        ui.button("Save instructions", on_click=save_instr).props("outline no-caps dense")
+
+    # ---- signup grants
+    with ui.card().classes("w-full"):
+        ui.label("Free trial tokens on sign-up").classes("font-medium")
+        ui.label("Given once per phone number to every new account. Set to 0 to remove.").classes("text-xs opacity-70")
+        for e in [e for e in c.llms.list(enabled_only=True) if c.meter.is_metered(e)]:
+            cur = c.billing.signup_grants().get(e["id"], 0)
+            with ui.row().classes("items-center gap-3"):
+                ui.label(e["name"]).classes("w-48")
+                n = ui.number(value=cur, min=0, precision=0).classes("w-40")
+
+                @guard_admin
+                def save(llm_id=e["id"], n=n):
+                    c.billing.set_signup_grant(admin_user(), llm_id, int(n.value or 0))
+                    ui.notify("Saved", type="positive")
+                ui.button("Save", on_click=save).props("outline no-caps dense")
+
+    # ---- packs
+    with ui.card().classes("w-full"):
+        ui.label("Token packs").classes("font-medium")
+
+        @ui.refreshable
+        def packs():
+            rows = c.billing.list_packs()
+            if not rows:
+                empty("No packs yet.")
+            for p in rows:
+                llm = c.store.llms.get(p["llm_id"], {"name": "(deleted)"})
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.label(f"{p['name']} — {p['tokens']:,} {llm['name']} tokens for {kes(p['price_kes'])}").classes("grow")
+                    badge("on sale" if p["enabled"] else "hidden", "positive" if p["enabled"] else "warning")
+
+                    @guard_admin
+                    def toggle(pid=p["id"], en=p["enabled"]):
+                        c.billing.update_pack(admin_user(), pid, enabled=not en)
+                        packs.refresh()
+
+                    @guard_admin
+                    def delete(pid=p["id"]):
+                        c.billing.remove_pack(admin_user(), pid)
+                        packs.refresh()
+                    ui.button("Hide" if p["enabled"] else "Show", on_click=toggle).props("outline no-caps dense")
+                    ui.button(icon="delete", on_click=delete).props("outline dense color=negative")
+        packs()
+        ui.button("Add pack", icon="add", on_click=lambda: pack_dialog(packs.refresh)).props("unelevated color=primary")
+
+    # ---- orders awaiting review
+    with ui.card().classes("w-full"):
+        ui.label("Manual payments awaiting your review").classes("font-medium")
+
+        @ui.refreshable
+        def review():
+            rows = c.billing.list_orders(status="AWAITING_REVIEW")
+            if not rows:
+                empty("Nothing to review.")
+            for o in rows:
+                who = c.store.users.get(o["user_id"], {}).get("name", "?")
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.label(f"{o['reference']} · {who} · {kes(o['amount_kes'])} · code {o['receipt']}").classes("grow font-mono text-sm")
+
+                    @guard_admin
+                    def approve(i=o["id"]):
+                        c.billing.admin_review(admin_user(), i, True)
+                        ui.notify("Approved — tokens credited", type="positive")
+                        review.refresh()
+
+                    @guard_admin
+                    def reject(i=o["id"]):
+                        c.billing.admin_review(admin_user(), i, False, "payment could not be verified")
+                        review.refresh()
+                    ui.button("Approve", icon="check", on_click=approve).props("unelevated color=primary dense no-caps")
+                    ui.button("Reject", on_click=reject).props("outline color=negative dense no-caps")
+        review()
+        ui.label("Check the M-Pesa code, amount and reference in your M-Pesa statement BEFORE approving.").classes("text-xs opacity-60")
+        ui.timer(5.0, review.refresh)
+
+    # ---- revenue
+    with ui.card().classes("w-full"):
+        ui.label("Revenue & margin").classes("font-medium")
+
+        @ui.refreshable
+        def revenue():
+            r = c.billing.revenue_report()
+            with ui.row().classes("gap-6"):
+                for label, val in (("Revenue", kes(r["revenue_kes"])), ("Est. LLM cost", kes(round(r["est_cost_kes"]))), ("Margin", kes(round(r["margin_kes"]))),
+                                   ("Margin %", "—" if r["margin_pct"] is None else f"{r['margin_pct']}%")):
+                    with ui.column().classes("gap-0"):
+                        ui.label(label).classes("text-xs opacity-60")
+                        ui.label(val).classes("text-xl font-bold")
+            if r["by_llm"]:
+                ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("llm", "LLM"), ("orders", "Paid orders"), ("rev", "Revenue"), ("sold", "Tokens sold"),
+                                                                                                   ("granted", "Granted free"), ("used", "Tokens used"), ("cost", "Est. cost"), ("out", "Outstanding tokens"))],
+                         rows=[{"id": x["llm_id"], "llm": x["llm"], "orders": x["orders"], "rev": kes(x["revenue_kes"]), "sold": f"{x['tokens_sold']:,}", "granted": f"{x['tokens_granted']:,}",
+                                "used": f"{x['tokens_used']:,}", "cost": kes(round(x["est_cost_kes"])), "out": f"{x['tokens_outstanding']:,}"} for x in r["by_llm"]],
+                         row_key="id").classes("w-full").props("dense flat")
+            ui.label("Outstanding tokens are service you owe customers. Est. cost uses each LLM's 'cost per 1k tokens' and includes tokens you gave away or funded.").classes("text-xs opacity-60")
+        revenue()
+        ui.timer(10.0, revenue.refresh)
+        with ui.row():
+            ui.button("Export ledger (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.ledger_csv(), "ledger.csv", "text/csv")).props("outline no-caps")
+            ui.button("Export orders (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.orders_csv(), "orders.csv", "text/csv")).props("outline no-caps")
+
+
+def pack_dialog(done) -> None:
+    c = core()
+    llms = [e for e in c.llms.list() if c.meter.is_metered(e)]
+    f = {"name": "", "llm_id": llms[0]["id"] if llms else None, "tokens": 100_000, "price": 500, "desc": ""}
+    with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
+        ui.label("Add token pack").classes("text-lg font-medium")
+        if not llms:
+            ui.label("Register a metered LLM first.").classes("text-amber-700")
+        ui.input("Pack name", placeholder="Starter", on_change=lambda e: f.update(name=e.value)).classes("w-full")
+        ui.select({e["id"]: e["name"] for e in llms}, value=f["llm_id"], label="LLM", on_change=lambda e: f.update(llm_id=e.value)).classes("w-full")
+        ui.number("Tokens", value=f["tokens"], min=1000, precision=0, on_change=lambda e: f.update(tokens=int(e.value or 0))).classes("w-full")
+        ui.number("Price (KES)", value=f["price"], min=10, precision=0, on_change=lambda e: f.update(price=int(e.value or 0))).classes("w-full")
+        ui.input("Description (optional)", on_change=lambda e: f.update(desc=e.value)).classes("w-full")
+
+        @guard_admin
+        def save():
+            c.billing.add_pack(admin_user(), name=f["name"], llm_id=f["llm_id"], tokens=f["tokens"], price_kes=f["price"], description=f["desc"])
+            d.close()
+            done()
+        with ui.row().classes("justify-end w-full"):
+            ui.button("Cancel", on_click=d.close).props("flat")
+            ui.button("Add", on_click=save).props("unelevated color=primary")
+    d.open()
+
+
+# ============================================================================= setup / audit
+
+def setup_panel():
+    c = core()
+    with ui.card().classes("w-full"):
+        ui.label("Terms & Privacy Notice").classes("font-medium")
+        ui.label("Shown at sign-up. The default is a starting point only — have a lawyer review it (Kenya Data Protection Act 2019, consumer law) before launch.").classes("text-xs text-amber-700")
+        box = ui.textarea(value=get_terms(c.store)).props("rows=14").classes("w-full")
+
+        @guard_admin
+        def save():
+            set_terms(c.store, box.value)
+            c.billing.log_admin(admin_user(), "edit_terms")
+            ui.notify("Saved", type="positive")
+
+        def reset():
+            box.set_value(DEFAULT_TERMS)
+        with ui.row():
+            ui.button("Save terms", on_click=save).props("unelevated color=primary no-caps")
+            ui.button("Restore default", on_click=reset).props("outline no-caps")
+    with ui.card().classes("w-full"):
+        ui.label("Demo marketplace").classes("font-medium")
+        ui.label("Loads four demo sellers, 8 live listings across all auction types and price history so agents have something to work with. Demo sales never create real matches.").classes("text-sm opacity-70")
+        has = any(u.get("demo") for u in c.store.users.values())
+
+        @guard_admin
+        def load():
+            r = seed_demo(c)
+            c.billing.log_admin(admin_user(), "seed_demo", **r)
+            ui.notify(f"Loaded {r['listings']} listings", type="positive")
+            ui.navigate.reload()
+
+        @guard_admin
+        def clear():
+            r = clear_demo(c)
+            c.billing.log_admin(admin_user(), "clear_demo", **r)
+            ui.notify(f"Removed {r['listings']} listings and {r['users']} demo sellers", type="positive")
+            ui.navigate.reload()
+        with ui.row():
+            ui.button("Load demo data", icon="science", on_click=load).props("unelevated color=primary no-caps").set_enabled(not has)
+            ui.button("Remove demo data", icon="delete_sweep", on_click=clear).props("outline color=negative no-caps").set_enabled(has)
+
+
+def log_panel():
+    c = core()
+    with ui.card().classes("w-full"):
+        ui.label("Wallet integrity").classes("font-medium")
+        out = ui.label().classes("text-sm")
+
+        def check():
+            p = c.wallet.verify_integrity()
+            out.set_text("✓ Every balance matches the ledger." if not p else "✗ MISMATCH: " + "; ".join(p[:5]))
+        ui.button("Verify ledger vs balances", icon="fact_check", on_click=check).props("outline no-caps")
+    with ui.card().classes("w-full"):
+        ui.label("Admin actions (money, users, pricing)").classes("font-medium")
+        rows = list(reversed(c.store.admin_log[-200:]))
+        if not rows:
+            empty("Nothing yet.")
+        else:
+            ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("at", "Time (EAT)"), ("who", "Admin"), ("action", "Action"), ("detail", "Detail"))],
+                     rows=[{"id": i, "at": fmt_datetime(r["at"]), "who": r["admin"], "action": r["action"], "detail": ", ".join(f"{k}={v}" for k, v in r["detail"].items())} for i, r in enumerate(rows)],
+                     row_key="id").classes("w-full").props("dense flat")

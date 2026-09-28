@@ -97,7 +97,7 @@ def rules_tab(agent: dict) -> None:
     f = {"ceiling": c["budget_ceiling"], "floor": c["reserve_floor"], "esc": c["escalation_threshold_pct"], "types": list(c["authorized_auction_types"]),
          "cat": (m.get("watch") or {}).get("category") or "", "kw": ", ".join((m.get("watch") or {}).get("keywords", [])),
          "minq": (m.get("watch") or {}).get("min_quantity", 1), "auto": m.get("auto_bid", True),
-         "relist": bool(m.get("auto_relist")), "maxr": (m.get("auto_relist") or {}).get("max_relists", 3), "disc": (m.get("auto_relist") or {}).get("discount_pct", 10)}
+         "summary": m.get("daily_summary", True), "relist": bool(m.get("auto_relist")), "maxr": (m.get("auto_relist") or {}).get("max_relists", 3), "disc": (m.get("auto_relist") or {}).get("discount_pct", 10)}
     with ui.card().classes("w-full"):
         ui.label("Hard limits (enforced by the deterministic guardrail — the LLM cannot override them)").classes("font-medium")
         if role == "BIDDER":
@@ -116,6 +116,7 @@ def rules_tab(agent: dict) -> None:
                 ui.number("Min quantity", value=f["minq"], min=1, precision=0, on_change=lambda e: f.update(minq=int(e.value or 1))).classes("w-36")
         else:
             ui.label("Unsold lots").classes("font-medium mt-2")
+            ui.switch("Send me an evening summary (18:00 EAT) when there is activity", value=m.get("daily_summary", True), on_change=lambda e: f.update(summary=e.value))
             ui.switch("Auto-relist unsold lots at a lower reserve", value=f["relist"], on_change=lambda e: f.update(relist=e.value))
             with ui.row():
                 ui.number("Max relists", value=f["maxr"], min=0, max=20, precision=0, on_change=lambda e: f.update(maxr=int(e.value or 0))).classes("w-36")
@@ -129,7 +130,7 @@ def rules_tab(agent: dict) -> None:
                 core().agents.update(agent["agent_id"], constraints=constraints, memory={"auto_bid": f["auto"], "watch": watch})
             else:
                 core().agents.update(agent["agent_id"], constraints={"reserve_floor": f["floor"], "authorized_auction_types": f["types"]},
-                                     memory={"auto_relist": {"max_relists": f["maxr"], "discount_pct": f["disc"]} if f["relist"] else None})
+                                     memory={"auto_relist": {"max_relists": f["maxr"], "discount_pct": f["disc"]} if f["relist"] else None, "daily_summary": f["summary"]})
             ui.notify("Saved", type="positive")
         ui.button("Save rules", icon="save", on_click=save).props("unelevated color=primary").classes("mt-2")
 
@@ -141,7 +142,7 @@ def brain_tab(agent: dict) -> None:
     role, cfg = agent["agent_type"], agent["config"]
     llms = core().llms.list(enabled_only=True, role=role)
     llm_opts = {"": "— none —", **{l["id"]: f"{l['name']} ({l['model']})" for l in llms}}
-    st = {"llm": cfg["llm_id"] or "", "algos": {t: dict(v) for t, v in cfg["algorithms"].items()}, "advisor": dict(cfg["advisor"] or {"strategy": "rules", "llm_id": None}),
+    st = {"cap": cfg.get("max_tokens_per_day"), "llm": cfg["llm_id"] or "", "algos": {t: dict(v) for t, v in cfg["algorithms"].items()}, "advisor": dict(cfg["advisor"] or {"strategy": "rules", "llm_id": None}),
           "tools": set(cfg["tools"]), "kbs": set(cfg["kb_ids"]), "steps": cfg["max_tool_steps"]}
 
     with ui.card().classes("w-full"):
@@ -167,6 +168,9 @@ def brain_tab(agent: dict) -> None:
                 ui.select(llm_opts, value=st["advisor"].get("llm_id") or "", label="Advisor LLM override",
                           on_change=lambda e: st["advisor"].update(llm_id=e.value or None)).classes("w-72")
         ui.number("Max tool-call rounds per decision", value=st["steps"], min=0, max=10, precision=0, on_change=lambda e: st.update(steps=int(e.value or 0))).classes("w-72")
+        ui.number("Daily token cap for this agent (blank = no cap)", value=st["cap"], min=1000, precision=0, on_change=lambda e: st.update(cap=int(e.value) if e.value else None)).classes("w-96").tooltip(
+            "Stops a runaway agent from spending your whole wallet: once it has used this many tokens in 24 hours it waits.")
+        token_status(agent)
 
     with ui.card().classes("w-full"):
         ui.label("Tools (from registered MCP servers)").classes("font-medium")
@@ -202,9 +206,36 @@ def brain_tab(agent: dict) -> None:
     def save():
         core().agents.update(agent["agent_id"], config={"llm_id": st["llm"] or None, "algorithms": st["algos"] if role == "BIDDER" else {},
                                                         "advisor": st["advisor"] if role == "SELLER" else None, "tools": sorted(st["tools"]),
-                                                        "kb_ids": sorted(st["kbs"]), "max_tool_steps": st["steps"]})
+                                                        "kb_ids": sorted(st["kbs"]), "max_tool_steps": st["steps"], "max_tokens_per_day": st["cap"]})
         ui.notify("Brain configuration saved", type="positive")
     ui.button("Save brain, tools & knowledge", icon="save", on_click=save).props("unelevated color=primary")
+
+
+def token_status(agent: dict) -> None:
+    """Can this agent operate right now? Shown next to the LLM mapping so nobody is surprised by a silent agent."""
+    c = core()
+
+    @ui.refreshable
+    def box():
+        s = c.meter.status_for_agent(agent)
+        if not s["llms"] and not s["cap"]:
+            ui.label("This agent uses only deterministic algorithms, so it needs no tokens.").classes("text-xs opacity-70")
+            return
+        for r in s["llms"]:
+            if not r["metered"]:
+                ui.label(f"{r['name']}: free (platform-funded)").classes("text-sm text-primary")
+            elif r["ok"]:
+                ui.label(f"{r['name']}: {r['balance']:,} tokens — ready").classes("text-sm text-primary")
+            else:
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"{r['name']}: {r['balance']:,} tokens — needs at least {r['min_needed']:,}. The agent will {'wait' if c.meter.policy == 'block' else 'use the heuristic'} until you top up.").classes("text-sm text-negative")
+                    ui.link("Buy tokens", "/wallet").classes("text-sm")
+        if s["avg_decision_tokens"]:
+            ui.label(f"Typical cost: about {s['avg_decision_tokens']:,} tokens per LLM call (last 20).").classes("text-xs opacity-70")
+        if s["cap"]:
+            ui.label(f"Daily cap: {s['used_24h']:,} of {s['cap']:,} tokens used in the last 24h" + (" — cap reached, waiting" if s["cap_reached"] else "")).classes("text-xs opacity-70")
+    box()
+    ui.timer(5.0, box.refresh)
 
 
 # ----------------------------------------------------------------------------- channels + chat

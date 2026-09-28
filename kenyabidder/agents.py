@@ -95,6 +95,16 @@ class AgentService:
             raise bad("INVALID_PHONE", "enter a phone number such as 0712 345 678 or +254 712 345 678")
         return p
 
+    def set_email(self, user_id: str, email: str) -> dict:
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        email = (email or "").strip() or None
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise bad("INVALID_EMAIL", "that email address does not look right")
+        u["email"] = email
+        return u
+
     def set_phone(self, user_id: str, phone: str) -> dict:
         """Add/replace the contact phone (also claims the once-per-phone signup grant if there is one)."""
         u = self.store.users.get(user_id)

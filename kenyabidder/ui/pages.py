@@ -59,10 +59,13 @@ def login_page():
                     p2 = ui.input("Password (8+ characters)", password=True, password_toggle_button=True).classes("w-full")
                     ph = ui.input("Phone (shown to a counterparty only after both confirm a match)").classes("w-full")
                     em = ui.input("Email").classes("w-full")
+                    with ui.row().classes("items-center gap-1 no-wrap"):
+                        agree = ui.checkbox("I accept the")
+                        ui.link("Terms & Privacy Notice", "/terms", new_tab=True).classes("-ml-3 text-sm")
 
                     @guard
                     def sign_up():
-                        u = core().agents.create_user(name=n2.value, password=p2.value, phone=ph.value, email=em.value)
+                        u = core().agents.create_user(name=n2.value, password=p2.value, phone=ph.value, email=em.value, accepted_terms=bool(agree.value))
                         login_user(u)
                         ui.navigate.to("/agents")
                     ui.button("Create account", on_click=sign_up).props("unelevated color=primary").classes("w-full")
@@ -83,6 +86,7 @@ def auctions_page():
                 ui.button("Create an agent", on_click=lambda: ui.navigate.to("/agents")).props("unelevated color=primary")
             return
         agent_picker(user, lambda: ui.navigate.reload())
+        checklist(user, agent)
         if agent["agent_type"] == "SELLER":
             listing_form(agent)
         ui.label("Auctions").classes("text-lg font-medium")
@@ -112,6 +116,32 @@ def auctions_page():
                                 badge("yours", "primary")
         grid()
         ui.timer(1.0, grid.refresh)
+
+
+def checklist(user: dict, agent: dict) -> None:
+    """Getting-started card — shown until every step is done, then disappears."""
+    c = core()
+    steps = []
+    cfg = agent["config"]
+    if agent["agent_type"] == "BIDDER":
+        steps.append(("Tell your agent what to hunt for (category & budget)", bool((agent["durable_memory"].get("watch") or {}).get("category")), f"/agent/{agent['agent_id']}"))
+    else:
+        steps.append(("Create your first listing", any(a["seller_agent_id"] == agent["agent_id"] for a in c.store.auctions.values()), "/"))
+    if c.meter.llm_ids_for(agent):
+        st = c.meter.status_for_agent(agent)
+        steps.append(("Top up tokens so your agent's LLM can decide", st["ok"], "/wallet"))
+    elif any(c.meter.is_metered(e) for e in c.llms.list(enabled_only=True)):
+        steps.append(("Give your agent an LLM brain (optional)", bool(cfg.get("llm_id")), f"/agent/{agent['agent_id']}"))
+    steps.append(("Link WhatsApp to get alerts on your phone", bool(agent["channel_identity_map"]), f"/agent/{agent['agent_id']}"))
+    steps.append(("Add your phone number", bool(user.get("phone")), "/profile"))
+    if all(done for _, done, _ in steps):
+        return
+    with ui.card().classes("w-full border border-primary"):
+        ui.label("Getting started").classes("font-medium")
+        for text, done, link in steps:
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.icon("check_circle" if done else "radio_button_unchecked").classes("text-primary" if done else "opacity-50")
+                ui.link(text, link).classes("text-sm" + (" line-through opacity-60" if done else ""))
 
 
 def status_badge(v: dict) -> None:

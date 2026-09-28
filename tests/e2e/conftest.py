@@ -75,6 +75,7 @@ def base_url():
     # NiceGUI switches into a test mode when it sees PYTEST_* variables — the app under test must not inherit them
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST") and k != "KENYABIDDER_DATA"}
     env["PYTHONUNBUFFERED"] = "1"
+    env["KENYABIDDER_DEV_PAYMENTS"] = "1"  # instant test payments, so the browser can buy tokens without M-Pesa
     proc = subprocess.Popen([sys.executable, "-m", "kenyabidder", "--port", str(port), "--data", ""], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=Path(__file__).parents[2])
     url = f"http://127.0.0.1:{port}"
@@ -136,6 +137,9 @@ class Session:
         await self.p.get_by_label("Name").last.fill(self.name)
         await self.p.get_by_label("Password (8+ characters)").fill("password123")
         await self.p.get_by_label("Phone").fill(phone)
+        await self.p.get_by_role("button", name="Create account").click()   # consent is mandatory…
+        await self.toast("accept the Terms")
+        await self.p.get_by_text("I accept the").click()
         await self.p.get_by_role("button", name="Create account").click()
         await self.p.wait_for_url("**/agents")
 

@@ -19,7 +19,8 @@ class Runtime:
     def __init__(self, data_file: str | None = None, mcp_port: int | None = None, mcp_host: str = "127.0.0.1", tick_ms: int = 50):
         self.data_file = data_file
         self.store = Store.load(data_file) if data_file else Store()
-        self.app = create_app(store=self.store, clock=SystemClock())
+        wallet_path = str(Path(data_file).with_name("wallet.db")) if data_file else ":memory:"  # money lives in SQLite, not the JSON snapshot
+        self.app = create_app(store=self.store, clock=SystemClock(), wallet_path=wallet_path)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
         s = self.store.settings
@@ -55,6 +56,22 @@ class Runtime:
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
 
+    async def _maintenance_loop(self) -> None:
+        """Every 30s: recover lost M-Pesa callbacks, expire stale orders, wake capped/blocked agents, send evening summaries."""
+        a = self.app
+        while True:
+            await asyncio.sleep(30)
+            for name, step in (("mpesa reconcile", a.billing.reconcile), ("blocked retry", a.orchestrator.retry_blocked)):
+                try:
+                    await step()
+                except Exception:  # noqa: BLE001
+                    log.exception("%s failed", name)
+            try:
+                a.billing.expire_stale()
+                a.sellers.send_daily_summaries()
+            except Exception:  # noqa: BLE001
+                log.exception("maintenance failed")
+
     def save(self) -> None:
         if self.data_file:
             try:
@@ -73,7 +90,11 @@ class Runtime:
 
     def start(self) -> None:
         loop = asyncio.get_running_loop()
+        problems = self.app.wallet.verify_integrity()
+        if problems:  # never silently run with a ledger that disagrees with balances
+            log.error("WALLET INTEGRITY PROBLEMS: %s", "; ".join(problems[:5]))
         self.tasks.append(loop.create_task(self._tick_loop()))
+        self.tasks.append(loop.create_task(self._maintenance_loop()))
         if self.data_file:
             self.tasks.append(loop.create_task(self._save_loop()))
         if self.mcp_port:
@@ -84,3 +105,4 @@ class Runtime:
             t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.save()
+        self.app.wallet.close()

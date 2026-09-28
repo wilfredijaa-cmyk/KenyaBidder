@@ -67,7 +67,8 @@ def pretty(s: str) -> str:
 
 def current_user() -> dict | None:
     uid = ng_app.storage.user.get("uid")
-    return core().store.users.get(uid) if uid else None
+    u = core().store.users.get(uid) if uid else None
+    return None if (u and u.get("suspended")) else u  # a suspended account is signed out on its next page load
 
 
 def login_user(user: dict) -> None:
@@ -84,6 +85,39 @@ def require_user() -> dict | None:
     if not u:
         ui.navigate.to("/login")
     return u
+
+
+def guard_admin(fn):
+    """Like guard, but re-checks the *current* role at click time (a demoted admin's open page must stop working)."""
+    import functools
+
+    @functools.wraps(fn)
+    async def wrapper(*a, **kw):
+        u = current_user()
+        if not u or u["role"] != "admin":
+            ui.notify("Administrators only", type="negative")
+            return None
+        return await guard(fn)(*a, **kw)
+    return wrapper
+
+
+def admin_user() -> dict:
+    return current_user()
+
+
+def token_chip_state(user: dict) -> tuple[str, str, str]:
+    """(label, color, tooltip) for the header chip; empty label when no metered LLM exists."""
+    c = core()
+    metered = [e for e in c.llms.list(enabled_only=True) if c.meter.is_metered(e)]
+    if not metered:
+        return "", "grey", ""
+    bal = c.wallet.balances(user["id"])
+    total = sum(bal.get(e["id"], 0) for e in metered)
+    agent = active_agent(user)
+    ok = c.meter.status_for_agent(agent)["ok"] if agent else True
+    txt = f"{total / 1000:.1f}k" if total >= 1000 else str(total)
+    tip = " · ".join(f"{e['name']}: {bal.get(e['id'], 0):,}" for e in metered)
+    return f"{txt} tokens", ("primary" if ok else "negative"), tip + ("" if ok else " — your agent is waiting for tokens")
 
 
 def flash(message: str, kind: str = "info") -> None:
@@ -133,7 +167,7 @@ def guard(fn):
 
 # ---------- frame ----------
 
-NAV = [("/", "Auctions", "gavel"), ("/agents", "My agents", "smart_toy"), ("/inbox", "Inbox", "inbox"),
+NAV = [("/", "Auctions", "gavel"), ("/agents", "My agents", "smart_toy"), ("/wallet", "Wallet", "bolt"), ("/inbox", "Inbox", "inbox"),
        ("/matches", "Matches", "handshake"), ("/activity", "Activity", "receipt_long"), ("/platform", "Platform", "bar_chart")]
 
 
@@ -178,7 +212,10 @@ def frame(user: dict, active: str):
             with ui.menu():
                 for path, label, _ in NAV + ([("/admin", "Admin", "")] if user["role"] == "admin" else []):
                     ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
-        ui.label(user["name"]).classes("text-sm opacity-70 max-sm:hidden")
+        label, color, tip = token_chip_state(user)
+        if label:
+            ui.button(label, icon="bolt", on_click=lambda: ui.navigate.to("/wallet")).props(f"flat dense no-caps color={color}").tooltip(tip)
+        ui.button(user["name"], icon="person", on_click=lambda: ui.navigate.to("/profile")).props("flat dense no-caps color=grey-7").classes("max-sm:hidden")
         ui.button(icon="logout", on_click=logout).props("flat round").tooltip("Sign out")
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-3"):
         yield

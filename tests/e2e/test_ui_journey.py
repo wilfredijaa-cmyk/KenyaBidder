@@ -91,9 +91,11 @@ async def test_llm_tools_and_kb_end_to_end(make_session, mock_llm):
     await admin.p.get_by_label("Display name").fill("Mock GPT")
     await admin.p.get_by_label("Provider").click()
     await admin.p.get_by_role("option", name=re.compile("OpenAI-compatible")).click()
-    await admin.p.get_by_label("Model").fill("mock-1")
+    await admin.p.get_by_label("Model", exact=True).fill("mock-1")
     await admin.p.get_by_label("Base URL", exact=False).fill(mock_llm["url"])
     await admin.p.get_by_label("API key", exact=False).first.fill("sk-mock")
+    await admin.p.get_by_label("Who pays for this model?").click()
+    await admin.p.get_by_role("option", name=re.compile("^Free")).click()
     await admin.p.get_by_role("button", name="Save").click()
     await admin.p.wait_for_selector("text=Mock GPT")
     await admin.p.locator(".q-card", has_text="Mock GPT").get_by_role("button", name="Test").click()
@@ -192,3 +194,59 @@ async def test_pause_revokes_and_manual_bid_hits_guardrail(make_session):
     await buyer.toast("Paused")
     await buyer.p.wait_for_selector("text=Resume agent")
     assert not buyer.errors, buyer.errors
+
+
+async def test_token_gate_purchase_and_resume(make_session, mock_llm):
+    """An agent on a *metered* LLM cannot decide without tokens; the owner buys a pack and the agent takes over."""
+    admin = await make_session.admin()
+    await admin.goto("/admin")
+    await admin.p.get_by_role("button", name="Add LLM").click()
+    await admin.p.get_by_label("Display name").fill("Metered GPT")
+    await admin.p.get_by_label("Provider").click()
+    await admin.p.get_by_role("option", name=re.compile("OpenAI-compatible")).click()
+    await admin.p.get_by_label("Model", exact=True).fill("mock-2")
+    await admin.p.get_by_label("Base URL", exact=False).fill(mock_llm["url"])
+    await admin.p.get_by_label("API key", exact=False).first.fill("sk-mock")
+    await admin.p.get_by_role("button", name="Save").click()
+    await admin.p.wait_for_selector("text=Metered GPT")
+    await admin.p.get_by_role("tab", name="Billing").click()
+    await admin.p.get_by_role("button", name="Add pack").click()
+    await admin.p.get_by_label("Pack name").fill("Trial pack")
+    await admin.p.get_by_label("Tokens").fill("50000")
+    await admin.p.get_by_label("Price (KES)").fill("250")
+    await admin.p.get_by_role("button", name="Add", exact=True).click()
+    await admin.p.wait_for_selector("text=Trial pack")
+
+    seller, buyer = await make_session("TokSeller"), await make_session("TokBuyer")
+    await create_agent(seller, "seller")
+    await create_agent(buyer, "buyer")
+    await save_rules(buyer, **{"Budget ceiling per bid (KES)": 5000, "Category": "cat-tok"})
+    await buyer.p.get_by_role("tab", name="Brain, tools & knowledge").click()
+    await buyer.p.get_by_label("Default LLM").click()
+    await buyer.p.get_by_role("option", name=re.compile("Metered GPT")).click()
+    await buyer.p.locator(".q-select").filter(has_text="heuristic").first.click()
+    await buyer.p.get_by_role("option", name=re.compile("^llm")).click()
+    await buyer.p.get_by_role("button", name="Save brain, tools & knowledge").click()
+    await buyer.toast("Brain configuration saved")
+    await buyer.p.wait_for_selector("text=needs at least")          # the agent page says plainly it cannot operate yet
+
+    await list_english(seller, "Token phones", category="cat-tok", reserve=1000, start=1000, mins=3)
+    await buyer.goto("/inbox")
+    await buyer.p.wait_for_selector("text=Your agent is waiting", timeout=20000)   # told once, with a pointer to the wallet
+    await buyer.goto("/")
+    await buyer.p.locator(".q-card", has_text="Token phones").first.click()
+    await buyer.p.wait_for_selector("text=Bids (")
+    assert await buyer.p.get_by_role("cell", name="You", exact=True).count() == 0    # it has not bid
+
+    await buyer.goto("/wallet")
+    await buyer.p.get_by_role("button", name="Buy", exact=True).first.click()
+    await buyer.p.get_by_role("button", name="Continue").click()
+    await buyer.toast("Tokens added to your wallet")
+    await buyer.p.wait_for_selector("text=50,000")
+    await buyer.goto("/")                                                            # the top-up woke the agent: it now bids
+    await buyer.p.locator(".q-card", has_text="Token phones").first.click()
+    await buyer.p.get_by_role("cell", name="You", exact=True).first.wait_for(timeout=20000)
+    await buyer.goto("/wallet")
+    await buyer.p.wait_for_selector("text=LLM calls")                                # usage is itemised per agent
+    for s in (admin, seller, buyer):
+        assert not s.errors, s.errors
