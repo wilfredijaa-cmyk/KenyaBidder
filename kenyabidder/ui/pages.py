@@ -43,7 +43,7 @@ def login_page():
                     pw = ui.input("Password", password=True, password_toggle_button=True).classes("w-full")
 
                     @guard
-                    def sign_in():
+                    async def sign_in():
                         u = await core().agents.authenticate_async(name.value, pw.value)
                         if not u:
                             ui.notify("Wrong name or password", type="negative")
