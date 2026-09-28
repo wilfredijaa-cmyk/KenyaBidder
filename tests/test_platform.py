@@ -207,3 +207,60 @@ def test_snapshot_roundtrip(env, tmp_path):
     assert oct(p.stat().st_mode)[-3:] == "600"
     again = Store.load(p)
     assert len(again.auctions) == 1 and len(again.llms) == 1 and "builtin" in again.mcps
+
+
+def test_manual_bid_passes_guardrails_and_is_audited(env):
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=2000)
+    a = env.english(s["agent_id"])
+    over = env.app.manual_bid(b["agent_id"], a["auction_id"], 9999)
+    assert not over["ok"] and over["code"] == "CEILING_EXCEEDED"
+    ok = env.app.manual_bid(b["agent_id"], a["auction_id"], 1500)
+    assert ok["ok"] and env.engine.get_auction(a["auction_id"])["bids"][-1]["amount"] == 1500
+    kinds = [(e["proposed_action"]["action"], e["guardrail_decision"]) for e in env.audit.for_agent(b["agent_id"])]
+    assert ("manual_bid", "REJECTED") in kinds and ("manual_bid", "APPROVED") in kinds
+    low = env.app.manual_bid(b["agent_id"], a["auction_id"], 1200)
+    assert not low["ok"] and low["code"] in ("BID_TOO_LOW", "ALREADY_HIGHEST")
+
+
+def test_login_lockout_after_repeated_failures(env):
+    env.agents.create_user(name="Target User", password="correct-horse")
+    for _ in range(5):
+        assert env.agents.authenticate("target user", "wrong-guess") is None
+    with pytest.raises(AppError) as e:  # even the right password is refused while locked out
+        env.agents.authenticate("Target User", "correct-horse")
+    assert e.value.code == "TOO_MANY_ATTEMPTS" and e.value.status == 429
+    env.clock.advance(5 * 60_000 + 1)
+    assert env.agents.authenticate("Target User", "correct-horse")["name"] == "Target User"
+    for _ in range(5):  # unknown names are throttled identically (no user enumeration)
+        env.agents.authenticate("ghost", "x")
+    with pytest.raises(AppError):
+        env.agents.authenticate("ghost", "x")
+
+
+async def test_whatsapp_webhook_requires_valid_signature(env):
+    import hashlib, hmac, json
+    from kenyabidder.channels import handle_whatsapp_webhook
+    _, b = env.bidder(ceiling=1000)
+    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254711000111")
+    body = json.dumps({"entry": [{"changes": [{"value": {"messages": [{"from": "254711000111", "text": {"body": "ceiling 4000"}}]}}]}]}).encode()
+    sig = "sha256=" + hmac.new(b"appsecret", body, hashlib.sha256).hexdigest()
+
+    with pytest.raises(AppError) as e:  # unconfigured -> refused (an open webhook would let anyone approve bids)
+        await handle_whatsapp_webhook(env.router, body, sig, secret="")
+    assert e.value.code == "WEBHOOK_NOT_CONFIGURED"
+    for bad_sig in (None, "sha256=deadbeef", sig.replace("sha256=", "")):
+        with pytest.raises(AppError) as e:
+            await handle_whatsapp_webhook(env.router, body, bad_sig, secret="appsecret")
+        assert e.value.code == "BAD_SIGNATURE"
+    assert b["constraints"]["budget_ceiling"] == 1000  # nothing executed by rejected requests
+    ok = await handle_whatsapp_webhook(env.router, body, sig, secret="appsecret")
+    assert "4000" in ok["reply"] and b["constraints"]["budget_ceiling"] == 4000
+    assert any("4000" in m["text"] for m in env.store.outbox)
+    # dev opt-out accepts the simple {from,text} shape and ignores junk
+    dev = await handle_whatsapp_webhook(env.router, json.dumps({"from": "254711000111", "text": "status"}).encode(), None, secret="", allow_unsigned=True)
+    assert "BIDDER" in dev["reply"]
+    assert (await handle_whatsapp_webhook(env.router, b'{"hello": 1}', None, secret="", allow_unsigned=True))["ignored"]
+    with pytest.raises(AppError) as e:
+        await handle_whatsapp_webhook(env.router, b"not json", None, secret="", allow_unsigned=True)
+    assert e.value.code == "INVALID_JSON"

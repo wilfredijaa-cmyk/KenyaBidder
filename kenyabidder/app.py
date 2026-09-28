@@ -4,6 +4,7 @@ The LLM strategy lives behind the orchestrator and can only ever *propose*.
 """
 from __future__ import annotations
 
+import uuid
 from types import SimpleNamespace
 
 from .agents import AgentService
@@ -84,6 +85,22 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
         execution.evaluate_all()
         matches.expire_stale()
 
+    def manual_bid(agent_id: str, auction_id: str, amount: int) -> dict:
+        """Human override: an explicit user decision still passes the Guardrail Interceptor and is audited."""
+        d = guardrail.evaluate({"agent_id": agent_id, "auction_id": auction_id, "action": "place_bid", "amount": amount, "source": "user"})
+        result = None
+        key = f"manual:{uuid.uuid4()}"  # unique per click — a timestamp would collide and silently replay the previous bid
+        if d["decision"] == "APPROVED":
+            result = execution._submit_with_retry(auction_id=auction_id, agent_id=agent_id, amount=amount, idempotency_key=key)
+        audit.record(agent_id=agent_id, auction_id=auction_id, proposed_action={"action": "manual_bid", "amount": amount},
+                     guardrail_decision=d["decision"], rejection_reason=None if d["decision"] == "APPROVED" else f"{d['code']}: {d['reason']}",
+                     executed_action={"amount": amount, "idempotency_key": key} if result else None,
+                     execution_result={"ok": result["ok"], "code": result.get("code", "OK")} if result else None)
+        if d["decision"] != "APPROVED":
+            return {"ok": False, "code": d["code"], "message": d["reason"]}
+        return result
+
+    app.manual_bid = manual_bid
     app.tick = tick
     app.kpis = lambda: compute_kpis(store)
     app.recompute_reputation = lambda agent_id: recompute_reputation(store, agent_id)

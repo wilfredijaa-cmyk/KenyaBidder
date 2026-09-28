@@ -1,7 +1,11 @@
 """Channel Router (spec §7.3): every channel talks to the *agent*, never to a channel session."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
+import os
 import uuid
 
 import httpx
@@ -129,3 +133,38 @@ class ChannelRouter:
         if cmd == "summary":
             return h.seller_summary(agent["agent_id"]) if agent["agent_type"] == "SELLER" else h.status(agent)
         return "Commands: status, pause, resume, ceiling <amount>, approve <id>, reject <id>, summary, help"
+
+
+async def handle_whatsapp_webhook(router: ChannelRouter, raw_body: bytes, signature: str | None, *, secret: str | None = None,
+                                  allow_unsigned: bool | None = None) -> dict:
+    """Process an inbound WhatsApp Cloud API webhook.
+
+    The endpoint is public, and a message "from" a linked number can approve bids — so the payload MUST be
+    authenticated with Meta's ``X-Hub-Signature-256`` (HMAC-SHA256 of the raw body with the app secret).
+    Without ``WHATSAPP_APP_SECRET`` the webhook is refused unless ``KENYABIDDER_INSECURE_WEBHOOK=1`` (local dev only).
+    """
+    secret = secret if secret is not None else os.environ.get("WHATSAPP_APP_SECRET")
+    if allow_unsigned is None:
+        allow_unsigned = os.environ.get("KENYABIDDER_INSECURE_WEBHOOK") == "1"
+    if secret:
+        expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not signature or not hmac.compare_digest(signature, expected):
+            raise AppError("BAD_SIGNATURE", "invalid webhook signature", 403)
+    elif not allow_unsigned:
+        raise AppError("WEBHOOK_NOT_CONFIGURED", "set WHATSAPP_APP_SECRET to accept WhatsApp webhooks", 403)
+    try:
+        body = json.loads(raw_body)
+        msg = body["entry"][0]["changes"][0]["value"]["messages"][0]
+        sender, text = msg["from"], msg["text"]["body"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        try:
+            body = json.loads(raw_body)
+            sender, text = body.get("from"), body.get("text")
+        except (ValueError, AttributeError):
+            raise AppError("INVALID_JSON", "body is not valid JSON", 400) from None
+    if not sender or not isinstance(text, str):
+        return {"ok": True, "ignored": True}
+    out = await router.handle_inbound("WHATSAPP", str(sender), text)
+    if out["agent_id"]:
+        router.whatsapp.send_nowait(str(sender), out["reply"])
+    return {"ok": True, "reply": out["reply"]}

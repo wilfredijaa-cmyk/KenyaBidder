@@ -21,7 +21,7 @@ import re
 import uuid
 
 from .engine import AUCTION_TYPES
-from .errors import bad, conflict, forbidden, is_nonneg_int, not_found
+from .errors import AppError, bad, conflict, forbidden, is_nonneg_int, not_found
 
 STRATEGIES = ["baseline", "heuristic", "llm"]
 ADVISORS = ["rules", "llm"]
@@ -74,13 +74,40 @@ class AgentService:
         self.store.users[u["id"]] = u
         return u
 
+    MAX_FAILURES, LOCKOUT_MS = 5, 5 * 60_000
+
     def authenticate(self, name: str, password: str) -> dict | None:
+        """Verify credentials. After 5 failures for a name (existing or not) further attempts are refused for 5 minutes."""
+        key = (name or "").strip().lower()
+        now = self.clock.now()
+        fails = [t for t in self.store.settings.setdefault("login_failures", {}).get(key, []) if now - t < self.LOCKOUT_MS]
+        if len(fails) >= self.MAX_FAILURES:
+            raise AppError("TOO_MANY_ATTEMPTS", "too many failed sign-in attempts — try again in a few minutes", 429)
+        u = self._authenticate(name, password)
+        if u:
+            self.store.settings["login_failures"].pop(key, None)
+        else:
+            self.store.settings["login_failures"][key] = [*fails, now]
+        return u
+
+    def _authenticate(self, name: str, password: str) -> dict | None:
         u = next((u for u in self.store.users.values() if u["name"].lower() == (name or "").strip().lower()), None)
         # verify against a dummy hash when the user is unknown so timing does not reveal which names exist
         if not u:
             verify_password(password or "", "scrypt$" + "00" * 16 + "$" + "00" * 32)
             return None
         return u if verify_password(password or "", u["password_hash"]) else None
+
+    def set_role(self, user_id: str, role: str) -> dict:
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        if role not in ("admin", "user"):
+            raise bad("INVALID_ROLE", "role must be admin or user")
+        if u["role"] == "admin" and role != "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin") <= 1:
+            raise bad("LAST_ADMIN", "there must always be at least one administrator")
+        u["role"] = role
+        return u
 
     # ---------- agents ----------
 
