@@ -21,16 +21,19 @@ class LlmRegistry:
         self.store, self.clock = store, clock
         self._factory = provider_factory  # tests inject fakes
         self._overrides: dict[str, Provider] = {}
+        self._cache: dict[str, tuple[tuple, Provider]] = {}
 
     # ---------- CRUD ----------
 
     def add(self, *, name: str, provider: str, model: str, base_url: str = "", api_key: str = "", api_key_env: str = "",
             max_tokens: int = 1024, temperature: float | None = None, timeout_s: float = 30.0,
-            roles: list[str] | None = None, notes: str = "", enabled: bool = True) -> dict:
+            roles: list[str] | None = None, notes: str = "", enabled: bool = True,
+            billing_mode: str = "metered", output_multiplier: int = 1, cost_per_1k_kes: float = 0.0) -> dict:
         entry = self._validate({"name": name, "provider": provider, "model": model, "base_url": base_url,
                                 "api_key": api_key, "api_key_env": api_key_env, "max_tokens": max_tokens,
                                 "temperature": temperature, "timeout_s": timeout_s, "roles": roles or list(ROLES),
-                                "notes": notes, "enabled": enabled})
+                                "notes": notes, "enabled": enabled, "billing_mode": billing_mode,
+                                "output_multiplier": output_multiplier, "cost_per_1k_kes": cost_per_1k_kes})
         if any(e["name"].lower() == entry["name"].lower() for e in self.store.llms.values()):
             raise conflict("NAME_TAKEN", f"an LLM named {entry['name']!r} already exists")
         entry.update(id=str(uuid.uuid4()), created_at=self.clock.now())
@@ -55,6 +58,7 @@ class LlmRegistry:
             raise conflict("IN_USE", f"LLM is assigned to agent(s): {', '.join(users)} — unassign it first")
         del self.store.llms[llm_id]
         self._overrides.pop(llm_id, None)
+        self._cache.pop(llm_id, None)
 
     def get(self, llm_id: str) -> dict:
         e = self.store.llms.get(llm_id)
@@ -93,6 +97,17 @@ class LlmRegistry:
             raise bad("INVALID_LLM", "timeout_s must be between 0 and 300")
         if not e["roles"] or any(r not in ROLES for r in e["roles"]):
             raise bad("INVALID_LLM", "roles must be a non-empty subset of BIDDER, SELLER")
+        e.setdefault("billing_mode", "metered")
+        e.setdefault("output_multiplier", 1)
+        e.setdefault("cost_per_1k_kes", 0.0)
+        if e["billing_mode"] not in ("metered", "free"):
+            raise bad("INVALID_LLM", "billing_mode must be 'metered' (users buy tokens) or 'free' (platform-funded)")
+        m = e["output_multiplier"]
+        if not (isinstance(m, int) and not isinstance(m, bool) and 1 <= m <= 50):
+            raise bad("INVALID_LLM", "output_multiplier must be a whole number from 1 to 50 (output tokens count this many times)")
+        c = e["cost_per_1k_kes"]
+        if not (isinstance(c, (int, float)) and not isinstance(c, bool) and 0 <= c <= 1_000_000):
+            raise bad("INVALID_LLM", "cost_per_1k_kes must be a non-negative number")
         return {**e, "name": e["name"].strip(), "model": e["model"].strip()}
 
     # ---------- runtime ----------
@@ -112,11 +127,18 @@ class LlmRegistry:
         if self._factory:
             return self._factory(e)
         key = self.resolve_key(e)
+        fingerprint = (e["provider"], e["model"], e.get("base_url"), key, e["timeout_s"])
+        hit = self._cache.get(llm_id)
+        if hit and hit[0] == fingerprint:  # reuse the HTTP client/connection pool across decisions
+            return hit[1]
         if e["provider"] == "anthropic":
             if not key:
                 raise bad("NO_API_KEY", f"no API key for {e['name']!r} (set it here or via the {e.get('api_key_env') or 'ANTHROPIC_API_KEY'} env var)")
-            return AnthropicProvider(key, e["model"], e.get("base_url") or None, e["timeout_s"])
-        return OpenAICompatProvider(key, e["model"], e["base_url"], e["timeout_s"])
+            prov: Provider = AnthropicProvider(key, e["model"], e.get("base_url") or None, e["timeout_s"])
+        else:
+            prov = OpenAICompatProvider(key, e["model"], e["base_url"], e["timeout_s"])
+        self._cache[llm_id] = (fingerprint, prov)
+        return prov
 
     def set_provider_override(self, llm_id: str, provider: Provider) -> None:
         """Test hook / offline demos."""

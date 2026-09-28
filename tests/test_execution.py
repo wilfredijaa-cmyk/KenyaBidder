@@ -220,3 +220,16 @@ def test_standing_trigger_beats_late_manual_accept_single_settlement(env):
     assert not res["ok"] and res["code"] == "AUCTION_NOT_OPEN"
     assert len(settled) == 1 and len(env.store.matches) == 1
     assert env.engine.get_auction(a["auction_id"])["result"]["winner_agent_id"] == t1["agent_id"]
+
+
+def test_fractional_increment_pct_still_places_an_integer_bid(env):
+    """Regression: an LLM proposing increment_pct=2.5 produced a float amount and permanently blocked the trigger."""
+    _, s = env.seller()
+    _, b = env.bidder(ceiling=10**7)
+    _, rival = env.bidder(ceiling=10**7)
+    a = env.english(s["agent_id"], start_price=10_000, reserve_price=10_000)
+    env.engine.submit_bid(auction_id=a["auction_id"], agent_id=rival["agent_id"], amount=10_000)
+    t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 900_000, "increment_pct": 2.5, "snipe_window_ms": 0})
+    assert t["status"] == "ACTIVE" and t["last_error"] is None
+    top = env.engine.get_auction(a["auction_id"])["bids"][-1]
+    assert top["agent_id"] == b["agent_id"] and top["amount"] == 10_250 and isinstance(top["amount"], int)

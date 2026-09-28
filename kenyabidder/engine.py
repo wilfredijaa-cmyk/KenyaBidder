@@ -12,6 +12,10 @@ from .errors import AppError, bad, forbidden, is_nonneg_int, is_pos_int, not_fou
 from .events import Events
 
 AUCTION_TYPES = ["ENGLISH", "DUTCH", "FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"]
+
+# Listing text is shown to other users' LLM agents (which cost them tokens) — it must stay small.
+SPEC_LIMITS = {"category": 60, "title": 120, "description": 1000, "condition": 60, "brand": 60, "unit": 30}
+DEFAULT_LIMITS = {"max_open_listings": 50, "max_new_listings_per_minute": 10}
 SEALED = {"FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"}
 OPEN = {"ACTIVE", "EXTENDING"}
 
@@ -33,16 +37,17 @@ def _pub_bid(b: dict) -> dict:
 
 
 class AuctionEngine:
-    def __init__(self, store, clock, events: Events | None = None):
+    def __init__(self, store, clock, events: Events | None = None, limits: dict | None = None):
         self.store = store
         self.clock = clock
         self.events = events or Events()
+        self.limits = {**DEFAULT_LIMITS, **(limits or {})}
 
     # ---------- listings ----------
 
     def create_listing(self, *, seller_agent_id, product_spec, auction_type, duration_ms, reserve_price=0,
                        start_price=None, min_increment=1, starts_at=None, dutch=None, anti_snipe=None,
-                       relist_of=None, relist_count=0) -> dict:
+                       relist_of=None, relist_count=0, demo=False) -> dict:
         now = self.clock.now()
         seller = self.store.agents.get(seller_agent_id)
         if not seller or seller["agent_type"] != "SELLER":
@@ -50,15 +55,7 @@ class AuctionEngine:
         if seller["status"] != "ACTIVE":
             raise forbidden("AGENT_NOT_ACTIVE", "seller agent is not active")
 
-        spec = product_spec
-        if not isinstance(spec, dict):
-            raise bad("INVALID_SPEC", "product_spec is required")
-        if not isinstance(spec.get("category"), str) or not spec["category"].strip():
-            raise bad("INVALID_SPEC", "product_spec.category is required")
-        if not isinstance(spec.get("title"), str) or not spec["title"].strip():
-            raise bad("INVALID_SPEC", "product_spec.title is required")
-        if not is_pos_int(spec.get("quantity")):
-            raise bad("INVALID_SPEC", "product_spec.quantity must be a positive integer")
+        spec = self._clean_spec(product_spec)
         if auction_type not in AUCTION_TYPES:
             raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(AUCTION_TYPES)}")
         if auction_type not in seller["constraints"]["authorized_auction_types"]:
@@ -73,17 +70,18 @@ class AuctionEngine:
         starts_at = now if starts_at is None else starts_at
         if not isinstance(starts_at, int):
             raise bad("INVALID_START", "starts_at must be an epoch-ms integer")
+        self._check_listing_limits(seller_agent_id, now, relist=relist_of is not None)
 
         a = {
             "auction_id": str(uuid.uuid4()), "auction_type": auction_type,
             "status": "SCHEDULED" if starts_at > now else "ACTIVE",
             "seller_agent_id": seller_agent_id,
-            "product_spec": {**spec, "category": spec["category"].strip(), "title": spec["title"].strip()},
+            "product_spec": spec,
             "reserve_price": reserve_price, "current_price": None, "min_increment": 1, "start_price": None,
             "dutch": None, "anti_snipe": {"window_ms": 0, "extend_ms": 0}, "bids": [],
             "starts_at": starts_at, "ends_at": starts_at + duration_ms, "extended_until": None,
             "result": None, "relist_of": relist_of, "relist_count": relist_count, "created_at": now,
-            "closed_at": None,
+            "closed_at": None, "demo": bool(demo),
         }
         if auction_type == "ENGLISH":
             sp = reserve_price if start_price is None else start_price
@@ -111,6 +109,46 @@ class AuctionEngine:
         self.store.auctions[a["auction_id"]] = a
         self.events.emit("auction.created", auction_id=a["auction_id"])
         return self.view(a, seller_agent_id)
+
+    @staticmethod
+    def _clean_spec(spec) -> dict:
+        if not isinstance(spec, dict):
+            raise bad("INVALID_SPEC", "product_spec is required")
+        unknown = set(spec) - set(SPEC_LIMITS) - {"quantity"}
+        if unknown:
+            raise bad("INVALID_SPEC", f"unknown product_spec field(s): {', '.join(sorted(unknown))}")
+        for k in ("category", "title"):
+            if not isinstance(spec.get(k), str) or not spec[k].strip():
+                raise bad("INVALID_SPEC", f"product_spec.{k} is required")
+        if not is_pos_int(spec.get("quantity")):
+            raise bad("INVALID_SPEC", "product_spec.quantity must be a positive integer")
+        out: dict = {"quantity": spec["quantity"]}
+        for k, limit in SPEC_LIMITS.items():
+            if k not in spec or spec[k] in (None, ""):
+                continue
+            if not isinstance(spec[k], str):
+                raise bad("INVALID_SPEC", f"product_spec.{k} must be text")
+            v = spec[k].strip()
+            if len(v) > limit:
+                raise bad("INVALID_SPEC", f"product_spec.{k} is too long ({len(v)} > {limit} characters)")
+            out[k] = v
+        return out
+
+    def _check_listing_limits(self, seller_agent_id: str, now: int, relist: bool) -> None:
+        """Stop a seller flooding the marketplace (and, transitively, every watching agent's LLM budget)."""
+        open_n = recent = 0
+        for a in self.store.auctions.values():
+            if a["seller_agent_id"] != seller_agent_id:
+                continue
+            self._advance(a)  # judge by the clock, not by a status the tick loop has not refreshed yet
+            if a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING"):
+                open_n += 1
+            if now - a["created_at"] < 60_000:
+                recent += 1
+        if open_n >= self.limits["max_open_listings"]:
+            raise AppError("TOO_MANY_LISTINGS", f"this agent already has {open_n} open listings (limit {self.limits['max_open_listings']})", 429)
+        if not relist and recent >= self.limits["max_new_listings_per_minute"]:
+            raise AppError("LISTING_RATE_LIMIT", "too many listings created in the last minute — slow down", 429)
 
     def withdraw_listing(self, *, listing_id, seller_agent_id, reason="") -> dict:
         a = self._get(listing_id)
@@ -171,7 +209,7 @@ class AuctionEngine:
             "min_increment": a["min_increment"], "start_price": a["start_price"],
             "dutch": copy.deepcopy(a["dutch"]), "anti_snipe": dict(a["anti_snipe"]),
             "starts_at": a["starts_at"], "ends_at": a["ends_at"], "extended_until": a["extended_until"],
-            "bid_count": len(a["bids"]), "created_at": a["created_at"], "relist_of": a["relist_of"],
+            "bid_count": len(a["bids"]), "created_at": a["created_at"], "relist_of": a["relist_of"], "demo": a.get("demo", False),
             "reserve_met": (a["current_price"] >= a["reserve_price"] and bool(a["bids"]))
             if a["auction_type"] == "ENGLISH" else None,
             "result": copy.deepcopy(a["result"]) if a["result"] and (is_seller or a["status"] == "SETTLED") else None,
@@ -263,7 +301,7 @@ class AuctionEngine:
         if result["outcome"] == "SOLD":
             self.store.market_history.append({
                 "category": a["product_spec"]["category"].lower(), "auction_type": t,
-                "price": result["price"], "quantity": a["product_spec"]["quantity"], "at": now})
+                "price": result["price"], "quantity": a["product_spec"]["quantity"], "at": now, **({"demo": True} if a.get("demo") else {})})
         self.events.emit("auction.settled", auction_id=a["auction_id"], result=result)
 
     # ---------- bidding ----------

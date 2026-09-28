@@ -18,6 +18,7 @@ from typing import Any
 from .engine import AUCTION_TYPES
 from .llm.providers import Completion, ToolCall, ToolSpec
 from .prompts import bidder_prompt, seller_prompt
+from .wallet import AgentTokenCap, InsufficientTokens
 
 log = logging.getLogger("kenyabidder.strategy")
 
@@ -209,8 +210,8 @@ class LlmStrategy:
     """Tool-using LLM strategy. Any failure falls back to the heuristic so time-critical auctions never block (spec §12)."""
     name = "llm"
 
-    def __init__(self, llms, mcps, kb, store, fallback=None):
-        self.llms, self.mcps, self.kb, self.store = llms, mcps, kb, store
+    def __init__(self, llms, mcps, kb, store, fallback=None, meter=None):
+        self.llms, self.mcps, self.kb, self.store, self.meter = llms, mcps, kb, store, meter
         self.fallback = fallback or HeuristicStrategy()
 
     def llm_id_for(self, agent: dict, auction_type: str) -> str | None:
@@ -224,6 +225,8 @@ class LlmStrategy:
         try:
             entry = self.llms.get(llm_id)
             provider = self.llms.provider(llm_id)
+            if self.meter:  # every provider call reserves + settles the owner's tokens; no tokens, no call
+                provider = self.meter.wrap(provider, entry, agent, "bid_strategy")
             tb = Toolbox(agent, self.mcps, self.kb)
             user = self.store.users.get(agent["principal_user_id"], {"name": "the user"})["name"]
             spec = auction["product_spec"]
@@ -242,6 +245,10 @@ class LlmStrategy:
             proposal["trace"] = trace
             proposal["llm"] = entry["name"]
             return proposal
+        except (InsufficientTokens, AgentTokenCap) as e:
+            if self.meter and self.meter.policy == "fallback":
+                return await self._fallback(ctx, e.message)
+            return {"action": "BLOCKED", "code": e.code, "reasoning": e.message}  # policy 'block': the agent waits for tokens
         except Exception as e:  # noqa: BLE001  (timeouts, HTTP errors, missing key, disabled LLM…)
             return await self._fallback(ctx, "timeout" if isinstance(e, TimeoutError) else str(e)[:160])
 
@@ -253,8 +260,8 @@ class LlmStrategy:
 class SellerAdvisor:
     """Rule-based listing advice, optionally refined by the seller agent's assigned LLM + tools + KBs."""
 
-    def __init__(self, intel, llms, mcps, kb, store):
-        self.intel, self.llms, self.mcps, self.kb, self.store = intel, llms, mcps, kb, store
+    def __init__(self, intel, llms, mcps, kb, store, meter=None):
+        self.intel, self.llms, self.mcps, self.kb, self.store, self.meter = intel, llms, mcps, kb, store, meter
 
     async def recommend(self, agent: dict, category: str, quantity: int = 1, urgency: str = "normal", scarce: bool = False) -> dict:
         allowed = agent["constraints"]["authorized_auction_types"]
@@ -266,13 +273,16 @@ class SellerAdvisor:
         floor = agent["constraints"]["reserve_floor"]
         try:
             entry = self.llms.get(llm_id)
+            provider = self.llms.provider(llm_id)
+            if self.meter:
+                provider = self.meter.wrap(provider, entry, agent, "listing_advice")
             tb = Toolbox(agent, self.mcps, self.kb)
             user = self.store.users.get(agent["principal_user_id"], {"name": "the user"})["name"]
             prompt = (f"Recommend a listing for: category={category!r}, quantity={quantity}, urgency={urgency}, scarce={scarce}.\n"
                       f"Baseline rule-based advice: {json.dumps({k: rules[k] for k in ('auction_type', 'suggested_reserve', 'suggested_start_price')})}\n"
                       f"Market stats: {json.dumps(rules['market_stats'])}\nDemand: {json.dumps(rules['demand'])}")
             args, trace = await run_tool_loop(
-                self.llms.provider(llm_id), seller_prompt(user, agent, allowed, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names), prompt,
+                provider, seller_prompt(user, agent, allowed, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names), prompt,
                 PROPOSE_LISTING, tb, max_steps=agent["config"]["max_tool_steps"] if tb.specs else 0, max_tokens=entry["max_tokens"],
                 temperature=entry.get("temperature"), total_timeout=min(90.0, entry["timeout_s"] * (agent["config"]["max_tool_steps"] + 1)))
             if not args or args.get("auction_type") not in allowed:
@@ -285,5 +295,9 @@ class SellerAdvisor:
             sp = min(int(sp), reserve) if isinstance(sp, (int, float)) and not isinstance(sp, bool) and sp >= 0 and args["auction_type"] == "ENGLISH" else rules["suggested_start_price"]
             return {**rules, "auction_type": args["auction_type"], "suggested_reserve": reserve, "suggested_start_price": sp,
                     "reasoning": str(args.get("reasoning", ""))[:600], "source": f"llm:{entry['name']}", "trace": trace}
+        except (InsufficientTokens, AgentTokenCap) as e:
+            if self.meter and self.meter.policy == "fallback":
+                return {**rules, "reasoning": f"[{e.message}; rule-based fallback] " + rules["reasoning"], "source": "rules"}
+            raise  # policy 'block': the seller must top up to use the LLM advisor (the UI explains and links to Wallet)
         except Exception as e:  # noqa: BLE001
             return {**rules, "reasoning": f"[LLM unavailable: {str(e)[:120]}; rule-based fallback] " + rules["reasoning"]}

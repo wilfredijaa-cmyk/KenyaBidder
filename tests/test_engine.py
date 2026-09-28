@@ -154,3 +154,42 @@ def test_prefilter(env):
     assert len(lst(max_price=500)) == 0
     assert len(lst(min_quantity=5)) == 1
     assert len(lst(q="desk")) == 1
+
+
+def test_listing_text_is_capped_and_unknown_fields_rejected(env):
+    """Listing text is read by *other users'* LLM agents — unbounded text is a token-drain vector."""
+    _, s = env.seller()
+    ok = {"category": "electronics", "title": "Phones", "quantity": 1, "description": "d" * 1000}
+    assert env.english(s["agent_id"], product_spec=ok)["product_spec"]["description"] == "d" * 1000
+    for over in ({"description": "d" * 1001}, {"title": "t" * 121}, {"category": "c" * 61}, {"description": 12345}, {"payload": "x"}):
+        with pytest.raises(AppError) as e:
+            env.english(s["agent_id"], product_spec={**ok, **over})
+        assert e.value.code == "INVALID_SPEC"
+
+
+def test_listing_spam_limits(make_env):
+    env = make_env()
+    _, s = env.seller()
+    long = dict(duration_ms=10 * 3600_000)
+    for _ in range(10):
+        env.english(s["agent_id"], **long)
+    with pytest.raises(AppError) as e:
+        env.english(s["agent_id"], **long)
+    assert e.value.code == "LISTING_RATE_LIMIT"
+    for _ in range(4):  # 40 more over four minutes -> 50 open
+        env.clock.advance(61_000)
+        for _ in range(10):
+            env.english(s["agent_id"], **long)
+    env.clock.advance(61_000)
+    with pytest.raises(AppError) as e:
+        env.english(s["agent_id"], **long)
+    assert e.value.code == "TOO_MANY_LISTINGS"
+
+
+def test_closed_listings_do_not_count_towards_the_open_limit(make_env):
+    env = make_env()
+    _, s = env.seller()
+    for _ in range(10):
+        env.english(s["agent_id"])           # 60s auctions
+    env.clock.advance(120_000)               # all closed by the clock, tick loop not run
+    assert env.english(s["agent_id"])["status"] == "ACTIVE"

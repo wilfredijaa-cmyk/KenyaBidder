@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 
+from .timeutil import eat
+
 log = logging.getLogger("kenyabidder.seller")
 
 
@@ -30,7 +32,7 @@ class SellerService:
         reserve = max(seller["constraints"].get("reserve_floor", 0), int(a["reserve_price"] * factor))
         kw = dict(seller_agent_id=seller["agent_id"], product_spec=a["product_spec"], auction_type=a["auction_type"],
                   reserve_price=reserve, duration_ms=a["ends_at"] - a["starts_at"], relist_of=a["auction_id"],
-                  relist_count=a["relist_count"] + 1)
+                  relist_count=a["relist_count"] + 1, demo=a.get("demo", False))  # a relisted demo lot must stay a demo lot
         if a["auction_type"] == "ENGLISH":
             kw.update(start_price=min(reserve, max(0, int(a["start_price"] * factor))),
                       min_increment=a["min_increment"], anti_snipe=a["anti_snipe"])
@@ -46,7 +48,30 @@ class SellerService:
         self.notify(seller["agent_id"], "relist", f"\"{title}\" did not sell. Relisted with reserve {reserve} (attempt {a['relist_count'] + 1}).", auction_id=created["auction_id"])
         return created
 
-    def summary(self, agent_id: str) -> str:
+    SUMMARY_HOUR_EAT = 18
+
+    def send_daily_summaries(self) -> int:
+        """Persona A: 'sends her a WhatsApp summary each evening'. Once per EAT day per seller, from 18:00 EAT,
+        and only if there was anything to report."""
+        now = self.clock.now()
+        local = eat(now)
+        if local.hour < self.SUMMARY_HOUR_EAT:
+            return 0
+        day = local.strftime("%Y-%m-%d")
+        n = 0
+        for agent in list(self.store.agents.values()):
+            mem = agent["durable_memory"]
+            if agent["agent_type"] != "SELLER" or agent["status"] != "ACTIVE" or not mem.get("daily_summary") or mem.get("last_summary_day") == day:
+                continue
+            mem["last_summary_day"] = day
+            st = self.stats(agent["agent_id"])
+            if st["sold"] + st["unsold"] + st["live"] == 0:
+                continue
+            self.notify(agent["agent_id"], "summary", self.summary(agent["agent_id"]))
+            n += 1
+        return n
+
+    def stats(self, agent_id: str) -> dict:
         since = self.clock.now() - 24 * 3600_000
         sold = revenue = unsold = live = 0
         for a in self.store.auctions.values():
@@ -60,4 +85,8 @@ class SellerService:
                     revenue += a["result"]["price"]
                 else:
                     unsold += 1
-        return f"Daily summary: {sold} sold ({revenue} KES), {unsold} unsold, {live} live listings."
+        return {"sold": sold, "revenue": revenue, "unsold": unsold, "live": live}
+
+    def summary(self, agent_id: str) -> str:
+        st = self.stats(agent_id)
+        return f"Daily summary: {st['sold']} sold ({st['revenue']} KES), {st['unsold']} unsold, {st['live']} live listings."

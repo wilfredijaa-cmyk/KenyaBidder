@@ -4,11 +4,14 @@ The LLM strategy lives behind the orchestrator and can only ever *propose*.
 """
 from __future__ import annotations
 
+import os
+import secrets
 import uuid
 from types import SimpleNamespace
 
 from .agents import AgentService
 from .audit import AuditLog
+from .billing import BillingService
 from .channels import ChannelRouter, WhatsAppAdapter
 from .clock import SystemClock
 from .engine import AuctionEngine
@@ -23,21 +26,23 @@ from .matches import MatchService
 from .mcpx.manager import McpManager
 from .mcpx.server import build_server
 from .orchestrator import Orchestrator
+from .payments import MpesaClient, MpesaConfig
 from .reputation import recompute_reputation
 from .seller import SellerService
 from .store import Store
+from .wallet import TokenMeter, WalletDB
 from .strategy import BaselineStrategy, HeuristicStrategy, LlmStrategy, SellerAdvisor
 
 
 def create_app(*, store=None, clock=None, guardrail_config=None, transport=None, whatsapp=None, match_ttl_ms=None,
-               llm_provider_factory=None, allow_stdio=None) -> SimpleNamespace:
+               llm_provider_factory=None, allow_stdio=None, wallet_path=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
     store = store or Store()
     clock = clock or SystemClock()
     events = Events()
     router = ChannelRouter(store, clock, whatsapp or WhatsAppAdapter(store, clock))
     notify = router.notify
 
-    engine = AuctionEngine(store, clock, events)
+    engine = AuctionEngine(store, clock, events, listing_limits)
     intel = MarketIntel(store, clock, engine)
     audit = AuditLog(store, clock)
     guardrail = GuardrailInterceptor(store, clock, engine, intel, guardrail_config)
@@ -46,18 +51,34 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
     sellers = SellerService(store, clock, engine, notify)
 
     llms = LlmRegistry(store, clock, llm_provider_factory)
+    wallet = WalletDB(wallet_path, clock)
+    meter = TokenMeter(store, clock, wallet, llms, notify)
     kb = KnowledgeBaseService(store, clock)
     app = SimpleNamespace(store=store, clock=clock, events=events, engine=engine, intel=intel, audit=audit,
                           guardrail=guardrail, execution=execution, matches=matches, sellers=sellers, llms=llms, kb=kb,
-                          router=router)
+                          router=router, wallet=wallet, meter=meter)
     app.mcps = McpManager(store, clock, builtin_factory=lambda: build_server(app, internal=False), allow_stdio=allow_stdio)
     app.mcps.ensure_builtin()
 
     strategies = {"baseline": BaselineStrategy(), "heuristic": HeuristicStrategy()}
-    strategies["llm"] = LlmStrategy(llms, app.mcps, kb, store, fallback=strategies["heuristic"])
+    strategies["llm"] = LlmStrategy(llms, app.mcps, kb, store, fallback=strategies["heuristic"], meter=meter)
     app.orchestrator = Orchestrator(store, clock, engine, intel, execution, strategies, notify)
-    app.advisor = SellerAdvisor(intel, llms, app.mcps, kb, store)
+    app.advisor = SellerAdvisor(intel, llms, app.mcps, kb, store, meter)
     app.agents = AgentService(store, clock, execution, llms, app.mcps, kb)
+
+    # ---- selling tokens (platform revenue; separate from auction settlement) ----
+    if mpesa_client is None:
+        cfg = MpesaConfig.from_env(fallback_secret=store.settings.setdefault("mpesa_callback_secret", secrets.token_urlsafe(24)))
+        mpesa_client = MpesaClient(cfg, clock=None) if cfg else None
+    if dev_payments is None:
+        dev_payments = os.environ.get("KENYABIDDER_DEV_PAYMENTS") == "1"
+
+    def on_credit(user_id: str, llm_id: str) -> None:
+        """Tokens arrived: let the user's blocked agents pick their open auctions back up."""
+        app.orchestrator.spawn(app.orchestrator.reconsider_user(user_id))
+
+    app.billing = BillingService(store, clock, wallet, llms, meter, notify, mpesa_client, dev_payments, on_credit)
+    app.agents.on_identity_change = app.billing.grant_signup_tokens
 
     def status(agent: dict) -> str:
         live = [t for t in execution.triggers_for(agent["agent_id"]) if t["status"] in ("ACTIVE", "AWAITING_APPROVAL")]

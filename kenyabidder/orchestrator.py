@@ -20,17 +20,30 @@ class Orchestrator:
         self.strategies = strategies  # {"baseline": ..., "heuristic": ..., "llm": ...}
         self.notify = notify or (lambda *a, **k: None)
         self.pending: set[asyncio.Task] = set()
+        self.blocked: dict[tuple[str, str], str] = {}  # (agent, auction) -> reason code, waiting for tokens / cap window
+        self._blocked_notified: dict[str, int] = {}
         engine.events.on("auction.created", self._on_created)
 
     def _on_created(self, auction_id, **_):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            log.warning("no running event loop; auto-bidding for %s skipped", auction_id)
+            log.debug("no running event loop; auto-bidding for %s skipped", auction_id)
             return
         t = loop.create_task(self.on_auction_created(auction_id))
         self.pending.add(t)
         t.add_done_callback(self._done)
+
+    def spawn(self, coro) -> bool:
+        """Run a coroutine in the background, tracked so idle()/shutdown can await it. No-op without a running loop."""
+        try:
+            t = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return False
+        self.pending.add(t)
+        t.add_done_callback(self._done)
+        return True
 
     def _done(self, t: asyncio.Task) -> None:
         self.pending.discard(t)
@@ -51,6 +64,34 @@ class Orchestrator:
                 await self.consider(agent["agent_id"], auction_id)
             except Exception:  # noqa: BLE001  one agent's failure must not starve the others
                 log.exception("consider failed for agent %s", agent["agent_id"])
+
+    async def retry_blocked(self, user_id: str | None = None) -> int:
+        """Re-run agents that were held back (no tokens / daily cap). Called after a top-up and periodically."""
+        n = 0
+        for (agent_id, auction_id), _code in list(self.blocked.items()):
+            agent, a = self.store.agents.get(agent_id), self.store.auctions.get(auction_id)
+            if not agent or not a or a["status"] not in ("ACTIVE", "EXTENDING", "SCHEDULED"):
+                self.blocked.pop((agent_id, auction_id), None)  # gone, or the auction closed while waiting
+                continue
+            if user_id and agent["principal_user_id"] != user_id:
+                continue
+            try:
+                r = await self.consider(agent_id, auction_id)
+                n += r["status"] == "PLANNED"
+            except Exception:  # noqa: BLE001
+                log.exception("retry_blocked failed")
+        return n
+
+    async def reconsider_user(self, user_id: str) -> int:
+        return await self.retry_blocked(user_id)
+
+    def _note_blocked(self, agent: dict, a: dict, code: str, reason: str) -> None:
+        self.blocked[(agent["agent_id"], a["auction_id"])] = code
+        now = self.clock.now()
+        if now - self._blocked_notified.get(agent["agent_id"], -10**18) >= 6 * 3600_000:  # one nudge per 6h, not one per auction
+            self._blocked_notified[agent["agent_id"]] = now
+            hint = "Top up in Wallet and it will pick up the open auctions automatically." if code == "NO_TOKENS" else "It resumes when its 24-hour window frees up."
+            self.notify(agent["agent_id"], "no_tokens", f"Your agent is waiting — {reason}. {hint}", auction_id=a["auction_id"])
 
     def prefilter(self, agent: dict, a: dict, *, spec: bool = True) -> str | None:
         """Deterministic pre-filter (§11.3). None if eligible, else a human-readable reason."""
@@ -109,6 +150,12 @@ class Orchestrator:
         stats = self.intel.historical_clearing_prices(a["product_spec"]["category"])
         strat = self.strategy_for(agent, a["auction_type"])
         proposal = await strat.propose({"agent": agent, "auction": a, "intel": {"stats": stats}})
+
+        if proposal["action"] == "BLOCKED":  # no tokens / cap reached and policy is 'block'
+            self.store.considered.discard(key)  # so a top-up (or a freed cap window) can retry it
+            self._note_blocked(agent, a, proposal["code"], proposal["reasoning"])
+            return {"status": "BLOCKED", "reason": proposal["reasoning"], "code": proposal["code"], "strategy": strat.name}
+        self.blocked.pop((agent_id, auction_id), None)
 
         # re-check after the (possibly slow) strategy call — the world may have moved on
         if agent["status"] != "ACTIVE":

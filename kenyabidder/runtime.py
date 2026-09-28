@@ -49,7 +49,11 @@ class Runtime:
     async def _save_loop(self) -> None:
         while True:
             await asyncio.sleep(5)
-            self.save()
+            try:
+                payload = self.store.serialize()  # consistent snapshot on the loop thread…
+                await asyncio.to_thread(self.store.write_atomic, self.data_file, payload)  # …disk I/O off it (bid latency)
+            except Exception:  # noqa: BLE001
+                log.exception("snapshot failed")
 
     def save(self) -> None:
         if self.data_file:

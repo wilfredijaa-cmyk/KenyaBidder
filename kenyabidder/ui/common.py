@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from nicegui import app as ng_app
 from nicegui import context, ui
 
 from ..errors import AppError
+from ..timeutil import EAT
 
 _rt = None
 
@@ -39,7 +40,12 @@ def kes(n) -> str:
 
 
 def fmt_time(ms: int | None) -> str:
-    return "" if not ms else datetime.fromtimestamp(ms / 1000).strftime("%H:%M:%S")
+    """Wall-clock time in East Africa Time regardless of the server's timezone."""
+    return "" if not ms else datetime.fromtimestamp(ms / 1000, EAT).strftime("%H:%M:%S")
+
+
+def fmt_datetime(ms: int | None) -> str:
+    return "" if not ms else datetime.fromtimestamp(ms / 1000, EAT).strftime("%d %b %Y %H:%M")
 
 
 def left(end_ms: int) -> str:

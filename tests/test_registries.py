@@ -21,6 +21,8 @@ def llm_cfg(llm_id, tools=(), kbs=(), steps=3, strat="llm"):
 
 
 def add_llm(env, name="Claude", **kw):
+    """These tests are about tool routing, not billing: register a platform-funded (free) LLM. See test_metering.py for tokens."""
+    kw.setdefault("billing_mode", "free")
     return env.llms.add(name=name, provider=kw.pop("provider", "anthropic"), model="claude-test", api_key="sk-x", **kw)
 
 

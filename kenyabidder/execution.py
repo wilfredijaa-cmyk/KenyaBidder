@@ -10,6 +10,7 @@ Trigger kinds:
 """
 from __future__ import annotations
 
+import math
 import time
 import uuid
 
@@ -139,8 +140,9 @@ class ExecutionEngine:
             if snipe > 0 and effective_end(a) - now > snipe:
                 return False
             last = a["bids"][-1] if a["bids"] else None
-            stepped = -(-last["amount"] * (100 + (p.get("increment_pct") or 0)) // 100) if last else needed
-            return self._fire(t, a, min(p["max_bid"], max(needed, stepped)))
+            # increment_pct may be fractional (LLMs say 2.5): always land on an integer amount
+            stepped = math.ceil(last["amount"] * (100 + (p.get("increment_pct") or 0)) / 100) if last else needed
+            return self._fire(t, a, int(min(p["max_bid"], max(needed, stepped))))
         if t["kind"] == "DUTCH_ACCEPT":
             price = self.engine.current_price(a, now)
             return self._fire(t, a, price) if price <= p["threshold"] else False

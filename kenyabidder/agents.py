@@ -22,7 +22,9 @@ import uuid
 
 from .engine import AUCTION_TYPES
 from .errors import AppError, bad, conflict, forbidden, is_nonneg_int, not_found
+from .phone import normalize_phone
 
+TERMS_VERSION = "2026-09"
 STRATEGIES = ["baseline", "heuristic", "llm"]
 ADVISORS = ["rules", "llm"]
 
@@ -47,7 +49,7 @@ def default_config(agent_type: str) -> dict:
         "llm_id": None,
         "algorithms": {t: {"strategy": "heuristic", "llm_id": None} for t in AUCTION_TYPES} if agent_type == "BIDDER" else {},
         "advisor": {"strategy": "rules", "llm_id": None} if agent_type == "SELLER" else None,
-        "tools": [], "kb_ids": [], "max_tool_steps": 4,
+        "tools": [], "kb_ids": [], "max_tool_steps": 4, "max_tokens_per_day": None,
     }
 
 
@@ -55,11 +57,15 @@ class AgentService:
     def __init__(self, store, clock, execution=None, llms=None, mcps=None, kbs=None):
         self.store, self.clock = store, clock
         self.execution, self.llms, self.mcps, self.kbs = execution, llms, mcps, kbs
+        self.on_identity_change = None  # set by the composition root: claims the once-per-phone signup token grant
 
     # ---------- users ----------
 
     def create_user(self, *, name: str, password: str, phone: str | None = None, email: str | None = None,
-                    role: str | None = None) -> dict:
+                    role: str | None = None, accepted_terms: bool = True) -> dict:
+        """Register an account. Programmatic callers consent implicitly (default); the sign-up form passes the checkbox."""
+        if not accepted_terms:
+            raise bad("TERMS_REQUIRED", "you must accept the Terms and Privacy Notice to create an account")
         name = (name or "").strip()
         if not re.fullmatch(r"[\w .'-]{2,40}", name):
             raise bad("INVALID_USER", "name must be 2-40 characters (letters, digits, space, . ' -)")
@@ -67,11 +73,38 @@ class AgentService:
             raise bad("INVALID_USER", "password must be at least 8 characters")
         if any(u["name"].lower() == name.lower() for u in self.store.users.values()):
             raise conflict("NAME_TAKEN", "that name is already registered")
+        phone_n = self._phone(phone)
+        email = (email or "").strip() or None
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise bad("INVALID_EMAIL", "that email address does not look right")
         first = not self.store.users
-        u = {"id": str(uuid.uuid4()), "name": name, "password_hash": hash_password(password),
-             "phone": (phone or "").strip() or None, "email": (email or "").strip() or None,
-             "role": "admin" if first else (role if role in ("admin", "user") else "user"), "created_at": self.clock.now()}
+        u = {"id": str(uuid.uuid4()), "name": name, "password_hash": hash_password(password), "phone": phone_n, "email": email,
+             "role": "admin" if first else (role if role in ("admin", "user") else "user"), "suspended": False,
+             "terms_accepted_at": self.clock.now(), "terms_version": TERMS_VERSION, "created_at": self.clock.now()}
         self.store.users[u["id"]] = u
+        if self.on_identity_change:
+            self.on_identity_change(u)
+        return u
+
+    @staticmethod
+    def _phone(raw: str | None) -> str | None:
+        if not (raw or "").strip():
+            return None
+        p = normalize_phone(raw)
+        if not p:
+            raise bad("INVALID_PHONE", "enter a phone number such as 0712 345 678 or +254 712 345 678")
+        return p
+
+    def set_phone(self, user_id: str, phone: str) -> dict:
+        """Add/replace the contact phone (also claims the once-per-phone signup grant if there is one)."""
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        if any(o["id"] != user_id and o["phone"] and o["phone"] == self._phone(phone) for o in self.store.users.values()):
+            raise conflict("PHONE_TAKEN", "that phone number is already registered to another account")
+        u["phone"] = self._phone(phone)
+        if self.on_identity_change:
+            self.on_identity_change(u)
         return u
 
     MAX_FAILURES, LOCKOUT_MS = 5, 5 * 60_000
@@ -84,6 +117,8 @@ class AgentService:
         if len(fails) >= self.MAX_FAILURES:
             raise AppError("TOO_MANY_ATTEMPTS", "too many failed sign-in attempts — try again in a few minutes", 429)
         u = self._authenticate(name, password)
+        if u and u.get("suspended"):  # only revealed to someone who knows the password
+            raise AppError("ACCOUNT_SUSPENDED", "this account has been suspended — contact support", 403)
         if u:
             self.store.settings["login_failures"].pop(key, None)
         else:
@@ -97,6 +132,39 @@ class AgentService:
             verify_password(password or "", "scrypt$" + "00" * 16 + "$" + "00" * 32)
             return None
         return u if verify_password(password or "", u["password_hash"]) else None
+
+    def change_password(self, user_id: str, old: str, new: str) -> None:
+        u = self.store.users.get(user_id)
+        if not u or not verify_password(old or "", u["password_hash"]):
+            raise forbidden("WRONG_PASSWORD", "current password is incorrect")
+        if len(new or "") < 8:
+            raise bad("INVALID_USER", "password must be at least 8 characters")
+        u["password_hash"] = hash_password(new)
+
+    def admin_reset_password(self, user_id: str, new: str) -> None:
+        """Support tool: there is no email reset flow yet, so an admin sets a temporary password and tells the user."""
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        if len(new or "") < 8:
+            raise bad("INVALID_USER", "password must be at least 8 characters")
+        u["password_hash"] = hash_password(new)
+        self.store.settings.setdefault("login_failures", {}).pop(u["name"].lower(), None)
+
+    def set_suspended(self, user_id: str, suspended: bool, *, by: str | None = None) -> dict:
+        """Suspend/reinstate an account. Suspension pauses every agent immediately (bid triggers cancelled)."""
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        if suspended and user_id == by:
+            raise bad("SELF_SUSPEND", "you cannot suspend your own account")
+        if suspended and u["role"] == "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin" and not x.get("suspended")) <= 1:
+            raise bad("LAST_ADMIN", "there must always be at least one active administrator")
+        u["suspended"] = bool(suspended)
+        if suspended:
+            for a in self.agents_for(user_id):
+                self.set_status(a["agent_id"], "SUSPENDED")
+        return u
 
     def set_role(self, user_id: str, role: str) -> dict:
         u = self.store.users.get(user_id)
@@ -122,7 +190,8 @@ class AgentService:
             "constraints": self._constraints(type, constraints or {}),
             "reputation": {"completed_matches": 0, "fell_through_count": 0, "avg_response_time_seconds": 0, "tier": "NEW", "score": 100},
             "durable_memory": {"conversation": [], "auto_bid": True, "watch": None, "auto_relist": None,
-                               "preferred_channel": "WEB", "last_channel": "WEB", "one_off_authorizations": [], "notes": ""},
+                               "preferred_channel": "WEB", "last_channel": "WEB", "one_off_authorizations": [], "notes": "",
+                               "daily_summary": True, "last_summary_day": None},
             "config": default_config(type), "status": "ACTIVE", "created_at": self.clock.now(),
         }
         self.store.agents[agent["agent_id"]] = agent
@@ -176,6 +245,9 @@ class AgentService:
         m.pop("one_off_authorizations", None)
         if "watch" in m:
             m["watch"] = None if m["watch"] is None else self._watch(m["watch"])
+        if "daily_summary" in m:
+            m["daily_summary"] = bool(m["daily_summary"])
+        m.pop("last_summary_day", None)
         if "preferred_channel" in m and m["preferred_channel"] not in ("WEB", "WHATSAPP"):
             raise bad("INVALID_MEMORY", "preferred_channel must be WEB or WHATSAPP")
         if m.get("auto_relist") is not None:
@@ -237,6 +309,12 @@ class AgentService:
         if not (isinstance(steps, int) and 0 <= steps <= 10):
             raise bad("INVALID_CONFIG", "max_tool_steps must be 0-10")
         out["max_tool_steps"] = steps
+        cap = merged.get("max_tokens_per_day")
+        if cap in ("", 0):
+            cap = None
+        if cap is not None and not (isinstance(cap, int) and not isinstance(cap, bool) and 1_000 <= cap <= 100_000_000):
+            raise bad("INVALID_CONFIG", "max_tokens_per_day must be blank (no cap) or a whole number between 1,000 and 100,000,000")
+        out["max_tokens_per_day"] = cap
         if (out["tools"] or out["kb_ids"]) and not self._uses_llm(role, out):
             raise bad("INVALID_CONFIG", "tools and knowledge bases are only used by LLM strategies — switch at least one algorithm to 'llm' (or the advisor) first")
         return out

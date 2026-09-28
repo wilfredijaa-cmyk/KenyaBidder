@@ -19,7 +19,8 @@ class MatchService:
         engine.events.on("auction.settled", self._on_settled)
 
     def _on_settled(self, auction_id, result, **_):
-        if result["outcome"] == "SOLD":
+        a = self.store.auctions.get(auction_id)
+        if result["outcome"] == "SOLD" and not (a or {}).get("demo"):  # demo listings never create real matches / contact reveals
             self.create_match(auction_id)
 
     def create_match(self, auction_id: str) -> dict:
