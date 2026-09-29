@@ -27,9 +27,9 @@ def admin_page():
     with frame(user, "/admin"):
         ui.label("Administration").classes("text-lg font-medium")
         with ui.tabs().classes("w-full") as tabs:
-            t_llm, t_mcp, t_kb, t_bill, t_users, t_trust, t_msg, t_setup, t_log, t_ep = (
+            t_llm, t_mcp, t_kb, t_bill, t_users, t_trust, t_msg, t_ops, t_setup, t_log, t_ep = (
                 ui.tab("LLMs"), ui.tab("MCP servers"), ui.tab("Knowledge bases"), ui.tab("Billing"), ui.tab("Users"), ui.tab("Trust & disputes"),
-                ui.tab("Messaging"), ui.tab("Legal & demo"), ui.tab("Audit log"), ui.tab("Our MCP endpoint"))
+                ui.tab("Messaging"), ui.tab("Health & backups"), ui.tab("Legal & demo"), ui.tab("Audit log"), ui.tab("Our MCP endpoint"))
         with ui.tab_panels(tabs, value=t_llm).classes("w-full"):
             with ui.tab_panel(t_llm):
                 llm_panel()
@@ -45,6 +45,8 @@ def admin_page():
                 admin_ops.trust_panel()
             with ui.tab_panel(t_msg):
                 admin_ops.messaging_panel()
+            with ui.tab_panel(t_ops):
+                admin_ops.ops_panel()
             with ui.tab_panel(t_setup):
                 setup_panel()
             with ui.tab_panel(t_log):

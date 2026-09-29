@@ -135,3 +135,51 @@ def trust_panel() -> None:
                 ui.button("Rule on this dispute", icon="gavel", on_click=lambda d=d: _ask("Rule on dispute", "Explanation (both parties see it)", lambda k, n, d=d: rule(k, n, d), "Issue ruling", options=RULINGS)).props("unelevated dense no-caps color=primary")
     body()
 
+
+
+def ops_panel() -> None:
+    """Health, database and backups."""
+    import asyncio
+    from .. import metrics
+    from .common import rt
+    r = rt()
+    c = core()
+
+    @ui.refreshable
+    def body():
+        ok, checks = metrics.readiness(r)
+        with ui.card().classes("w-full"):
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Health").classes("font-medium")
+                badge("ready" if ok else "NOT READY", "positive" if ok else "negative")
+            for k, v in checks.items():
+                ui.label(f"{'✓' if v else '✗'} {k.replace('_', ' ')}").classes("text-sm " + ("" if v else "text-negative"))
+            problems = c.wallet.verify_integrity()
+            ui.label("✓ token ledger matches balances" if not problems else "✗ LEDGER PROBLEMS: " + "; ".join(problems[:3])).classes("text-sm " + ("" if not problems else "text-negative"))
+            ui.label(f"Database: {r.db.dialect} · {'durable state on' if r.persistence else 'in-memory (data is lost on restart)'} · "
+                     "scrape /metrics (set KENYABIDDER_METRICS_TOKEN) and alert on /readyz.").classes("text-xs opacity-70")
+        with ui.card().classes("w-full"):
+            ui.label("Backups").classes("font-medium")
+            if not r.backups:
+                ui.label("Automatic backups need a durable DuckDB database (default when running with a data directory). "
+                         "For PostgreSQL use your provider's snapshots or pg_dump.").classes("text-sm opacity-70")
+                return
+            b = r.backups
+            ui.label(f"Every {b.every_ms // 3_600_000}h, keeping the newest {b.keep}. Stored in {b.dir}. Copy them off this machine!").classes("text-sm opacity-70")
+            if b.last_error:
+                ui.label(f"Last attempt failed: {b.last_error}").classes("text-sm text-negative")
+
+            @guard_admin
+            async def run():
+                path = await asyncio.to_thread(b.run)
+                ui.notify(f"Backup written: {path.name}", type="positive")
+                body.refresh()
+            ui.button("Back up now", icon="backup", on_click=run).props("unelevated color=primary")
+            files = b.list()
+            if not files:
+                empty("No backups yet.")
+            else:
+                ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("name", "File"), ("when", "Taken"), ("mb", "Size"))],
+                         rows=[{"id": f["name"], "name": f["name"], "when": f["when"], "mb": f"{f['bytes'] / 1_048_576:.2f} MB"} for f in files], row_key="id").classes("w-full").props("dense flat")
+            ui.label("Restore (with the app stopped): python -m kenyabidder restore <backup file> — the current database is kept as .before-restore.").classes("text-xs opacity-60")
+    body()

@@ -60,3 +60,28 @@ def test_backup_is_verified_pruned_and_restorable(tmp_path):
     back = open_database(f"duckdb://{tmp_path}/live.duckdb")
     assert back.scalar("SELECT balance FROM balances") == 42
     assert (tmp_path / "live.duckdb.before-restore").exists()
+
+
+async def test_readiness_and_metrics(tmp_path):
+    import json
+    from kenyabidder import metrics
+    rt = Runtime(data_file=str(tmp_path / "state.json"))
+    ok, checks = metrics.readiness(rt)
+    assert ok and checks == {"database": True}  # loops not started yet: nothing to judge
+    rt.start()
+    await asyncio.sleep(0.2)
+    await rt.flush()
+    ok, checks = metrics.readiness(rt)
+    assert ok and checks["tick_loop"] and checks["state_flush"]
+    rt.app.agents.create_user(name="Wanjiru", password="password123", phone="+254711000001")
+    text = metrics.render(rt)
+    assert "kenyabidder_up 1" in text and "kenyabidder_users 1" in text and "kenyabidder_ready 1" in text
+    assert 'kenyabidder_check_ok{check="database"} 1' in text and "# TYPE kenyabidder_auctions gauge" in text
+    rt.last_tick_at -= 60  # a hung tick loop must flip readiness
+    assert metrics.readiness(rt)[0] is False and "kenyabidder_ready 0" in metrics.render(rt)
+    rt.last_tick_at = __import__("time").time()
+    rt.flush_errors_streak = 3
+    assert metrics.readiness(rt)[1]["state_flush"] is False
+    await rt.stop()
+    line = metrics.JsonFormatter().format(__import__("logging").LogRecord("x", 20, "f", 1, "hello %s", ("w",), None))
+    assert json.loads(line)["msg"] == "hello w"

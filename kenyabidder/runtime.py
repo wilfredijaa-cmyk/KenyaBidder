@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 
 from .app import create_app
@@ -46,6 +47,9 @@ class Runtime:
         else:
             self.store = Store()
         self._flush_lock = asyncio.Lock()
+        self.started_at = 0.0
+        self.last_tick_at = self.last_flush_at = 0.0
+        self.flush_errors = self.flush_errors_streak = 0
         self.app = create_app(store=self.store, clock=SystemClock(), database=self.db)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
@@ -71,6 +75,7 @@ class Runtime:
                 self.app.tick()
             except Exception:  # noqa: BLE001  the loop must survive any single failure
                 log.exception("tick failed")
+            self.last_tick_at = time.time()
             await asyncio.sleep(self.tick_ms / 1000)
 
     async def flush(self) -> None:
@@ -85,6 +90,7 @@ class Runtime:
                 ops.append(p.collect(self.store, name))
                 await asyncio.sleep(0)
             await asyncio.to_thread(p.apply, ops)
+            self.last_flush_at = time.time()
 
     async def _save_loop(self) -> None:
         beats = 0
@@ -92,10 +98,13 @@ class Runtime:
             await asyncio.sleep(1)
             try:
                 await self.flush()
+                self.flush_errors_streak = 0
                 beats += 1
                 if beats % 10 == 0:
                     await asyncio.to_thread(self.persistence.renew_lease)
             except Exception:  # noqa: BLE001
+                self.flush_errors += 1
+                self.flush_errors_streak += 1
                 log.exception("state flush failed")
 
     async def _maintenance_loop(self) -> None:
@@ -131,6 +140,7 @@ class Runtime:
 
     def start(self) -> None:
         loop = asyncio.get_running_loop()
+        self.started_at = self.last_tick_at = time.time()
         problems = self.app.wallet.verify_integrity()
         if problems:  # never silently run with a ledger that disagrees with balances
             log.error("WALLET INTEGRITY PROBLEMS: %s", "; ".join(problems[:5]))
