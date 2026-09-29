@@ -27,7 +27,14 @@ def free_port():
         return s.getsockname()[1]
 
 
-async def caption(page, text, ms=2200):
+CAPS = []  # (seconds since the recording started, text) -> captions.json, used to time the narration
+T0 = [0.0]
+
+
+async def caption(page, text, ms=None):
+    ms = max(ms or 0, int(len(text.split()) * 420 + 900))  # long enough to be read AND spoken
+    if T0[0]:
+        CAPS.append((round(time.time() - T0[0], 2), text))
     await page.evaluate("""t => { let d = document.getElementById('kb-cap'); if (!d) { d = document.createElement('div'); d.id = 'kb-cap';
         d.style.cssText = 'position:fixed;left:50%;bottom:22px;transform:translateX(-50%);max-width:80%;background:rgba(15,23,42,.92);color:#fff;padding:12px 22px;border-radius:12px;font:500 20px system-ui;z-index:99999;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.35)';
         document.body.appendChild(d); } d.textContent = t; }""", text)
@@ -95,6 +102,7 @@ async def main():
 
             # ---------------- the recorded story: the buyer's point of view ----------------
             rc, buyer = await ctx(record=True)
+            T0[0] = time.time()
             await goto(buyer, base, "/login")
             await caption(buyer, "KenyaBidder — AI agents that buy and sell for you", 2500)
             await shot(buyer, "01-login")
@@ -205,6 +213,8 @@ async def main():
             await rc.close()
             await b.close()
             shutil.move(path, HERE / "overview.webm")
+            import json
+            (HERE / "captions.json").write_text(json.dumps(CAPS, indent=1))
         shutil.rmtree(HERE / "_rec", ignore_errors=True)
     finally:
         proc.terminate()
