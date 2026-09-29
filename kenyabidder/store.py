@@ -8,6 +8,20 @@ MAP_KEYS = ["users", "agents", "auctions", "matches", "triggers", "approvals", "
 LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log", "admin_log"]
 
 
+class Log(list):
+    """Append-mostly list that counts items trimmed off the front, so the durable copy stays aligned."""
+
+    dropped = 0
+
+    def __delitem__(self, key):
+        if isinstance(key, slice):
+            if key.start in (None, 0) and key.step in (None, 1):
+                self.dropped += len(range(*key.indices(len(self))))
+        elif key in (0, -len(self)):
+            self.dropped += 1
+        super().__delitem__(key)
+
+
 class Store:
     """In-memory state with atomic JSON snapshots (stand-in for Postgres + Redis, spec §15.1)."""
 
@@ -15,7 +29,7 @@ class Store:
         for k in MAP_KEYS:
             setattr(self, k, {})
         for k in LIST_KEYS:
-            setattr(self, k, [])
+            setattr(self, k, Log())
         self.considered: set[str] = set()
         self.rate_windows: dict[str, list[int]] = {}
         self.settings: dict = {}
@@ -31,7 +45,7 @@ class Store:
         s = cls()
         for k in MAP_KEYS + LIST_KEYS:
             if k in data:
-                setattr(s, k, data[k])
+                setattr(s, k, Log(data[k]) if k in LIST_KEYS else data[k])
         s.considered = set(data.get("considered", []))
         s.settings = data.get("settings", {})
         return s

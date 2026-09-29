@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="kenyabidder", description="KenyaBidder — AI auction matchmaking")
     p.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)))
-    p.add_argument("--data", default=os.environ.get("KENYABIDDER_DATA", "data/state.json"), help="state snapshot file ('' = in-memory only)")
+    p.add_argument("--data", default=os.environ.get("KENYABIDDER_DATA", "data/state.json"), help="data file location; state lives in kenyabidder.duckdb beside it ('' = in-memory only; set KENYABIDDER_DATABASE_URL for PostgreSQL)")
     p.add_argument("--mcp-port", type=int, default=int(os.environ.get("KENYABIDDER_MCP_PORT", 0)), help="serve KenyaBidder's FastMCP endpoint on this port (0 = off)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

@@ -10,6 +10,10 @@ from pathlib import Path
 from .app import create_app
 from .clock import SystemClock
 from .mcpx.server import build_server
+from .backups import BackupService
+from .db import open_database
+from .db.legacy import import_sqlite_wallet
+from .persist import StatePersistence
 from .store import Store
 
 log = logging.getLogger("kenyabidder.runtime")
@@ -18,14 +22,33 @@ log = logging.getLogger("kenyabidder.runtime")
 class Runtime:
     def __init__(self, data_file: str | None = None, mcp_port: int | None = None, mcp_host: str = "127.0.0.1", tick_ms: int = 50, database_url: str | None = None):
         self.data_file = data_file
-        self.store = Store.load(data_file) if data_file else Store()
-        if database_url is None and data_file:
-            database_url = os.environ.get("KENYABIDDER_DATABASE_URL") or "duckdb://" + str(Path(data_file).with_name("kenyabidder.duckdb"))
-        self.database_url = database_url or os.environ.get("KENYABIDDER_DATABASE_URL") or ":memory:"
-        self.app = create_app(store=self.store, clock=SystemClock(), database=self.database_url)
+        url = database_url or os.environ.get("KENYABIDDER_DATABASE_URL")
+        if not url and data_file:
+            url = "duckdb://" + str(Path(data_file).with_name("kenyabidder.duckdb"))
+        self.database_url = url or ":memory:"
+        self.db = open_database(self.database_url)
+        self.persistence: StatePersistence | None = None
+        self.backups: BackupService | None = None
+        if url:  # durable mode: state lives in the database, guarded by a single-writer lease
+            self.persistence = StatePersistence(self.db)
+            self.persistence.acquire_lease(force=os.environ.get("KENYABIDDER_FORCE_LEASE") == "1")
+            legacy_dir = Path(data_file).parent if data_file else None
+            if legacy_dir:
+                import_sqlite_wallet(self.db, str(legacy_dir / "wallet.db"))
+            self.store = self.persistence.load()
+            if data_file:
+                self.store = self.persistence.import_legacy_json(data_file) or self.store
+            backup_dir = os.environ.get("KENYABIDDER_BACKUP_DIR") or (str(legacy_dir / "backups") if legacy_dir else None)
+            if backup_dir and self.db.dialect == "duckdb":
+                self.backups = BackupService(self.db, backup_dir, SystemClock(), keep=int(os.environ.get("KENYABIDDER_BACKUP_KEEP", 14)),
+                                             every_hours=float(os.environ.get("KENYABIDDER_BACKUP_EVERY_HOURS", 24)))
+                self.backups.prime()
+        else:
+            self.store = Store()
+        self._flush_lock = asyncio.Lock()
+        self.app = create_app(store=self.store, clock=SystemClock(), database=self.db)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
-        self._last_payload: str | None = None
         s = self.store.settings
         s.setdefault("storage_secret", secrets.token_hex(32))
         s.setdefault("mcp_key", secrets.token_urlsafe(24))
@@ -50,16 +73,30 @@ class Runtime:
                 log.exception("tick failed")
             await asyncio.sleep(self.tick_ms / 1000)
 
+    async def flush(self) -> None:
+        """Persist what changed. Diffing runs on the loop thread one collection at a time (yielding between them, so bids are never
+        stalled); the database writes run in a worker thread."""
+        p = self.persistence
+        if not p:
+            return
+        async with self._flush_lock:
+            ops = []
+            for name in p.names():
+                ops.append(p.collect(self.store, name))
+                await asyncio.sleep(0)
+            await asyncio.to_thread(p.apply, ops)
+
     async def _save_loop(self) -> None:
+        beats = 0
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
             try:
-                payload = self.store.serialize()  # consistent snapshot on the loop thread…
-                if payload != self._last_payload:  # …skip the disk write entirely when nothing changed
-                    await asyncio.to_thread(self.store.write_atomic, self.data_file, payload)  # …disk I/O off the loop (bid latency)
-                    self._last_payload = payload
+                await self.flush()
+                beats += 1
+                if beats % 10 == 0:
+                    await asyncio.to_thread(self.persistence.renew_lease)
             except Exception:  # noqa: BLE001
-                log.exception("snapshot failed")
+                log.exception("state flush failed")
 
     async def _maintenance_loop(self) -> None:
         """Every 30s: recover lost M-Pesa callbacks, expire stale orders, wake capped/blocked agents, send evening summaries."""
@@ -71,19 +108,17 @@ class Runtime:
                     await step()
                 except Exception:  # noqa: BLE001
                     log.exception("%s failed", name)
+            if self.backups and self.backups.due():
+                try:
+                    await asyncio.to_thread(self.backups.run)
+                except Exception:  # noqa: BLE001
+                    log.exception("backup failed")
             for name, sync_step in (("order expiry", a.billing.expire_stale), ("evening summaries", a.sellers.send_daily_summaries),
                                     ("pruning", lambda: self.store.prune(a.clock.now()))):
                 try:
                     sync_step()
                 except Exception:  # noqa: BLE001  one failing job must not skip the others
                     log.exception("%s failed", name)
-
-    def save(self) -> None:
-        if self.data_file:
-            try:
-                self.store.save(self.data_file)
-            except Exception:  # noqa: BLE001
-                log.exception("snapshot failed")
 
     async def _serve_mcp(self) -> None:
         from fastmcp.server.auth import StaticTokenVerifier
@@ -101,7 +136,7 @@ class Runtime:
             log.error("WALLET INTEGRITY PROBLEMS: %s", "; ".join(problems[:5]))
         self.tasks.append(loop.create_task(self._tick_loop()))
         self.tasks.append(loop.create_task(self._maintenance_loop()))
-        if self.data_file:
+        if self.persistence:
             self.tasks.append(loop.create_task(self._save_loop()))
         if self.mcp_port:
             self.tasks.append(loop.create_task(self._serve_mcp()))
@@ -110,5 +145,10 @@ class Runtime:
         for t in self.tasks:
             t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        self.save()
+        if self.persistence:
+            try:
+                self.persistence.flush_all(self.store)
+                self.persistence.release_lease()
+            except Exception:  # noqa: BLE001
+                log.exception("final state flush failed")
         self.app.wallet.close()
