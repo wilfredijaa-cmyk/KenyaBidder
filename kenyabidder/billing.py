@@ -47,6 +47,7 @@ class BillingService:
         self.store, self.clock, self.db, self.llms, self.meter = store, clock, db, llms, meter
         self.notify = notify or (lambda *a, **k: None)
         self.mpesa, self.dev_payments, self.on_credit = mpesa, dev_payments, on_credit
+        self.grant_gate = None  # fn(user) -> bool; set by the composition root (verified phone required?)
         self.sql = db.database  # orders / claims are plain SQL on the same database as the ledger
 
     # ------------------------------------------------------------------ admin log
@@ -166,6 +167,8 @@ class BillingService:
         """Free trial tokens, once per *phone number* (so re-registering does not farm grants). Idempotent."""
         phone = normalize_phone(user.get("phone"))
         if not phone or not self.signup_grants():
+            return []
+        if self.grant_gate and not self.grant_gate(user):  # phone must be verified first (the grant is claimed when it is)
             return []
         if self.db.has_signup_grant(user["id"]):  # one free trial per ACCOUNT (changing the phone number must not earn another)…
             return []

@@ -259,7 +259,7 @@ def channels_tab(agent: dict) -> None:
     with ui.card().classes("w-full"):
         ui.label("Channels").classes("font-medium")
         ui.label("One agent, one memory. Everything you do here shows up on WhatsApp and vice-versa.").classes("text-sm opacity-70")
-        ui.select({"WEB": "Web", "WHATSAPP": "WhatsApp"}, value=m["preferred_channel"], label="Send notifications to",
+        ui.select({"WEB": "Web only", "WHATSAPP": "WhatsApp", "SMS": "SMS (verified phone)", "EMAIL": "Email (verified address)"}, value=m["preferred_channel"], label="Send notifications to",
                   on_change=guard(lambda e: core().agents.update(agent["agent_id"], memory={"preferred_channel": e.value}))).classes("w-64")
         linked = ui.label(", ".join(f"{c['channel']} {c['external_id']}" for c in agent["channel_identity_map"]) or "Nothing linked yet").classes("text-sm")
         num = ui.input("WhatsApp number (digits, with country code)", placeholder="254700000000").classes("w-96")

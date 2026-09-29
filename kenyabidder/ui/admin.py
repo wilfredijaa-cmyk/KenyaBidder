@@ -10,6 +10,7 @@ from nicegui import ui
 
 from ..llm.registry import PROVIDERS
 from ..wallet import billing_of
+from . import admin_ops
 from .common import (admin_user, badge, core, empty, fmt_datetime, frame, guard, guard_admin, kes, pretty, require_admin, rt)
 
 ROLE_OPTS = {"BIDDER": "buyer agents", "SELLER": "seller agents"}
@@ -26,8 +27,8 @@ def admin_page():
     with frame(user, "/admin"):
         ui.label("Administration").classes("text-lg font-medium")
         with ui.tabs().classes("w-full") as tabs:
-            t_llm, t_mcp, t_kb, t_bill, t_users, t_setup, t_log, t_ep = (ui.tab("LLMs"), ui.tab("MCP servers"), ui.tab("Knowledge bases"), ui.tab("Billing"),
-                                                                          ui.tab("Users"), ui.tab("Legal & demo"), ui.tab("Audit log"), ui.tab("Our MCP endpoint"))
+            t_llm, t_mcp, t_kb, t_bill, t_users, t_msg, t_setup, t_log, t_ep = (ui.tab("LLMs"), ui.tab("MCP servers"), ui.tab("Knowledge bases"), ui.tab("Billing"),
+                                                                                ui.tab("Users"), ui.tab("Messaging"), ui.tab("Legal & demo"), ui.tab("Audit log"), ui.tab("Our MCP endpoint"))
         with ui.tab_panels(tabs, value=t_llm).classes("w-full"):
             with ui.tab_panel(t_llm):
                 llm_panel()
@@ -39,6 +40,8 @@ def admin_page():
                 billing_panel()
             with ui.tab_panel(t_users):
                 users_panel(user)
+            with ui.tab_panel(t_msg):
+                admin_ops.messaging_panel()
             with ui.tab_panel(t_setup):
                 setup_panel()
             with ui.tab_panel(t_log):
@@ -421,6 +424,8 @@ def users_panel(me: dict):
                         badge("suspended", "negative")
                     if u.get("demo"):
                         badge("demo")
+                    if u.get("phone_verified"):
+                        badge("phone verified", "positive")
                     ui.label(f"{len(c.agents.agents_for(u['id']))} agent(s) · {u.get('phone') or 'no phone'}").classes("text-xs opacity-60")
                 if u.get("demo"):
                     continue

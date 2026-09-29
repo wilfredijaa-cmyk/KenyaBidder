@@ -52,6 +52,7 @@ def login_page():
                         ui.navigate.to("/")
                     pw.on("keydown.enter", sign_in)
                     ui.button("Sign in", on_click=sign_in).props("unelevated color=primary").classes("w-full")
+                    ui.button("Forgot password?", on_click=lambda: forgot_dialog(name.value)).props("flat dense no-caps").classes("w-full")
                 with ui.tab_panel(t_up):
                     if first:
                         ui.label("You are the first user, so this account becomes the administrator.").classes("text-sm text-primary")
@@ -69,6 +70,32 @@ def login_page():
                         login_user(u)
                         ui.navigate.to("/agents")
                     ui.button("Create account", on_click=sign_up).props("unelevated color=primary").classes("w-full")
+
+
+def forgot_dialog(prefill: str = "") -> None:
+    """Self-service reset: a code goes to the account's VERIFIED phone (or email); the answer never reveals whether the account exists."""
+    with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
+        ui.label("Reset your password").classes("text-lg font-medium")
+        ui.label("Enter your name. If the account has a verified phone or email, we send a 6-digit code there.").classes("text-sm opacity-70")
+        nm = ui.input("Name", value=prefill or "").classes("w-full")
+        code = ui.input("6-digit code").classes("w-full")
+        newpw = ui.input("New password (8+ characters)", password=True, password_toggle_button=True).classes("w-full")
+
+        @guard
+        async def send():
+            r = await core().verification.request_password_reset(nm.value)
+            ui.notify(r["message"], type="info", multi_line=True)
+
+        @guard
+        def finish():
+            core().verification.reset_password(nm.value, code.value, newpw.value)
+            ui.notify("Password changed — sign in with your new password", type="positive")
+            d.close()
+        with ui.row().classes("w-full justify-between"):
+            ui.button("Send code", on_click=send).props("outline no-caps")
+            ui.button("Set new password", on_click=finish).props("unelevated color=primary no-caps")
+        ui.label("No verified phone or email? Ask support — an administrator can set a temporary password.").classes("text-xs opacity-60")
+    d.open()
 
 
 # ----------------------------------------------------------------------------- auctions
@@ -137,7 +164,7 @@ def checklist(user: dict, agent: dict) -> None:
     elif any(c.meter.is_metered(e) for e in c.llms.list(enabled_only=True)):
         steps.append(("Give your agent an LLM brain (optional)", bool(cfg.get("llm_id")), f"/agent/{agent['agent_id']}"))
     steps.append(("Link WhatsApp to get alerts on your phone", bool(agent["channel_identity_map"]), f"/agent/{agent['agent_id']}"))
-    steps.append(("Add your phone number", bool(user.get("phone")), "/profile"))
+    steps.append(("Add and verify your phone number", bool(user.get("phone")) and (bool(user.get("phone_verified")) or not c.verification.phone_required()), "/profile"))
     if all(done for _, done, _ in steps):
         return
     with ui.card().classes("w-full border border-primary"):

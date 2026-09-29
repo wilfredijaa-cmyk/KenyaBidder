@@ -49,9 +49,13 @@ class WhatsAppAdapter:
             log.exception("whatsapp send failed")
 
 
+ALERT_KINDS = {"approval_needed", "match", "outbid", "no_tokens", "low_tokens", "anomaly", "rfq", "dispute", "verification"}
+SMS_ALERTS_PER_DAY, EMAIL_ALERTS_PER_DAY = 15, 40  # per user: a runaway agent must not turn into an SMS bill
+
+
 class ChannelRouter:
-    def __init__(self, store, clock, whatsapp: WhatsAppAdapter):
-        self.store, self.clock, self.whatsapp = store, clock, whatsapp
+    def __init__(self, store, clock, whatsapp: WhatsAppAdapter, messenger=None):
+        self.store, self.clock, self.whatsapp, self.messenger = store, clock, whatsapp, messenger
         self.listeners: list = []  # web push subscribers: fn(notification)
         self.handlers = None
 
@@ -73,7 +77,29 @@ class ChannelRouter:
             link = next((c for c in agent["channel_identity_map"] if c["channel"] == "WHATSAPP"), None)
             if link:
                 self.whatsapp.send_nowait(link["external_id"], message)
+        if agent:
+            self._alert(agent, kind, message)
         return n
+
+    def _alert(self, agent: dict, kind: str, message: str) -> None:
+        """SMS / email alerts for the events that need a human, only to VERIFIED contacts and within a per-user daily cap."""
+        pref = agent["durable_memory"].get("preferred_channel")
+        if pref not in ("SMS", "EMAIL") or kind not in ALERT_KINDS or not self.messenger:
+            return
+        u = self.store.users.get(agent["principal_user_id"])
+        if not u or u.get("suspended"):
+            return
+        from .timeutil import eat
+        day = eat(self.clock.now()).strftime("%Y-%m-%d")
+        used = u.setdefault("alerts_sent", {"day": day, "SMS": 0, "EMAIL": 0})
+        if used["day"] != day:
+            used.update(day=day, SMS=0, EMAIL=0)
+        if pref == "SMS" and u.get("phone") and u.get("phone_verified") and used["SMS"] < SMS_ALERTS_PER_DAY:
+            used["SMS"] += 1
+            self.messenger.spawn(self.messenger.send_sms(u["phone"], f"KenyaBidder: {message}"[:300], "alert"))
+        elif pref == "EMAIL" and u.get("email") and u.get("email_verified") and used["EMAIL"] < EMAIL_ALERTS_PER_DAY:
+            used["EMAIL"] += 1
+            self.messenger.spawn(self.messenger.send_email(u["email"], f"KenyaBidder: {kind.replace('_', ' ')}", message, "alert"))
 
     def notifications_for(self, agent_id: str, limit: int = 50) -> list[dict]:
         out = []

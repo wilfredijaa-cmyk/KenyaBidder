@@ -22,7 +22,10 @@ from .intel import MarketIntel
 from .kb import KnowledgeBaseService
 from .kpis import compute_kpis
 from .llm.registry import LlmRegistry
+from .errors import AppError
 from .matches import MatchService
+from .messaging import Messenger
+from .verification import VerificationService
 from .mcpx.manager import McpManager
 from .mcpx.server import build_server
 from .orchestrator import Orchestrator
@@ -34,12 +37,13 @@ from .wallet import TokenMeter, WalletDB
 from .strategy import BaselineStrategy, HeuristicStrategy, LlmStrategy, SellerAdvisor
 
 
-def create_app(*, store=None, clock=None, guardrail_config=None, transport=None, whatsapp=None, match_ttl_ms=None,
+def create_app(*, store=None, clock=None, guardrail_config=None, transport=None, whatsapp=None, sms=None, email=None, match_ttl_ms=None,
                llm_provider_factory=None, allow_stdio=None, report_grace_ms=None, database=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
     store = store or Store()
     clock = clock or SystemClock()
     events = Events()
-    router = ChannelRouter(store, clock, whatsapp or WhatsAppAdapter(store, clock))
+    messenger = Messenger(store, clock, sms, email)
+    router = ChannelRouter(store, clock, whatsapp or WhatsAppAdapter(store, clock), messenger)
     notify = router.notify
 
     engine = AuctionEngine(store, clock, events, listing_limits)
@@ -80,6 +84,15 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
 
     app.billing = BillingService(store, clock, wallet, llms, meter, notify, mpesa_client, dev_payments, on_credit)
     app.agents.on_identity_change = app.billing.grant_signup_tokens
+    app.messenger = messenger
+    app.verification = VerificationService(store, clock, messenger, app.agents)
+    app.billing.grant_gate = lambda u: not app.verification.phone_required() or bool(u.get("phone_verified"))
+    app.verification.on_phone_verified = app.billing.grant_signup_tokens  # the trial tokens are claimed the moment the phone is proven
+
+    def confirm_gate(user: dict) -> None:
+        if app.verification.phone_required() and not user.get("phone_verified"):
+            raise AppError("PHONE_UNVERIFIED", "verify your phone number (Profile → Verify) before exchanging contact details", 403)
+    matches.confirm_gate = confirm_gate
 
     def llm_deletion_blockers(llm_id: str) -> list[str]:
         out = []

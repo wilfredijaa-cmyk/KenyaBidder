@@ -68,11 +68,14 @@ def pretty(s: str) -> str:
 def current_user() -> dict | None:
     uid = ng_app.storage.user.get("uid")
     u = core().store.users.get(uid) if uid else None
+    if u and ng_app.storage.user.get("sv", 0) != u.get("session_version", 0):
+        return None  # the password was changed/reset since this browser signed in: every other session ends
     return None if (u and u.get("suspended")) else u  # a suspended account is signed out on its next page load
 
 
 def login_user(user: dict) -> None:
     ng_app.storage.user["uid"] = user["id"]
+    ng_app.storage.user["sv"] = user.get("session_version", 0)
 
 
 def logout() -> None:

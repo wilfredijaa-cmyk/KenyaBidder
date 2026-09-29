@@ -4,7 +4,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from ..terms import get_terms
-from .common import (active_agent, badge, core, empty, fmt_datetime, frame, guard, kes, my_agents, pretty, require_user, theme)
+from .common import (active_agent, badge, core, empty, fmt_datetime, frame, guard, kes, login_user, my_agents, pretty, require_user, theme)
 
 STATUS_COLOR = {"PAID": "positive", "PENDING": "warning", "AWAITING_REVIEW": "warning", "FAILED": "negative", "REJECTED": "negative",
                 "CANCELLED": "grey", "EXPIRED": "grey", "REFUNDED": "grey"}
@@ -236,7 +236,44 @@ def profile_page():
                 c.agents.set_phone(user["id"], ph.value)
                 c.agents.set_email(user["id"], em.value)
                 ui.notify("Saved", type="positive")
+                verify_card.refresh()
             ui.button("Save", icon="save", on_click=save).props("unelevated color=primary")
+
+        @ui.refreshable
+        def verify_card():
+            u = c.store.users[user["id"]]
+            need = c.verification.phone_required()
+            with ui.card().classes("w-full max-w-xl"):
+                ui.label("Verification").classes("font-medium")
+                ui.label("A verified phone protects your account, unlocks your free trial tokens and lets you exchange contact details after a match."
+                         if need else "Verify your phone and email so you can recover your account and receive alerts.").classes("text-xs opacity-70")
+                for label, field, has, send, confirm in (("Phone", "phone", u.get("phone"), c.verification.send_phone_code, c.verification.confirm_phone),
+                                                         ("Email", "email", u.get("email"), c.verification.send_email_code, c.verification.confirm_email)):
+                    with ui.row().classes("w-full items-center gap-2"):
+                        ui.label(f"{label}: {u.get(field) or 'not set'}").classes("grow")
+                        if not has:
+                            continue
+                        if u.get(f"{field}_verified"):
+                            badge("verified", "positive")
+                            continue
+                        badge("not verified", "warning")
+                        code = ui.input("6-digit code").props("dense outlined").classes("w-32")
+
+                        @guard
+                        async def send(send=send, label=label):
+                            r = await send(user["id"])
+                            ui.notify(f"Code sent to {r['sent_to']} — valid {r['expires_in_s'] // 60} minutes"
+                                      + (f" (dev mode, no gateway configured — your code is {r['dev_code']})" if r.get("dev_code") else ""), type="positive", multi_line=True)
+
+                        @guard
+                        def confirm_it(confirm=confirm, code=code, label=label):
+                            confirm(user["id"], code.value)
+                            ui.notify(f"{label} verified", type="positive")
+                            verify_card.refresh()
+                            ui.navigate.reload()
+                        ui.button("Send code", on_click=send).props("outline dense no-caps")
+                        ui.button("Confirm", on_click=confirm_it).props("unelevated dense no-caps color=primary")
+        verify_card()
         with ui.card().classes("w-full max-w-xl"):
             ui.label("Change password").classes("font-medium")
             old = ui.input("Current password", password=True, password_toggle_button=True).classes("w-full")
@@ -245,6 +282,7 @@ def profile_page():
             @guard
             def change():
                 c.agents.change_password(user["id"], old.value, new.value)
+                login_user(user)  # the change ended every session — keep this browser signed in
                 old.set_value("")
                 new.set_value("")
                 ui.notify("Password changed", type="positive")

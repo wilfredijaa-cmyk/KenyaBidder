@@ -4,8 +4,8 @@ import tempfile
 from pathlib import Path
 
 MAP_KEYS = ["users", "agents", "auctions", "matches", "triggers", "approvals", "idempotency", "breakers",
-            "llms", "mcps", "kbs", "packs"]
-LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log", "admin_log"]
+            "llms", "mcps", "kbs", "packs", "verifications", "businesses", "disputes"]
+LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log", "admin_log", "message_log"]
 
 
 class Log(list):
@@ -57,7 +57,7 @@ class Store:
             for k in list(self.idempotency)[: len(self.idempotency) - 20_000]:  # dicts keep insertion order: oldest first
                 del self.idempotency[k]
             n["idempotency"] = True
-        for name, cap in (("audit", 50_000), ("notifications", 5_000), ("market_history", 20_000), ("outbox", 1_000), ("admin_log", 5_000), ("reveal_log", 20_000)):
+        for name, cap in (("audit", 50_000), ("notifications", 5_000), ("market_history", 20_000), ("outbox", 1_000), ("admin_log", 5_000), ("reveal_log", 20_000), ("message_log", 5_000)):
             lst = getattr(self, name)
             if len(lst) > cap:
                 del lst[: len(lst) - cap]
@@ -67,6 +67,8 @@ class Store:
             del self.triggers[tid]
         for aid in [a["id"] for a in self.approvals.values() if a["status"] != "PENDING" and now - (a.get("resolved_at") or a["created_at"]) > 30 * 24 * 3600_000]:
             del self.approvals[aid]
+        for vid in [v["id"] for v in self.verifications.values() if now - v["created_at"] > 24 * 3600_000]:
+            del self.verifications[vid]  # one-time codes are worthless after their 10 minutes; keep a day for support questions
         fails = self.settings.get("login_failures", {})
         for k in [k for k, ts in fails.items() if not [t for t in ts if now - t < 5 * 60_000]]:
             del fails[k]  # expired lockout entries (incl. names that never existed) must not accumulate

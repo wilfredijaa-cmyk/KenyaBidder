@@ -16,6 +16,7 @@ class MatchService:
         self.notify = notify or (lambda *a, **k: None)
         self.match_ttl_ms = match_ttl_ms
         self.report_grace_ms = report_grace_ms  # how long the other side has to answer a first report
+        self.confirm_gate = None  # composition root: fn(user) -> raises if the user may not exchange contact details yet
         # create_match is triggered by the deterministic layer when an auction closes with a winner.
         engine.events.on("auction.settled", self._on_settled)
 
@@ -71,6 +72,8 @@ class MatchService:
         if m["status"] not in PRE_REVEAL:
             raise bad("INVALID_STATE", f"match is {m['status']}")
         side = self._side(m, agent_id)
+        if self.confirm_gate:
+            self.confirm_gate(self.store.users[self.store.agents[agent_id]["principal_user_id"]])
         now = self.clock.now()
         m["confirmations"][f"{side}_at"] = m["confirmations"][f"{side}_at"] or now
         m["updated_at"] = now

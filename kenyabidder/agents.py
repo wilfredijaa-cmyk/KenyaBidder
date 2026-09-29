@@ -103,6 +103,8 @@ class AgentService:
         email = (email or "").strip() or None
         if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
             raise bad("INVALID_EMAIL", "that email address does not look right")
+        if email != u.get("email"):
+            u["email_verified"] = False  # a new address must prove itself again
         u["email"] = email
         return u
 
@@ -113,7 +115,10 @@ class AgentService:
             raise not_found("USER_NOT_FOUND", "user not found")
         if any(o["id"] != user_id and o["phone"] and o["phone"] == self._phone(phone) for o in self.store.users.values()):
             raise conflict("PHONE_TAKEN", "that phone number is already registered to another account")
-        u["phone"] = self._phone(phone)
+        new = self._phone(phone)
+        if new != u.get("phone"):
+            u["phone_verified"] = False  # a new number must prove itself again
+        u["phone"] = new
         if self.on_identity_change:
             self.on_identity_change(u)
         return u
@@ -167,7 +172,14 @@ class AgentService:
             raise forbidden("WRONG_PASSWORD", "current password is incorrect")
         if len(new or "") < 8:
             raise bad("INVALID_USER", "password must be at least 8 characters")
+        self.set_password(user_id, new)
+
+    def set_password(self, user_id: str, new: str) -> None:
+        """Store a new password, end every signed-in session of the account and clear its sign-in lockout."""
+        u = self.store.users[user_id]
         u["password_hash"] = hash_password(new)
+        u["session_version"] = u.get("session_version", 0) + 1
+        self.store.settings.setdefault("login_failures", {}).pop(u["name"].lower(), None)
 
     def admin_reset_password(self, user_id: str, new: str) -> None:
         """Support tool: there is no email reset flow yet, so an admin sets a temporary password and tells the user."""
@@ -176,8 +188,7 @@ class AgentService:
             raise not_found("USER_NOT_FOUND", "user not found")
         if len(new or "") < 8:
             raise bad("INVALID_USER", "password must be at least 8 characters")
-        u["password_hash"] = hash_password(new)
-        self.store.settings.setdefault("login_failures", {}).pop(u["name"].lower(), None)
+        self.set_password(user_id, new)
 
     def set_suspended(self, user_id: str, suspended: bool, *, by: str | None = None) -> dict:
         """Suspend/reinstate an account. Suspension pauses every agent immediately (bid triggers cancelled)."""
@@ -280,8 +291,8 @@ class AgentService:
         if "daily_summary" in m:
             m["daily_summary"] = bool(m["daily_summary"])
         m.pop("last_summary_day", None)
-        if "preferred_channel" in m and m["preferred_channel"] not in ("WEB", "WHATSAPP"):
-            raise bad("INVALID_MEMORY", "preferred_channel must be WEB or WHATSAPP")
+        if "preferred_channel" in m and m["preferred_channel"] not in ("WEB", "WHATSAPP", "SMS", "EMAIL"):
+            raise bad("INVALID_MEMORY", "preferred_channel must be WEB, WHATSAPP, SMS or EMAIL")
         if m.get("auto_relist") is not None:
             r = m["auto_relist"]
             if not (isinstance(r.get("max_relists", 3), int) and 0 <= r.get("max_relists", 3) <= 20
