@@ -254,7 +254,8 @@ class ExecutionEngine:
             return t["kind"] in REPEATING
         if res.get("code") == "AUCTION_NOT_OPEN":
             t["status"] = "DONE"
-        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST", "BID_TOO_HIGH", "ALREADY_LOWEST"):
+        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST", "ALREADY_LOWEST") and not (res.get("code") == "BID_TOO_HIGH" and t["kind"] in REPEATING):
+            # (a sealed quote above the buyer's maximum can never become valid: block it instead of refiring every tick)
             t["status"], t["last_error"] = "BLOCKED", res.get("code")
         return False
 

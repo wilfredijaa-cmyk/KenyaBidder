@@ -48,7 +48,8 @@ class PrivacyService:
         for m in self.store.matches.values():
             if m["seller_agent_id"] in mine or m["buyer_agent_id"] in mine:
                 mm = _scrub({k: v for k, v in m.items() if k != "contact_reveal"})
-                mm["counterparty"] = name_of(m["buyer_agent_id"] if m["seller_agent_id"] in mine else m["seller_agent_id"])
+                mm["counterparty"] = (name_of(m["buyer_agent_id"] if m["seller_agent_id"] in mine else m["seller_agent_id"])
+                                      if m.get("contact_reveal") else "not revealed (contact details were never exchanged)")
                 matches.append(mm)
         orders = self.billing.list_orders(user_id=user_id, limit=100_000)
         return {
@@ -82,6 +83,9 @@ class PrivacyService:
             out.append("you have an open dispute")
         if any(a["status"] in ("ACTIVE", "EXTENDING", "SCHEDULED") and a.get("poster_agent_id") in mine and a["bids"] for a in self.store.auctions.values()):
             out.append("one of your listings has live bids")
+        if any(a["status"] in ("ACTIVE", "EXTENDING") and ((a["auction_type"] in ("FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED", "REVERSE_SEALED") and any(b["agent_id"] in mine for b in a["bids"]))
+                                                            or (a["bids"] and a["bids"][-1]["agent_id"] in mine)) for a in self.store.auctions.values()):
+            out.append("your agent is currently leading or has a sealed bid on an open auction")
         u = self.store.users.get(user_id)
         if u and u["role"] == "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin" and not x.get("deleted_at")) <= 1:
             out.append("you are the only administrator")
@@ -102,31 +106,50 @@ class PrivacyService:
             raise bad("TOKENS_HELD", f"you still hold {sum(held.values()):,} tokens; deleting forfeits them (no refund) — confirm to proceed")
         now = self.clock.now()
         alias = f"deleted-{user_id[:6]}"
+        # 1. Lock the account FIRST: whatever happens next, it can never sign in again and nothing personal is left on the profile.
+        u.update(name=alias, phone=None, email=None, phone_verified=False, email_verified=False, suspended=True, deleted_at=now,
+                 deletion_pending=True, password_hash="deleted$" + secrets.token_hex(16), role="user", session_version=u.get("session_version", 0) + 1)
+        u.pop("verified_business", None)
+        # 2. Scrub everything else (idempotent: if it is interrupted, resume_pending() finishes it from the maintenance loop).
+        self._scrub(user_id)
+        self.store.admin_log.append({"at": now, "admin_id": None, "admin": "system", "action": "account_deleted", "detail": {"user": alias}})
+        return {"deleted": True, "kept": "payment and token-ledger records (legal retention), under an anonymous id"}
+
+    def _scrub(self, user_id: str) -> None:
+        u = self.store.users[user_id]
         mine = [a for a in self.store.agents.values() if a["principal_user_id"] == user_id]
+        ids = {a["agent_id"] for a in mine}
         for a in mine:
             self.agents.set_status(a["agent_id"], "SUSPENDED")  # cancels every live trigger at once
             a["channel_identity_map"] = []
             a["durable_memory"].update(conversation=[], notes="", watch=None, one_off_authorizations=[])
             a["config"]["tools"], a["config"]["kb_ids"] = [], []
-        ids = {a["agent_id"] for a in mine}
+        for auction in self.store.auctions.values():  # open listings/RFQs nobody has bid on simply come down
+            if auction.get("poster_agent_id") in ids and auction["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING") and not auction["bids"]:
+                auction["status"], auction["result"] = "CANCELLED", {"outcome": "CANCELLED", "reason": "poster deleted their account"}
         for m in self.store.matches.values():
             if m.get("contact_reveal"):
-                for k in ("seller_contact", "buyer_contact"):
-                    c = m["contact_reveal"][k]
-                    if c and c.get("name") == u["name"]:
-                        m["contact_reveal"][k] = {"name": "deleted user", "phone": None, "email": None, "verified_business": None}
+                for key, agent_key in (("seller_contact", "seller_agent_id"), ("buyer_contact", "buyer_agent_id")):
+                    if m[agent_key] in ids and m["contact_reveal"].get(key):
+                        m["contact_reveal"][key] = {"name": "deleted user", "phone": None, "email": None, "verified_business": None}
         self.store.notifications[:] = [n for n in self.store.notifications if n["agent_id"] not in ids]
         for v in [v["id"] for v in self.store.verifications.values() if v["user_id"] == user_id]:
             del self.store.verifications[v]
         for b in self.store.businesses.values():
             if b["user_id"] == user_id:
                 b.update(business_name="(deleted)", registration_no="(deleted)", notes="")
-        if held:
-            for llm_id, bal in held.items():
+        for llm_id, bal in self.wallet.balances(user_id).items():
+            if bal > 0:
                 self.wallet.adjust(user_id, llm_id, -bal, ref=f"forfeit:{user_id}:{llm_id}", meta={"reason": "account deleted, tokens forfeited"})
-        u.update(name=alias, phone=None, email=None, phone_verified=False, email_verified=False, suspended=True, deleted_at=now,
-                 password_hash="deleted$" + secrets.token_hex(16), role="user", session_version=u.get("session_version", 0) + 1)
-        u.pop("verified_business", None)
-        self.store.settings.setdefault("login_failures", {})
-        self.store.admin_log.append({"at": now, "admin_id": None, "admin": "system", "action": "account_deleted", "detail": {"user": alias}})
-        return {"deleted": True, "kept": "payment and token-ledger records (legal retention), under an anonymous id"}
+        u.pop("deletion_pending", None)
+
+    def resume_pending(self) -> int:
+        """Finish any deletion that was interrupted after the account was locked."""
+        n = 0
+        for uid in [k for k, u in self.store.users.items() if u.get("deletion_pending")]:
+            try:
+                self._scrub(uid)
+                n += 1
+            except Exception:  # noqa: BLE001  stays pending; retried on the next maintenance run
+                pass
+        return n

@@ -101,3 +101,57 @@ def test_deleted_users_notifications_do_not_come_back_from_the_database(env):
     back = StatePersistence(db).load()  # …and are gone after a restart
     assert not any(n["agent_id"] == buyer["agent_id"] for n in back.notifications)
     assert "David" not in json.dumps(back.users) and back.users[ub["id"]]["phone"] is None
+
+
+def test_export_hides_the_counterparty_until_contact_was_exchanged(env):
+    us, seller = env.seller(name="Amina")
+    ub, buyer = env.bidder(name="David", phone="+254700000009")
+    aid = env.english(seller["agent_id"])["auction_id"]
+    env.engine.submit_bid(auction_id=aid, agent_id=buyer["agent_id"], amount=1500)
+    env.clock.advance(61_000)
+    env.engine.tick()
+    out = env.privacy.export(ub["id"])
+    assert "Amina" not in json.dumps(out) and out["matches"][0]["counterparty"].startswith("not revealed")
+
+
+def test_deletion_locks_first_and_an_interrupted_scrub_is_resumed(env, monkeypatch):
+    us, seller = env.seller(name="Amina")
+    ub, buyer = env.bidder(name="David", phone="+254700000009")
+    env.wallet.credit(ub["id"], "L1", 500, "TOPUP", ref="o1")
+    real = env.wallet.adjust
+
+    def boom(*a, **k):
+        raise RuntimeError("database hiccup")
+    monkeypatch.setattr(env.wallet, "adjust", boom)
+    with pytest.raises(RuntimeError):
+        env.privacy.delete_account(ub["id"], "password123", forfeit_tokens=True)
+    u = env.store.users[ub["id"]]
+    assert u["deletion_pending"] and u["suspended"] and u["phone"] is None and env.agents.authenticate(u["name"], "password123") is None  # already unusable
+    monkeypatch.setattr(env.wallet, "adjust", real)
+    assert env.privacy.resume_pending() == 1
+    assert "deletion_pending" not in u and env.wallet.balance(ub["id"], "L1") == 0
+
+
+def test_deletion_takes_down_unbid_listings_and_is_blocked_while_leading_an_auction(env):
+    env.agents.create_user(name="Boss", password="password123")  # the first account is the administrator
+    us, seller = env.seller(name="Amina")
+    ub, buyer = env.bidder(name="David")
+    aid = env.english(seller["agent_id"], duration_ms=600_000)["auction_id"]
+    env.engine.submit_bid(auction_id=aid, agent_id=buyer["agent_id"], amount=1500)
+    with pytest.raises(AppError) as e:
+        env.privacy.delete_account(ub["id"], "password123")
+    assert "leading" in e.value.message
+    with pytest.raises(AppError) as e:  # the seller has a live bid too
+        env.privacy.delete_account(us["id"], "password123")
+    assert "live bids" in e.value.message
+    quiet = env.english(seller["agent_id"], duration_ms=600_000)  # a second listing with no bids is fine to take down…
+    env.clock.advance(601_000)
+    env.engine.tick()  # …first let the first auction close so the seller has nothing live
+    m = next(iter(env.store.matches.values()))
+    env.matches.confirm_match(m["match_id"], seller["agent_id"])
+    env.matches.confirm_match(m["match_id"], buyer["agent_id"])
+    env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
+    env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
+    fresh = env.english(seller["agent_id"], duration_ms=600_000)["auction_id"]
+    env.privacy.delete_account(us["id"], "password123")
+    assert env.engine.get_auction(fresh)["status"] == "CANCELLED"

@@ -191,3 +191,15 @@ def test_revealed_contact_shows_the_verified_badge(env):
     env.matches.confirm_match(m["match_id"], buyer["agent_id"])
     assert m["contact_reveal"]["seller_contact"]["verified_business"] == "Amina Traders"
     assert m["contact_reveal"]["buyer_contact"]["verified_business"] is None
+
+
+def test_withdrawing_a_dispute_lets_pending_reports_take_effect_and_allows_reopening(env):
+    m, seller, buyer = revealed_match(env)
+    d = env.trust.open_dispute(buyer["agent_id"], m["match_id"], "OTHER", "Something went wrong here.")
+    env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
+    env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
+    assert m["status"] == "CONTACT_REVEALED"  # held back while the dispute was open
+    env.trust.withdraw(buyer["agent_id"], d["id"])
+    assert m["status"] == "COMPLETED"
+    d2 = env.trust.open_dispute(seller["agent_id"], m["match_id"], "NOT_PAID", "Actually the balance is still owing.")
+    assert env.trust.dispute_for_match(m["match_id"])["id"] == d2["id"]

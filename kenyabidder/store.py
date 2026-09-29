@@ -96,7 +96,19 @@ class Store:
                 setattr(s, k, Log(data[k]) if k in LIST_KEYS else data[k])
         s.considered = set(data.get("considered", []))
         s.settings = data.get("settings", {})
-        return s
+        return s.upgrade()
+
+    def upgrade(self) -> "Store":
+        """Bring records written by older versions up to the current shape (idempotent; runs after every load)."""
+        for a in self.auctions.values():
+            a.setdefault("direction", "FORWARD")
+            a.setdefault("poster_agent_id", a.get("seller_agent_id"))
+            a.setdefault("verified_only", False)
+        for m in self.matches.values():
+            m.setdefault("direction", "FORWARD")
+        for u in self.users.values():
+            u.setdefault("session_version", 0)
+        return self
 
     def prune(self, now: int) -> dict:
         """Bound everything that only ever grew. The scaling path is a real database; until then, nothing may grow forever."""

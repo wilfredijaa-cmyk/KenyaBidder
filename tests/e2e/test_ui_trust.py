@@ -68,11 +68,11 @@ async def test_phone_verification_business_badge_and_swahili(make_session):
     await user.goto("/profile")
     await user.p.wait_for_selector("text=✓ verified")
 
-    await user.p.get_by_role("button", name="SW").click()  # Kiswahili
+    await user.p.get_by_role("button", name="SW", exact=True).click()  # Kiswahili
     await user.p.wait_for_selector("text=Wasifu wangu")
     await user.goto("/")
     await user.p.wait_for_selector("text=Mawakala wangu")
-    await user.p.get_by_role("button", name="EN").click()
+    await user.p.get_by_role("button", name="EN", exact=True).click()
     await user.p.wait_for_selector("text=My agents")
     for s in (user, admin):
         assert not s.errors, s.errors

@@ -26,6 +26,7 @@ def test_full_roundtrip_of_maps_logs_and_kv(db):
     s.audit.extend({"i": i} for i in range(5))
     s.considered.update({"x", "y"})
     s.settings["mcp_key"] = "k"
+    s.upgrade()  # loading always brings older records up to the current shape
     back = roundtrip(db, s)
     assert back.users == s.users and back.auctions == s.auctions and list(back.audit) == list(s.audit)
     assert back.considered == {"x", "y"} and back.settings == {"mcp_key": "k"}
@@ -114,8 +115,8 @@ def test_legacy_snapshot_is_imported_once(db, tmp_path):
     s.save(legacy)
     p = StatePersistence(db)
     got = p.import_legacy_json(legacy)
-    assert got.users == {"u": {"id": "u"}} and not legacy.exists() and (tmp_path / "state.json.imported").exists()
-    assert StatePersistence(db).load().users == {"u": {"id": "u"}}
+    assert got.users == {"u": {"id": "u", "session_version": 0}} and not legacy.exists() and (tmp_path / "state.json.imported").exists()
+    assert StatePersistence(db).load().users == {"u": {"id": "u", "session_version": 0}}
     assert p.import_legacy_json(legacy) is None
 
 
@@ -141,3 +142,11 @@ def test_any_non_append_change_to_a_log_is_made_durable(db):
     s.notifications.clear()
     p.flush_all(s)
     assert list(StatePersistence(db).load().notifications) == []
+
+
+def test_records_written_before_reverse_auctions_are_upgraded_on_load(db):
+    s = Store()
+    s.auctions["old"] = {"auction_id": "old", "status": "ACTIVE", "seller_agent_id": "s1", "auction_type": "ENGLISH", "bids": []}  # no poster/direction/verified_only
+    StatePersistence(db).flush_all(s)
+    a = StatePersistence(db).load().auctions["old"]
+    assert a["poster_agent_id"] == "s1" and a["direction"] == "FORWARD" and a["verified_only"] is False

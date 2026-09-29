@@ -192,3 +192,15 @@ def test_llm_proposals_are_clamped_into_the_floor_and_the_buyers_maximum(env):
     sealed = env.engine.get_auction(rfq(env, buyer, auction_type="REVERSE_SEALED", max_price=10_000)["auction_id"])
     assert proposal_from_tool_input({"action": "BID", "amount": 10**9, "reasoning": "x"}, sealed, s1)["params"]["amount"] == 10_000
     assert proposal_from_tool_input({"action": "BID", "amount": "cheap", "reasoning": "x"}, sealed, s1) is None
+
+
+def test_a_sealed_quote_above_the_buyers_maximum_is_blocked_not_refired(env):
+    _, buyer = env.bidder()
+    _, s1 = supplier(env)
+    aid = rfq(env, buyer, auction_type="REVERSE_SEALED", max_price=5_000)["auction_id"]
+    t = env.execution.register_trigger(agent_id=s1["agent_id"], auction_id=aid, kind="REVERSE_SEALED_BID", params={"amount": 9_000})
+    assert t["status"] == "BLOCKED" and t["last_error"] == "BID_TOO_HIGH"
+    n = len(env.store.audit)
+    env.engine.tick()
+    env.execution.evaluate_all()
+    assert len(env.store.audit) == n  # no more attempts, no more audit noise

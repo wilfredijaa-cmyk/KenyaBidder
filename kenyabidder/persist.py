@@ -118,7 +118,7 @@ class StatePersistence:
             if body is not None:
                 setattr(s, attr, set(body) if key == "considered" else body)
                 self._kv_seen[key] = _digest(_dump(sorted(body) if key == "considered" else body))
-        return s
+        return s.upgrade()
 
     def _kv_get(self, key: str):
         row = self.db.query_one("SELECT body FROM kv WHERE key = ?", (key,))

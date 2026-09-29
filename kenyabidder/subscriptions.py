@@ -27,8 +27,8 @@ class SubscriptionService:
         plan = order["data"]["plan"]
         now = self.clock.now()
         s = self.store.subscriptions.get(order["user_id"])
-        if s and order["id"] in s["order_ids"]:
-            return s
+        if s and order["id"] in (s.get("seen_orders") or s["order_ids"]):
+            return s  # already counted (even if its days have since lapsed): a duplicate callback must not grant them again
         if at is not None and at + plan["days"] * DAY_MS <= now:
             return None  # a recovered order whose days have already run out: nothing left to grant
         base = now if at is None else at
@@ -37,10 +37,11 @@ class SubscriptionService:
             s["renewals"] += 1
         else:
             s = {"user_id": order["user_id"], "started_at": base, "current_period_end": base + plan["days"] * DAY_MS, "renewals": 0,
-                 "order_ids": [], "reminded_for": None}
+                 "order_ids": [], "seen_orders": list((s or {}).get("seen_orders") or (s or {}).get("order_ids") or []), "reminded_for": None}
             self.store.subscriptions[order["user_id"]] = s
         s.update(status="ACTIVE", plan_name=order["pack_name"], plan=dict(plan), reminded_for=None)
-        s["order_ids"] = [*s["order_ids"], order["id"]][-20:]
+        s["order_ids"] = [*s["order_ids"], order["id"]][-50:]
+        s["seen_orders"] = [*(s.get("seen_orders") or []), order["id"]][-500:]
         self._tell(order["user_id"], f"Your {order['pack_name']} plan is active until {self._date(s['current_period_end'])}.")
         return s
 
@@ -60,7 +61,7 @@ class SubscriptionService:
     def recover(self, paid_plan_orders: list[dict]) -> int:
         """Safety net: a PAID plan order whose activation was lost (crash between the payment commit and the plan) is activated now."""
         n = 0
-        known = {i for s in self.store.subscriptions.values() for i in s["order_ids"]}
+        known = {i for s in self.store.subscriptions.values() for i in (s.get("seen_orders") or s["order_ids"])}
         for o in paid_plan_orders:
             if o["id"] not in known and o["data"].get("plan") and self.activate(o, at=o["updated_at"]):
                 n += 1

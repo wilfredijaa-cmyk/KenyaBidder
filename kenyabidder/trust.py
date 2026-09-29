@@ -134,8 +134,9 @@ class TrustService:
         now = self.clock.now()
         if now - (m.get("revealed_at") or m["updated_at"]) > DISPUTE_WINDOW_MS:
             raise bad("WINDOW_CLOSED", "disputes must be opened within 30 days of the contact exchange")
-        if any(d["match_id"] == match_id for d in self.store.disputes.values()):
-            raise conflict("ALREADY_DISPUTED", "this match already has a dispute")
+        earlier = [d for d in self.store.disputes.values() if d["match_id"] == match_id]
+        if any(d["status"] != "WITHDRAWN" for d in earlier) or len(earlier) >= 3:
+            raise conflict("ALREADY_DISPUTED", "this match already has a dispute")  # a withdrawn one may be reopened, but not forever
         if sum(1 for d in self.store.disputes.values() if d["opened_by"] == agent_id and d["status"] in ("OPEN", "RESPONDED")) >= MAX_OPEN_PER_AGENT:
             raise AppError("TOO_MANY_DISPUTES", "you already have several disputes open — wait for them to be resolved", 429)
         other = m["buyer_agent_id"] if self._party(m, agent_id) == "seller" else m["seller_agent_id"]
@@ -172,7 +173,10 @@ class TrustService:
         if d["status"] not in ("OPEN", "RESPONDED"):
             raise bad("DISPUTE_CLOSED", f"dispute is {d['status'].lower()}")
         d.update(status="WITHDRAWN", resolved_at=self.clock.now())
-        self.matches.store.matches[d["match_id"]]["dispute_open"] = False
+        m = self.store.matches[d["match_id"]]
+        m["dispute_open"] = False
+        if m["status"] == "CONTACT_REVEALED" and m["outcome_reports"]:
+            self.matches._finalize(m)  # outcome reports made while the dispute was open can now take effect
         self.notify(d["against"], "dispute", "The dispute against you was withdrawn.", dispute_id=d["id"])
         return d
 
@@ -206,7 +210,8 @@ class TrustService:
         return d
 
     def dispute_for_match(self, match_id: str) -> dict | None:
-        return next((d for d in self.store.disputes.values() if d["match_id"] == match_id), None)
+        found = [d for d in self.store.disputes.values() if d["match_id"] == match_id]
+        return sorted(found, key=lambda d: d["opened_at"])[-1] if found else None  # stable: ties keep insertion order
 
     def open_disputes(self) -> list[dict]:
         return sorted((d for d in self.store.disputes.values() if d["status"] in ("OPEN", "RESPONDED")), key=lambda d: d["opened_at"])

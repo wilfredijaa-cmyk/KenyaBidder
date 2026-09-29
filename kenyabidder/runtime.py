@@ -133,7 +133,7 @@ class Runtime:
                     await asyncio.to_thread(self.backups.run)
                 except Exception:  # noqa: BLE001
                     log.exception("backup failed")
-            for name, sync_step in (("order expiry", a.billing.expire_stale), ("subscriptions", a.subscriptions.tick),
+            for name, sync_step in (("order expiry", a.billing.expire_stale), ("subscriptions", a.subscriptions.tick), ("pending deletions", a.privacy.resume_pending),
                                     ("plan recovery", lambda: a.subscriptions.recover(a.billing.paid_plan_orders(a.clock.now() - 400 * 24 * 3600_000))), ("evening summaries", a.sellers.send_daily_summaries),
                                     ("pruning", lambda: self.store.prune(a.clock.now()))):
                 try:
