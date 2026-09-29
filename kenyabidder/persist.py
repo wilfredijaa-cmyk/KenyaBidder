@@ -164,6 +164,9 @@ class StatePersistence:
         if name in MAP_KEYS:
             cur = getattr(store, name)
             seen, frozen = self._seen[name], self._frozen[name]
+            for coll, eid in [t for t in store.thawed if t[0] == name]:
+                frozen.discard(eid)  # edited on purpose: look at it again (its digest will differ, so it is rewritten)
+                store.thawed.discard((coll, eid))
             for eid, ent in cur.items():
                 if eid in frozen:
                     continue

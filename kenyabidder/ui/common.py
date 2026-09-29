@@ -10,7 +10,7 @@ from nicegui import context, ui
 
 from .. import i18n
 from ..errors import AppError
-from ..i18n import LANGS
+from ..i18n import LANGS, Verbatim
 from ..timeutil import EAT
 
 _rt = None
@@ -238,7 +238,7 @@ def frame(user: dict, active: str):
         label, color, tip = token_chip_state(user)
         if label:
             ui.button(label, icon="bolt", on_click=lambda: ui.navigate.to("/wallet")).props(f"flat dense no-caps color={color}").tooltip(tip)
-        ui.button(user["name"], icon="person", on_click=lambda: ui.navigate.to("/profile")).props("flat dense no-caps color=grey-7").classes("max-sm:hidden")
+        ui.button(Verbatim(user["name"]), icon="person", on_click=lambda: ui.navigate.to("/profile")).props("flat dense no-caps color=grey-7").classes("max-sm:hidden")
         ui.button(icon="logout", on_click=logout).props("flat round").tooltip("Sign out")
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-3"):
         yield

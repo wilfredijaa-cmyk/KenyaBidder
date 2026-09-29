@@ -423,3 +423,13 @@ async def test_concurrent_wrong_passwords_are_all_counted_before_the_lockout_che
     env.clock.advance(6 * 60_000)
     assert (await env.agents.authenticate_async("Target", "password123"))["id"] == u["id"]
     assert not env.store.settings["login_failures"].get("target")  # success clears the counter
+
+
+async def test_changing_the_phone_cuts_the_old_numbers_control_of_the_agent(env):
+    ua, a = env.bidder(phone="+254711000888")
+    env.link_whatsapp(a, "+254711000888")
+    env.agents.update(a["agent_id"], memory={"preferred_channel": "WHATSAPP"})
+    assert (await env.router.handle_inbound("WHATSAPP", "254711000888", "status"))["agent_id"] == a["agent_id"]
+    env.agents.set_phone(ua["id"], "0722 111 222")
+    assert (await env.router.handle_inbound("WHATSAPP", "254711000888", "pause"))["agent_id"] is None  # the old number no longer commands the agent
+    assert a["status"] == "ACTIVE" and a["channel_identity_map"] == [] and a["durable_memory"]["preferred_channel"] == "WEB"

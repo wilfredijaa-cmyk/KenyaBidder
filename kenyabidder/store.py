@@ -78,6 +78,7 @@ class Store:
             setattr(self, k, {})
         for k in LIST_KEYS:
             setattr(self, k, Log())
+        self.thawed: set[tuple[str, str]] = set()  # (collection, id) of frozen records that were edited after all (see persist.py)
         self.considered: set[str] = set()
         self.rate_windows: dict[str, list[int]] = {}
         self.settings: dict = {}
@@ -97,6 +98,10 @@ class Store:
         s.considered = set(data.get("considered", []))
         s.settings = data.get("settings", {})
         return s.upgrade()
+
+    def thaw(self, collection: str, entity_id: str) -> None:
+        """Tell the durable copy that a finished (frozen) record was changed on purpose — e.g. personal data erased from an old match."""
+        self.thawed.add((collection, entity_id))
 
     def upgrade(self) -> "Store":
         """Bring records written by older versions up to the current shape (idempotent; runs after every load)."""

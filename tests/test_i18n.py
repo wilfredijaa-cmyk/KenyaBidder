@@ -58,3 +58,8 @@ def test_install_translates_static_text_only_when_swahili(monkeypatch):
     assert made == ["Wallet"]
     i18n.install(fake, lambda: "sw")  # idempotent: no double wrapping
     assert fake.label.__wrapped__.__name__ == "<lambda>"
+
+
+def test_user_supplied_text_is_never_translated():
+    assert i18n.translate("Phone", "sw") == "Simu"
+    assert i18n.translate(i18n.Verbatim("Phone"), "sw") == "Phone" and i18n.translate(i18n.Verbatim("Admin"), "sw") == "Admin"

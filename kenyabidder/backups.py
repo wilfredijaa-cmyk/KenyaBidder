@@ -76,10 +76,12 @@ def restore_backup(src: str | os.PathLike, dest: str | os.PathLike) -> None:
     src, dest = Path(src), Path(dest)
     if not src.exists():
         raise FileNotFoundError(src)
+    import time
+    stamp = time.strftime("%Y%m%d-%H%M%S")  # every restore keeps its own safety copy: a second restore must not destroy the first
     if dest.exists():
-        shutil.move(dest, dest.with_name(dest.name + ".before-restore"))
+        shutil.move(dest, dest.with_name(f"{dest.name}.before-restore-{stamp}"))
     wal = dest.with_name(dest.name + ".wal")
     if wal.exists():  # a leftover write-ahead log belongs to the OLD file and must never be replayed onto the backup
-        shutil.move(wal, dest.with_name(dest.name + ".wal.before-restore"))
+        shutil.move(wal, dest.with_name(f"{dest.name}.wal.before-restore-{stamp}"))
     shutil.copy2(src, dest)
     os.chmod(dest, 0o600)

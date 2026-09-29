@@ -6,6 +6,7 @@ import json
 from nicegui import ui
 
 from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
+from ..i18n import Verbatim
 from .common import (active_agent, agent_picker, badge, core, current_user, empty, fmt_time, frame, guard, kes, left,
                      lang_toggle, login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
 
@@ -134,7 +135,7 @@ def auctions_page():
                     v = core().engine.view(a, agent["agent_id"])
                     with ui.card().classes("cursor-pointer").on("click", lambda _, i=a["auction_id"]: ui.navigate.to(f"/auction/{i}")):
                         with ui.row().classes("w-full items-center"):
-                            ui.label(v["product_spec"]["title"]).classes("font-medium")
+                            ui.label(Verbatim(v["product_spec"]["title"])).classes("font-medium")
                             ui.space()
                             status_badge(v)
                         ui.label(f"{v['product_spec']['category']} · qty {v['product_spec']['quantity']} · {pretty(v['auction_type'])}").classes("text-xs opacity-70")
@@ -298,7 +299,7 @@ def auction_page(auction_id: str):
             v = core().engine.get_auction_detail(auction_id, agent["agent_id"])
             with ui.card().classes("w-full"):
                 with ui.row().classes("w-full items-center"):
-                    ui.label(v["product_spec"]["title"]).classes("text-xl font-medium")
+                    ui.label(Verbatim(v["product_spec"]["title"])).classes("text-xl font-medium")
                     ui.space()
                     status_badge(v)
                 ui.label(f"{v['product_spec']['category']} · qty {v['product_spec']['quantity']} · {pretty(v['auction_type'])}"
@@ -493,7 +494,9 @@ def dispute_section(m: dict, agent: dict, refresh) -> None:
     from ..trust import CATEGORIES, RULINGS
     t = core().trust
     d = t.dispute_for_match(m["match_id"])
-    if not d:
+    if not d or d["status"] == "WITHDRAWN":
+        if d:
+            ui.label("A dispute on this deal was withdrawn.").classes("text-xs opacity-70")
         if m.get("contact_reveal") and m["status"] in ("CONTACT_REVEALED", "COMPLETED", "FELL_THROUGH", "DISPUTED"):
             with ui.expansion("Something went wrong? Open a dispute", icon="gavel").classes("w-full border rounded"):
                 f = {"cat": "NOT_DELIVERED", "text": ""}

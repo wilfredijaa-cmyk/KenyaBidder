@@ -59,7 +59,10 @@ def test_backup_is_verified_pruned_and_restorable(tmp_path):
     restore_backup(tmp_path / "bk" / files[0]["name"], tmp_path / "live.duckdb")
     back = open_database(f"duckdb://{tmp_path}/live.duckdb")
     assert back.scalar("SELECT balance FROM balances") == 42
-    assert (tmp_path / "live.duckdb.before-restore").exists()
+    assert len(list(tmp_path.glob("live.duckdb.before-restore-*"))) == 1
+    (tmp_path / "live.duckdb.wal").write_text("stale log")
+    restore_backup(tmp_path / "bk" / files[0]["name"], tmp_path / "live.duckdb")  # a second restore keeps BOTH safety copies and drops the stale WAL
+    assert not (tmp_path / "live.duckdb.wal").exists() and list(tmp_path.glob("live.duckdb.wal.before-restore-*"))
 
 
 async def test_readiness_and_metrics(tmp_path):

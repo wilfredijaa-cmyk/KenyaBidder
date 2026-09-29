@@ -132,6 +132,7 @@ class PrivacyService:
                 for key, agent_key in (("seller_contact", "seller_agent_id"), ("buyer_contact", "buyer_agent_id")):
                     if m[agent_key] in ids and m["contact_reveal"].get(key):
                         m["contact_reveal"][key] = {"name": "deleted user", "phone": None, "email": None, "verified_business": None}
+                        self.store.thaw("matches", m["match_id"])  # old matches are frozen in the database: make sure the erasure reaches it
         self.store.notifications[:] = [n for n in self.store.notifications if n["agent_id"] not in ids]
         for v in [v["id"] for v in self.store.verifications.values() if v["user_id"] == user_id]:
             del self.store.verifications[v]

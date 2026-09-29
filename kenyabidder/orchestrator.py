@@ -129,6 +129,9 @@ class Orchestrator:
         opening = a["dutch"]["floor_price"] if a["auction_type"] == "DUTCH" else self.engine.min_next_bid(a, now)
         if opening > agent["constraints"]["budget_ceiling"]:
             return "cheapest possible price is above the budget ceiling"
+        limit = self.store.settings.get("verification_required_above") or 0
+        if limit and opening > limit and not (self.store.users.get(agent["principal_user_id"]) or {}).get("verified_business"):
+            return f"even the cheapest valid bid is above {limit:,} KES, which needs a verified business"
         return None
 
     def strategy_for(self, agent: dict, auction_type: str):

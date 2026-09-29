@@ -181,5 +181,5 @@ def ops_panel() -> None:
             else:
                 ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("name", "File"), ("when", "Taken"), ("mb", "Size"))],
                          rows=[{"id": f["name"], "name": f["name"], "when": f["when"], "mb": f"{f['bytes'] / 1_048_576:.2f} MB"} for f in files], row_key="id").classes("w-full").props("dense flat")
-            ui.label("Restore (with the app stopped): python -m kenyabidder restore <backup file> — the current database is kept as .before-restore.").classes("text-xs opacity-60")
+            ui.label("Restore (with the app stopped): python -m kenyabidder restore <backup file> — the current database is kept as .before-restore-<time>.").classes("text-xs opacity-60")
     body()

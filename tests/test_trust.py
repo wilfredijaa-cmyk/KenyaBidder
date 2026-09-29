@@ -203,3 +203,19 @@ def test_withdrawing_a_dispute_lets_pending_reports_take_effect_and_allows_reope
     assert m["status"] == "COMPLETED"
     d2 = env.trust.open_dispute(seller["agent_id"], m["match_id"], "NOT_PAID", "Actually the balance is still owing.")
     assert env.trust.dispute_for_match(m["match_id"])["id"] == d2["id"]
+
+
+async def test_verification_gates_tell_the_owner_and_are_filtered_before_tokens_are_spent(env):
+    _, seller = env.seller()
+    ub, plain = env.bidder(ceiling=50_000, memory={"watch": {"category": "electronics"}}, config={"algorithms": {"ENGLISH": {"strategy": "baseline", "llm_id": None}}})
+    env.store.settings["verification_required_above"] = 1_500
+    cheap = env.english(seller["agent_id"], start_price=1_000)["auction_id"]
+    dear = env.english(seller["agent_id"], start_price=2_000, reserve_price=2_000)["auction_id"]
+    assert (await env.orchestrator.consider(plain["agent_id"], dear, manual=True))["status"] == "FILTERED"  # cheapest bid is already above the limit
+    r = await env.orchestrator.consider(plain["agent_id"], cheap, manual=True)  # baseline bids up to the ceiling: will cross the threshold
+    assert r["status"] == "PLANNED"
+    t = next(t for t in env.store.triggers.values() if t["agent_id"] == plain["agent_id"])
+    env.engine.submit_bid(auction_id=cheap, agent_id=env.bidder()[1]["agent_id"], amount=1_500)  # someone raises it past what a plain bidder may do
+    env.execution.evaluate_all()
+    assert t["status"] == "BLOCKED" and t["last_error"] == "VERIFICATION_REQUIRED"
+    assert any(n["kind"] == "verification" for n in env.router.notifications_for(plain["agent_id"]))

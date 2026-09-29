@@ -119,6 +119,10 @@ class AgentService:
         new = self._phone(phone)
         if new != u.get("phone"):
             u["phone_verified"] = False  # a new number must prove itself again
+            for a in self.agents_for(user_id):  # …and the old number must stop commanding this account's agents
+                a["channel_identity_map"] = [c for c in a["channel_identity_map"] if c["channel"] != "WHATSAPP"]
+                if a["durable_memory"].get("preferred_channel") in ("WHATSAPP", "SMS"):
+                    a["durable_memory"]["preferred_channel"] = "WEB"
         u["phone"] = new
         if self.on_identity_change:
             self.on_identity_change(u)

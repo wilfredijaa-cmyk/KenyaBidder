@@ -77,12 +77,17 @@ class WalletDB:
 
     def _write(self, c, *, user_id, llm_id, kind, delta, used=0, agent_id=None, ref=None, meta=None) -> dict:
         if delta:
-            # One atomic statement (relative update): concurrent writers on PostgreSQL serialise on the row instead of overwriting each
-            # other's read-modify-write. The CHECK constraint is the final judge of "never negative".
+            # Relative, single-statement updates: concurrent writers on PostgreSQL serialise on the row instead of overwriting each
+            # other's read-modify-write, and the CHECK constraint is the final judge of "never negative".
             try:
-                bal = c.query_one("INSERT INTO balances(user_id, llm_id, balance) VALUES(?,?,?) "
-                                  "ON CONFLICT (user_id, llm_id) DO UPDATE SET balance = balances.balance + excluded.balance RETURNING balance",
-                                  (user_id, llm_id, delta))["balance"]
+                row = c.query_one("UPDATE balances SET balance = balance + ? WHERE user_id=? AND llm_id=? RETURNING balance", (delta, user_id, llm_id))
+                if row is None:
+                    if delta < 0:
+                        raise IntegrityError("nothing to debit")
+                    row = c.query_one("INSERT INTO balances(user_id, llm_id, balance) VALUES(?,?,?) "
+                                      "ON CONFLICT (user_id, llm_id) DO UPDATE SET balance = balances.balance + excluded.balance RETURNING balance",
+                                      (user_id, llm_id, delta))
+                bal = row["balance"]
             except IntegrityError:
                 raise bad("NEGATIVE_BALANCE", "operation would make the balance negative") from None
         else:
@@ -130,12 +135,18 @@ class WalletDB:
     def record_usage(self, user_id: str, llm_id: str, used: int, *, agent_id: str | None, metered: bool, meta: dict | None = None) -> dict:
         """Debit consumed tokens. Never overdraws: if the balance is short the balance is zeroed and the shortfall recorded."""
         used = max(0, int(used))
-        with self.tx() as c:
-            debit = min(self._bal(c, user_id, llm_id), used) if metered else 0
-            m = dict(meta or {})
-            if metered and debit < used:
-                m["shortfall"] = used - debit
-            return self._write(c, user_id=user_id, llm_id=llm_id, kind="USAGE", delta=-debit, used=used, agent_id=agent_id, meta=m)
+        for attempt in range(3):
+            try:
+                with self.tx() as c:
+                    debit = min(self._bal(c, user_id, llm_id), used) if metered else 0
+                    m = dict(meta or {})
+                    if metered and debit < used:
+                        m["shortfall"] = used - debit
+                    return self._write(c, user_id=user_id, llm_id=llm_id, kind="USAGE", delta=-debit, used=used, agent_id=agent_id, meta=m)
+            except AppError as e:
+                if e.code != "NEGATIVE_BALANCE" or attempt == 2:
+                    raise  # a concurrent debit drained the balance between our read and our write: re-read and try again
+        raise AssertionError("unreachable")
 
     # ---------- reads ----------
 

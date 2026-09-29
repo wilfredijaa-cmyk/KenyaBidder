@@ -225,3 +225,24 @@ def test_llm_billing_field_validation(env):
 
 def test_estimate_tokens_is_pessimistic():
     assert estimate_tokens("a" * 300) == 101
+
+
+def test_usage_settlement_retries_when_a_concurrent_debit_wins_the_race(env, monkeypatch):
+    """On PostgreSQL another writer can drain the balance between our read and our write; the CHECK refuses, and settlement must
+    re-read and try again instead of losing the usage record after the LLM call already happened."""
+    from kenyabidder.errors import bad
+    w = env.wallet
+    w.credit("u", "L", 1_000, "TOPUP", ref="o1")
+    real, calls = w._write, {"n": 0}
+
+    def flaky(c, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise bad("NEGATIVE_BALANCE", "raced")
+        return real(c, **kw)
+    monkeypatch.setattr(w, "_write", flaky)
+    e = w.record_usage("u", "L", 600, agent_id="a", metered=True)
+    assert calls["n"] == 2 and e["tokens"] == -600 and w.balance("u", "L") == 400
+    monkeypatch.setattr(w, "_write", lambda c, **kw: (_ for _ in ()).throw(bad("NEGATIVE_BALANCE", "always")))
+    with pytest.raises(AppError):
+        w.record_usage("u", "L", 600, agent_id="a", metered=True)  # gives up after 3 attempts instead of looping forever

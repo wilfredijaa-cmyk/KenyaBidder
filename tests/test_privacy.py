@@ -155,3 +155,22 @@ def test_deletion_takes_down_unbid_listings_and_is_blocked_while_leading_an_auct
     fresh = env.english(seller["agent_id"], duration_ms=600_000)["auction_id"]
     env.privacy.delete_account(us["id"], "password123")
     assert env.engine.get_auction(fresh)["status"] == "CANCELLED"
+
+
+def test_erasure_reaches_old_frozen_matches_in_the_database(env):
+    """Matches older than the dispute window are frozen (never re-written) — deleting an account must still scrub them."""
+    from kenyabidder.db import open_database
+    from kenyabidder.persist import StatePersistence
+    us, seller, ub, buyer, m = deal(env)
+    env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
+    env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
+    env.clock.advance(45 * 24 * 3600_000)
+    db = open_database(":memory:")
+    p = StatePersistence(db, env.clock)
+    p.flush_all(env.store)
+    assert m["match_id"] in p._frozen["matches"]
+    env.privacy.delete_account(ub["id"], "password123")
+    p.flush_all(env.store)
+    back = StatePersistence(db).load()
+    assert back.matches[m["match_id"]]["contact_reveal"]["buyer_contact"]["phone"] is None
+    assert "+254700000009" not in json.dumps(back.matches)

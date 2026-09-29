@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> None:
             p.error("usage: python -m kenyabidder restore <backup file>")
         dest = os.path.join(os.path.dirname(args.data or "data/state.json") or ".", "kenyabidder.duckdb")
         restore_backup(args.command[1], dest)
-        print(f"Restored {args.command[1]} to {dest} (previous database kept as .before-restore). Start the app again.")
+        print(f"Restored {args.command[1]} to {dest} (previous database kept as .before-restore-<time>). Start the app again.")
         return
     metrics_mod.configure_logging()
     rt = runtime_mod.Runtime(data_file=args.data or None, mcp_port=args.mcp_port or None)

@@ -83,7 +83,13 @@ TEMPLATES = {
 }
 
 
+class Verbatim(str):
+    """User-supplied text (names, listing titles…) that must never be translated, even if it equals a catalogue entry."""
+
+
 def translate(text: str, lang: str | None) -> str:
+    if isinstance(text, Verbatim):
+        return str(text)
     return SW.get(text, text) if lang == "sw" else text
 
 

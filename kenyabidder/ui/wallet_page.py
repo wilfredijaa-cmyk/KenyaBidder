@@ -157,7 +157,7 @@ def wallet_page():
         else:
             ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("at", "Time (EAT)"), ("kind", "Type"), ("llm", "LLM"), ("tokens", "Tokens"), ("bal", "Balance"), ("note", "Note"))],
                      rows=[{"id": e["entry_id"], "at": fmt_datetime(e["at"]), "kind": e["kind"].lower(), "llm": c.store.llms.get(e["llm_id"], {}).get("name", "?"),
-                            "tokens": f"{e['tokens']:+,}" if e["tokens"] else f"used {e['used']:,} (free)", "bal": f"{e['balance_after']:,}",
+                            "tokens": f"{e['tokens']:+,}" if e["tokens"] else (f"used {e['used']:,} (not covered: balance was empty)" if e["meta"].get("shortfall") else f"used {e['used']:,} (free)"), "bal": f"{e['balance_after']:,}",
                             "note": e["meta"].get("reason") or e["meta"].get("purpose") or e["meta"].get("order") or ""} for e in led], row_key="id").classes("w-full").props("dense flat")
         with ui.row():
             ui.button("Download ledger (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.ledger_csv(user_id=user["id"]), "kenyabidder-ledger.csv", "text/csv")).props("outline no-caps")
