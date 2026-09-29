@@ -111,3 +111,22 @@ async def test_losing_the_writer_lease_stops_writes_and_flips_readiness(tmp_path
     await asyncio.sleep(1.5)
     assert rt.db.scalar("SELECT count(*) FROM docs") == before  # nothing written after the lease was lost
     await rt.stop()
+
+
+def test_a_failed_backup_leaves_no_orphan_files(tmp_path, monkeypatch):
+    import shutil
+    clock = FakeClock()
+    db = open_database(f"duckdb://{tmp_path}/live.duckdb")
+    svc = BackupService(db, tmp_path / "bk", clock, keep=2)
+    real = shutil.copy2
+
+    def full_disk(src, dst, *a, **k):
+        open(dst, "w").write("half")
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(shutil, "copy2", full_disk)
+    with pytest.raises(OSError):
+        svc.run()
+    assert list((tmp_path / "bk").glob("*")) == [] and svc.last_error
+    monkeypatch.setattr(shutil, "copy2", real)
+    svc.run()
+    assert svc.last_error is None and len(svc.list()) == 1

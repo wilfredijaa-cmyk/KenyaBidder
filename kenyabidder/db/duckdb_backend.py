@@ -84,9 +84,13 @@ class DuckDatabase(Database):
         with self._lock:
             self._run("CHECKPOINT", ())
             tmp = f"{dest}.partial"
-            shutil.copy2(self.path, tmp)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, dest)
+            try:
+                shutil.copy2(self.path, tmp)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, dest)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)  # a full disk must not leave a full-size orphan behind
+                raise
 
     def close(self) -> None:
         with self._lock:

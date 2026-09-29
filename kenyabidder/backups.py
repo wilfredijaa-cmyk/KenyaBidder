@@ -41,6 +41,7 @@ class BackupService:
             os.replace(tmp, dest)
         except Exception as e:  # noqa: BLE001
             tmp.unlink(missing_ok=True)
+            tmp.with_name(tmp.name + ".partial").unlink(missing_ok=True)
             self.last_error = f"{type(e).__name__}: {e}"
             raise
         self.last_at, self.last_error = self.clock.now(), None
@@ -61,6 +62,8 @@ class BackupService:
         return out
 
     def _prune(self) -> None:
+        for orphan in self.dir.glob("*.partial*"):  # leftovers of an interrupted run
+            orphan.unlink(missing_ok=True)
         for old in self.list()[self.keep:]:
             (self.dir / old["name"]).unlink(missing_ok=True)
 
