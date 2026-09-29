@@ -35,7 +35,7 @@ from .strategy import BaselineStrategy, HeuristicStrategy, LlmStrategy, SellerAd
 
 
 def create_app(*, store=None, clock=None, guardrail_config=None, transport=None, whatsapp=None, match_ttl_ms=None,
-               llm_provider_factory=None, allow_stdio=None, report_grace_ms=None, wallet_path=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
+               llm_provider_factory=None, allow_stdio=None, report_grace_ms=None, database=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
     store = store or Store()
     clock = clock or SystemClock()
     events = Events()
@@ -51,7 +51,8 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
     sellers = SellerService(store, clock, engine, notify)
 
     llms = LlmRegistry(store, clock, llm_provider_factory)
-    wallet = WalletDB(wallet_path, clock)
+    from .db import Database, open_database
+    wallet = WalletDB(database if isinstance(database, Database) else open_database(database), clock)
     meter = TokenMeter(store, clock, wallet, llms, notify)
     kb = KnowledgeBaseService(store, clock)
     app = SimpleNamespace(store=store, clock=clock, events=events, engine=engine, intel=intel, audit=audit,

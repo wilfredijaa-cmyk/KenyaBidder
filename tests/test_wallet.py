@@ -1,10 +1,10 @@
 import asyncio
-import sqlite3
 
 import pytest
 
 from kenyabidder.errors import AppError
 from kenyabidder.llm.providers import Completion, LlmError, ScriptedProvider, ToolCall, ToolSpec
+from kenyabidder.db import IntegrityError, open_database
 from kenyabidder.wallet import AgentTokenCap, InsufficientTokens, WalletDB, estimate_tokens
 
 
@@ -35,8 +35,8 @@ def test_credit_debit_and_balance_invariants(env):
 def test_database_refuses_a_negative_balance_even_if_code_is_wrong(env):
     w = env.wallet
     w.credit("u", "l", 100, "GRANT")
-    with pytest.raises(sqlite3.IntegrityError):
-        w.conn.execute("UPDATE balances SET balance = -1 WHERE user_id='u'")
+    with pytest.raises(IntegrityError):
+        w.database.execute("UPDATE balances SET balance = -1 WHERE user_id='u'")
     with pytest.raises(AppError):
         w.adjust("u", "l", -101)
     assert w.adjust("u", "l", -100)["balance_after"] == 0
@@ -65,12 +65,12 @@ def test_ledger_queries_and_reports(env):
 
 
 def test_ledger_survives_reopen_and_matches_balances(tmp_path, env):
-    path = tmp_path / "wallet.db"
-    w = WalletDB(path, env.clock)
+    path = tmp_path / "wallet.duckdb"
+    w = WalletDB(open_database(f"duckdb://{path}"), env.clock)
     w.credit("u", "L", 5_000, "TOPUP", ref="o1")
     w.record_usage("u", "L", 1_200, agent_id="a", metered=True)
     w.close()
-    again = WalletDB(path, env.clock)  # simulates a crash/restart
+    again = WalletDB(open_database(f"duckdb://{path}"), env.clock)  # simulates a crash/restart
     assert again.balance("u", "L") == 3_800 and len(again.ledger(user_id="u")) == 2
     assert again.credit("u", "L", 5_000, "TOPUP", ref="o1")["duplicate"]  # idempotency survives restarts
     assert again.verify_integrity() == []
@@ -80,7 +80,7 @@ def test_ledger_survives_reopen_and_matches_balances(tmp_path, env):
 def test_integrity_check_detects_tampering(env):
     w = env.wallet
     w.credit("u", "L", 100, "TOPUP", ref="x")
-    w.conn.execute("UPDATE balances SET balance = 999 WHERE user_id='u'")
+    w.database.execute("UPDATE balances SET balance = 999 WHERE user_id='u'")
     assert w.verify_integrity()
 
 

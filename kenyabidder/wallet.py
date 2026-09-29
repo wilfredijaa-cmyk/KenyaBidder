@@ -1,7 +1,7 @@
 """Token wallet: what users buy, and what their agents' LLM calls consume.
 
-* **Durable**: balances, the append-only ledger and payment orders live in SQLite (WAL, ``synchronous=FULL``) — not in
-  the JSON snapshot — so a crash can never lose a purchase or resurrect spent tokens.
+* **Durable**: balances, the append-only ledger and payment orders live in the SQL database (DuckDB, PostgreSQL later),
+  each change in one transaction — so a crash can never lose a purchase or resurrect spent tokens.
 * **Invariants enforced by the database**: a balance can never go negative (``CHECK``), and a credit for the same
   ``(kind, ref)`` can never be applied twice (unique index) — a replayed webhook is a no-op.
 * **Per user, per LLM**: tokens are bought for a specific configured LLM and only spent on that LLM.
@@ -11,44 +11,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-import threading
 import uuid
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any
 
+from .db import Database, open_database
 from .errors import AppError, bad
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS balances(
-  user_id TEXT NOT NULL, llm_id TEXT NOT NULL,
-  balance INTEGER NOT NULL CHECK(balance >= 0),
-  PRIMARY KEY(user_id, llm_id));
-CREATE TABLE IF NOT EXISTS ledger(
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  entry_id TEXT NOT NULL UNIQUE,
-  user_id TEXT NOT NULL, llm_id TEXT NOT NULL, agent_id TEXT,
-  kind TEXT NOT NULL,                      -- GRANT | TOPUP | USAGE | ADJUST | REFUND
-  tokens INTEGER NOT NULL,                 -- signed effect on the balance
-  used INTEGER NOT NULL DEFAULT 0,         -- raw billable tokens consumed (USAGE rows; also for free LLMs)
-  balance_after INTEGER NOT NULL,
-  ref TEXT, at INTEGER NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
-CREATE UNIQUE INDEX IF NOT EXISTS ux_ledger_ref ON ledger(kind, ref) WHERE ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS ix_ledger_user ON ledger(user_id, seq DESC);
-CREATE INDEX IF NOT EXISTS ix_ledger_agent ON ledger(agent_id, at);
-CREATE TABLE IF NOT EXISTS orders(
-  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, pack_id TEXT, pack_name TEXT, llm_id TEXT NOT NULL,
-  tokens INTEGER NOT NULL, amount_kes INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL,
-  phone TEXT, external_ref TEXT, receipt TEXT, note TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL DEFAULT '{}');
-CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_receipt ON orders(receipt)
-  WHERE receipt IS NOT NULL AND status IN ('AWAITING_REVIEW','PAID');
-CREATE INDEX IF NOT EXISTS ix_orders_user ON orders(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS ix_orders_ext ON orders(external_ref);
-"""
-
-LEDGER_COLS = "seq, entry_id, user_id, llm_id, agent_id, kind, tokens, used, balance_after, ref, at, meta"
+LEDGER_COLS = "seq, entry_id, user_id, llm_id, agent_id, kind, tokens, used, balance_after, ref, ts, meta"
 
 
 class InsufficientTokens(AppError):
@@ -69,75 +37,43 @@ class AgentTokenCap(AppError):
         self.used, self.cap = used, cap
 
 
-def _entry(row: sqlite3.Row | tuple) -> dict:
-    keys = LEDGER_COLS.replace(" ", "").split(",")
-    d = dict(zip(keys, row))
+def _entry(row: dict) -> dict:
+    d = dict(row)
+    d["at"] = d.pop("ts")  # the column is `ts` (AT is an SQL keyword); the API keeps `at`
     d["meta"] = json.loads(d["meta"] or "{}")
     return d
 
 
-def _order(row: sqlite3.Row) -> dict:
-    d = dict(row)
-    d["data"] = json.loads(d.get("data") or "{}")
-    return d
-
-
 class WalletDB:
-    """SQLite-backed ledger + orders. All access happens on the event-loop thread; the lock is belt-and-braces."""
+    """Ledger + balances + orders on the portable :class:`~kenyabidder.db.Database` (DuckDB today, PostgreSQL later).
 
-    def __init__(self, path: str | Path = ":memory:", clock=None):
+    The database itself enforces the money invariants: ``CHECK (balance >= 0)`` and ``UNIQUE (kind, ref)``."""
+
+    def __init__(self, database: Database | None = None, clock=None):
+        self.database = database or open_database(":memory:")
         self.clock = clock
-        self.path = str(path)
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self.conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        if self.path != ":memory:":
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=FULL")
-            try:
-                Path(self.path).chmod(0o600)
-            except OSError:
-                pass
-        self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
-        with self._lock:
-            self.conn.close()
+        self.database.close()
 
     def now(self) -> int:
         return self.clock.now() if self.clock else 0
 
-    @contextmanager
     def tx(self):
-        """One atomic write transaction (``BEGIN IMMEDIATE`` so writers serialize)."""
-        with self._lock:
-            self.conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield self.conn
-            except BaseException:
-                self.conn.execute("ROLLBACK")
-                raise
-            else:
-                self.conn.execute("COMMIT")
+        """One atomic write transaction (yields a :class:`~kenyabidder.db.Tx`)."""
+        return self.database.tx()
 
     # ---------- balances ----------
 
     def balance(self, user_id: str, llm_id: str) -> int:
-        with self._lock:
-            r = self.conn.execute("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (user_id, llm_id)).fetchone()
-        return r[0] if r else 0
+        return self.database.scalar("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (user_id, llm_id), 0)
 
     def balances(self, user_id: str) -> dict[str, int]:
-        with self._lock:
-            rows = self.conn.execute("SELECT llm_id, balance FROM balances WHERE user_id=?", (user_id,)).fetchall()
-        return {r[0]: r[1] for r in rows}
+        return {r["llm_id"]: r["balance"] for r in self.database.query("SELECT llm_id, balance FROM balances WHERE user_id=?", (user_id,))}
 
     @staticmethod
     def _bal(c, user_id: str, llm_id: str) -> int:
-        r = c.execute("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (user_id, llm_id)).fetchone()
-        return r[0] if r else 0
+        return c.scalar("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (user_id, llm_id), 0)
 
     def _write(self, c, *, user_id, llm_id, kind, delta, used=0, agent_id=None, ref=None, meta=None) -> dict:
         bal = self._bal(c, user_id, llm_id) + delta
@@ -145,11 +81,11 @@ class WalletDB:
             raise bad("NEGATIVE_BALANCE", "operation would make the balance negative")
         if delta:
             c.execute("INSERT INTO balances(user_id, llm_id, balance) VALUES(?,?,?) "
-                      "ON CONFLICT(user_id, llm_id) DO UPDATE SET balance=excluded.balance", (user_id, llm_id, bal))
+                      "ON CONFLICT (user_id, llm_id) DO UPDATE SET balance = excluded.balance", (user_id, llm_id, bal))
         entry_id, at = str(uuid.uuid4()), self.now()
-        cur = c.execute("INSERT INTO ledger(entry_id,user_id,llm_id,agent_id,kind,tokens,used,balance_after,ref,at,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (entry_id, user_id, llm_id, agent_id, kind, delta, used, bal, ref, at, json.dumps(meta or {})))
-        return {"seq": cur.lastrowid, "entry_id": entry_id, "user_id": user_id, "llm_id": llm_id, "agent_id": agent_id, "kind": kind,
+        seq = c.query_one("INSERT INTO ledger(entry_id,user_id,llm_id,agent_id,kind,tokens,used,balance_after,ref,ts,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
+                          (entry_id, user_id, llm_id, agent_id, kind, delta, used, bal, ref, at, json.dumps(meta or {})))["seq"]
+        return {"seq": seq, "entry_id": entry_id, "user_id": user_id, "llm_id": llm_id, "agent_id": agent_id, "kind": kind,
                 "tokens": delta, "used": used, "balance_after": bal, "ref": ref, "at": at, "meta": meta or {}}
 
     def credit(self, user_id: str, llm_id: str, tokens: int, kind: str, *, ref: str | None = None,
@@ -165,7 +101,7 @@ class WalletDB:
 
         def run(conn):
             if ref is not None:
-                row = conn.execute(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind=? AND ref=?", (kind, ref)).fetchone()
+                row = conn.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind=? AND ref=?", (kind, ref))
                 if row:
                     return {**_entry(row), "duplicate": True}
             return self._write(conn, user_id=user_id, llm_id=llm_id, kind=kind, delta=tokens, ref=ref, meta=meta)
@@ -181,7 +117,7 @@ class WalletDB:
             raise bad("INVALID_TOKENS", "delta must be a non-zero integer")
         with self.tx() as c:
             if ref is not None:
-                row = c.execute(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind='ADJUST' AND ref=?", (ref,)).fetchone()
+                row = c.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind='ADJUST' AND ref=?", (ref,))
                 if row:
                     return {**_entry(row), "duplicate": True}
             return self._write(c, user_id=user_id, llm_id=llm_id, kind="ADJUST", delta=delta, ref=ref, meta=meta)
@@ -205,65 +141,55 @@ class WalletDB:
                 where.append(f"{col}=?")
                 args.append(v)
         sql = f"SELECT {LEDGER_COLS} FROM ledger" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY seq DESC LIMIT ?"
-        with self._lock:
-            return [_entry(r) for r in self.conn.execute(sql, (*args, max(1, min(limit, 100_000)))).fetchall()]
+        return [_entry(r) for r in self.database.query(sql, (*args, max(1, min(limit, 100_000))))]
 
     def used_since(self, agent_id: str, since_ms: int) -> int:
-        with self._lock:
-            r = self.conn.execute("SELECT COALESCE(SUM(used),0) FROM ledger WHERE agent_id=? AND kind='USAGE' AND at>=?", (agent_id, since_ms)).fetchone()
-        return r[0]
+        return int(self.database.scalar("SELECT COALESCE(SUM(used),0) FROM ledger WHERE agent_id=? AND kind='USAGE' AND ts>=?", (agent_id, since_ms), 0))
 
     def usage_by_agent(self, user_id: str, since_ms: int = 0) -> list[dict]:
-        with self._lock:
-            rows = self.conn.execute("SELECT agent_id, llm_id, COUNT(*) AS calls, SUM(used) AS used FROM ledger "
-                                     "WHERE user_id=? AND kind='USAGE' AND at>=? GROUP BY agent_id, llm_id ORDER BY used DESC", (user_id, since_ms)).fetchall()
-        return [dict(r) for r in rows]
+        rows = self.database.query("SELECT agent_id, llm_id, COUNT(*) AS calls, SUM(used) AS used FROM ledger "
+                                   "WHERE user_id=? AND kind='USAGE' AND ts>=? GROUP BY agent_id, llm_id ORDER BY used DESC", (user_id, since_ms))
+        return [{**r, "calls": int(r["calls"]), "used": int(r["used"])} for r in rows]
 
     def has_signup_grant(self, user_id: str) -> bool:
-        with self._lock:
-            return self.conn.execute("SELECT 1 FROM ledger WHERE user_id=? AND kind='GRANT' AND ref LIKE 'signup:%' LIMIT 1", (user_id,)).fetchone() is not None
+        return self.database.scalar("SELECT 1 FROM ledger WHERE user_id=? AND kind='GRANT' AND ref LIKE 'signup:%' LIMIT 1", (user_id,)) is not None
 
     def signup_grants_since(self, since_ms: int) -> int:
         """How many distinct signup grants were issued recently (the platform-wide free-trial budget)."""
-        with self._lock:
-            return self.conn.execute("SELECT COUNT(DISTINCT user_id) FROM ledger WHERE kind='GRANT' AND ref LIKE 'signup:%' AND at>=?", (since_ms,)).fetchone()[0]
+        return int(self.database.scalar("SELECT COUNT(DISTINCT user_id) FROM ledger WHERE kind='GRANT' AND ref LIKE 'signup:%' AND ts>=?", (since_ms,), 0))
 
     def recent_usage_avg(self, agent_id: str, n: int = 20) -> int | None:
-        with self._lock:
-            rows = self.conn.execute("SELECT used FROM ledger WHERE agent_id=? AND kind='USAGE' AND used>0 ORDER BY seq DESC LIMIT ?", (agent_id, n)).fetchall()
-        return round(sum(r[0] for r in rows) / len(rows)) if rows else None
+        rows = self.database.query("SELECT used FROM ledger WHERE agent_id=? AND kind='USAGE' AND used>0 ORDER BY seq DESC LIMIT ?", (agent_id, n))
+        return round(sum(r["used"] for r in rows) / len(rows)) if rows else None
 
     def token_totals(self, since_ms: int = 0) -> dict[str, dict[str, int]]:
         """Per LLM: tokens sold (TOPUP), granted, used and refunded — the inputs of the revenue/margin report."""
-        with self._lock:
-            rows = self.conn.execute("SELECT llm_id, kind, SUM(tokens) AS t, SUM(used) AS u FROM ledger WHERE at>=? GROUP BY llm_id, kind", (since_ms,)).fetchall()
+        rows = self.database.query("SELECT llm_id, kind, SUM(tokens) AS t, SUM(used) AS u FROM ledger WHERE ts>=? GROUP BY llm_id, kind", (since_ms,))
         out: dict[str, dict[str, int]] = {}
         for r in rows:
             d = out.setdefault(r["llm_id"], {"sold": 0, "granted": 0, "used": 0, "adjusted": 0, "refunded": 0})
+            t, u = int(r["t"]), int(r["u"])
             if r["kind"] == "TOPUP":
-                d["sold"] += r["t"]
+                d["sold"] += t
             elif r["kind"] == "GRANT":
-                d["granted"] += r["t"]
+                d["granted"] += t
             elif r["kind"] == "USAGE":
-                d["used"] += r["u"]
+                d["used"] += u
             elif r["kind"] == "ADJUST":
-                d["adjusted"] += r["t"]
+                d["adjusted"] += t
             elif r["kind"] == "REFUND":
-                d["refunded"] += r["t"]
+                d["refunded"] += t
         return out
 
     def outstanding_liability(self) -> dict[str, int]:
         """Tokens customers hold but have not used, per LLM (owed service)."""
-        with self._lock:
-            rows = self.conn.execute("SELECT llm_id, SUM(balance) FROM balances GROUP BY llm_id").fetchall()
-        return {r[0]: r[1] for r in rows}
+        return {r["llm_id"]: int(r["total"]) for r in self.database.query("SELECT llm_id, SUM(balance) AS total FROM balances GROUP BY llm_id")}
 
     def verify_integrity(self) -> list[str]:
         """Recompute every balance from the ledger and report mismatches (run on startup and from the admin console)."""
+        sums = {(r["user_id"], r["llm_id"]): int(r["total"]) for r in self.database.query("SELECT user_id, llm_id, SUM(tokens) AS total FROM ledger GROUP BY user_id, llm_id")}
+        bals = {(r["user_id"], r["llm_id"]): int(r["balance"]) for r in self.database.query("SELECT user_id, llm_id, balance FROM balances")}
         problems: list[str] = []
-        with self._lock:
-            sums = {(r[0], r[1]): r[2] for r in self.conn.execute("SELECT user_id, llm_id, SUM(tokens) FROM ledger GROUP BY user_id, llm_id")}
-            bals = {(r[0], r[1]): r[2] for r in self.conn.execute("SELECT user_id, llm_id, balance FROM balances")}
         for k in sums.keys() | bals.keys():
             if sums.get(k, 0) != bals.get(k, 0):
                 problems.append(f"{k[0][:8]}/{k[1][:8]}: ledger says {sums.get(k, 0)}, balance says {bals.get(k, 0)}")

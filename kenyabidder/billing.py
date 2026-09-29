@@ -9,9 +9,9 @@ import csv
 import hmac
 import io
 import re
-import sqlite3
 import uuid
 
+from .db import IntegrityError
 from .errors import AppError, bad, conflict, forbidden, not_found
 from .payments import MpesaClient, callback_receipt
 from .phone import mpesa_msisdn, normalize_phone
@@ -23,7 +23,7 @@ MIN_PRICE_KES, MAX_PRICE_KES = 10, 250_000  # M-Pesa transaction limits
 ORDER_COLS = "id,user_id,pack_id,pack_name,llm_id,tokens,amount_kes,provider,status,phone,external_ref,receipt,note,created_at,updated_at,data"
 
 
-def _row(r: sqlite3.Row) -> dict:
+def _row(r: dict) -> dict:
     import json
     d = dict(r)
     d["data"] = json.loads(d.get("data") or "{}")
@@ -47,6 +47,7 @@ class BillingService:
         self.store, self.clock, self.db, self.llms, self.meter = store, clock, db, llms, meter
         self.notify = notify or (lambda *a, **k: None)
         self.mpesa, self.dev_payments, self.on_credit = mpesa, dev_payments, on_credit
+        self.sql = db.database  # orders / claims are plain SQL on the same database as the ledger
 
     # ------------------------------------------------------------------ admin log
 
@@ -216,8 +217,7 @@ class BillingService:
     # ------------------------------------------------------------------ orders
 
     def get_order(self, order_id: str) -> dict | None:
-        with self.db._lock:
-            r = self.db.conn.execute(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,)).fetchone()
+        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))
         return _row(r) if r else None
 
     def owned_order(self, user_id: str, order_id: str) -> dict:
@@ -235,14 +235,13 @@ class BillingService:
         if status:
             where.append("status=?"); args.append(status)
         sql = f"SELECT {ORDER_COLS} FROM orders" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"
-        with self.db._lock:
-            return [_row(r) for r in self.db.conn.execute(sql, (*args, limit)).fetchall()]
+        return [_row(r) for r in self.sql.query(sql, (*args, limit))]
 
     def _insert_order(self, user: dict, pack: dict, provider: str, phone: str | None, status: str = "PENDING") -> dict:
         now = self.clock.now()
         oid = uuid.uuid4().hex
         with self.db.tx() as c:
-            open_n = c.execute("SELECT COUNT(*) FROM orders WHERE user_id=? AND status IN ('PENDING','AWAITING_REVIEW')", (user["id"],)).fetchone()[0]
+            open_n = c.scalar("SELECT COUNT(*) FROM orders WHERE user_id=? AND status IN ('PENDING','AWAITING_REVIEW')", (user["id"],), 0)
             if open_n >= self.MAX_OPEN_ORDERS_PER_USER:
                 raise AppError("TOO_MANY_ORDERS", f"you already have {open_n} unfinished orders — finish or cancel one first", 429)
             c.execute("INSERT INTO orders(id,user_id,pack_id,pack_name,llm_id,tokens,amount_kes,provider,status,phone,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -253,9 +252,20 @@ class BillingService:
         """Compare-and-swap on the order status; True if this call performed the transition."""
         sets = ", ".join(f"{k}=?" for k in fields)
         with self.db.tx() as c:
-            cur = c.execute(f"UPDATE orders SET status=?, updated_at=?{', ' + sets if sets else ''} WHERE id=? AND status IN ({','.join('?' * len(frm))})",
-                            (to, self.clock.now(), *fields.values(), order_id, *frm))
-            return cur.rowcount == 1
+            n = c.execute(f"UPDATE orders SET status=?, updated_at=?{', ' + sets if sets else ''} WHERE id=? AND status IN ({','.join('?' * len(frm))})",
+                          (to, self.clock.now(), *fields.values(), order_id, *frm))
+            if n == 1 and to in ("REJECTED", "FAILED", "CANCELLED", "EXPIRED", "REFUNDED"):
+                c.execute("DELETE FROM receipt_claims WHERE order_id=?", (order_id,))  # a dead order frees its M-Pesa code
+            return n == 1
+
+    @staticmethod
+    def _claim_receipt(c, receipt: str, order_id: str) -> None:
+        """'One M-Pesa code, one purchase': claimed while an order is awaiting review or paid. Raises IntegrityError if another order holds it."""
+        held = c.query_one("SELECT order_id FROM receipt_claims WHERE receipt=?", (receipt,))
+        if held and held["order_id"] != order_id:
+            raise IntegrityError(f"receipt {receipt} is already claimed by another order")
+        if not held:
+            c.execute("INSERT INTO receipt_claims(receipt, order_id) VALUES (?,?)", (receipt, order_id))
 
     async def checkout(self, user: dict, pack_id: str, method: str, phone: str | None = None) -> dict:
         pack = self.get_pack(pack_id)
@@ -273,8 +283,7 @@ class BillingService:
         if not msisdn:
             raise bad("INVALID_PHONE", "enter a Safaricom number such as 0712 345 678")
         since = self.clock.now() - 3600_000
-        with self.db._lock:
-            n = self.db.conn.execute("SELECT COUNT(*) FROM orders WHERE provider='mpesa' AND phone=? AND created_at>=?", ("+" + msisdn, since)).fetchone()[0]
+        n = self.sql.scalar("SELECT COUNT(*) FROM orders WHERE provider='mpesa' AND phone=? AND created_at>=?", ("+" + msisdn, since), 0)
         if n >= self.STK_PER_PHONE_PER_HOUR:  # nobody can use us to spam a phone with payment prompts
             raise AppError("PHONE_RATE_LIMIT", "too many payment prompts sent to that number in the last hour — try again later", 429)
         o = self._insert_order(user, pack, "mpesa", "+" + msisdn)
@@ -294,11 +303,13 @@ class BillingService:
         if not RECEIPT_RE.match(code):
             raise bad("INVALID_RECEIPT", "enter the M-Pesa confirmation code from your SMS (8–14 letters and digits, e.g. SGH7X2K9LP)")
         try:
-            ok = self._set_status(order_id, ("PENDING", "EXPIRED"), "AWAITING_REVIEW", receipt=code)
-        except sqlite3.IntegrityError:
+            with self.db.tx() as c:
+                self._claim_receipt(c, code, order_id)
+                ok = self._set_status(order_id, ("PENDING", "EXPIRED"), "AWAITING_REVIEW", receipt=code)
+                if not ok:
+                    raise bad("INVALID_STATE", "this order is not waiting for a payment code")
+        except IntegrityError:
             raise conflict("DUPLICATE_RECEIPT", "that payment code has already been submitted") from None
-        if not ok:
-            raise bad("INVALID_STATE", "this order is not waiting for a payment code")
         return self.get_order(order_id)
 
     def cancel_order(self, user: dict, order_id: str) -> dict:
@@ -326,7 +337,7 @@ class BillingService:
     def mark_paid(self, order_id: str, *, receipt: str | None, method: str) -> dict:
         """Atomically: PENDING/AWAITING_REVIEW → PAID **and** credit the tokens. Safe to call any number of times."""
         with self.db.tx() as c:
-            row = c.execute(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,)).fetchone()
+            row = c.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))
             if not row:
                 raise not_found("ORDER_NOT_FOUND", "order not found")
             o = _row(row)
@@ -335,12 +346,15 @@ class BillingService:
             recoverable = ("PENDING", "AWAITING_REVIEW") + (("EXPIRED", "CANCELLED") if o["provider"] == "mpesa" else ())  # a late STK approval still counts
             if o["status"] not in recoverable:
                 raise conflict("INVALID_STATE", f"order is {o['status']} and cannot be marked paid")
-            cur = c.execute("UPDATE orders SET status='PAID', updated_at=?, receipt=COALESCE(?, receipt), note=? WHERE id=? AND status=?",
-                            (self.clock.now(), receipt, f"paid via {method}", order_id, o["status"]))
-            if cur.rowcount != 1:
+            final_receipt = receipt or o["receipt"]
+            if final_receipt:
+                self._claim_receipt(c, final_receipt, order_id)  # IntegrityError if another order already holds this code
+            n = c.execute("UPDATE orders SET status='PAID', updated_at=?, receipt=?, note=? WHERE id=? AND status=?",
+                          (self.clock.now(), final_receipt, f"paid via {method}", order_id, o["status"]))
+            if n != 1:
                 raise conflict("RACE", "order changed concurrently")
             self.db.credit(o["user_id"], o["llm_id"], o["tokens"], "TOPUP", ref=f"order:{order_id}",
-                           meta={"order": o["reference"], "amount_kes": o["amount_kes"], "method": method, "receipt": receipt or o["receipt"]}, c=c)
+                           meta={"order": o["reference"], "amount_kes": o["amount_kes"], "method": method, "receipt": final_receipt}, c=c)
         paid = self.get_order(order_id)
         name = self.store.llms.get(paid["llm_id"], {}).get("name", "LLM")
         self._credited(paid["user_id"], paid["llm_id"], f"Payment received — {paid['tokens']:,} {name} tokens added to your wallet.")
@@ -356,8 +370,9 @@ class BillingService:
         reclaim = min(o["tokens"], self.db.balance(o["user_id"], o["llm_id"]))
         with self.db.tx() as c:
             if not c.execute("UPDATE orders SET status='REFUNDED', updated_at=?, note=? WHERE id=? AND status='PAID'",
-                             (self.clock.now(), f"refunded: {reason.strip()[:150]} (reclaimed {reclaim:,} unspent tokens)", order_id)).rowcount:
+                             (self.clock.now(), f"refunded: {reason.strip()[:150]} (reclaimed {reclaim:,} unspent tokens)", order_id)):
                 raise bad("INVALID_STATE", "order is no longer refundable")
+            c.execute("DELETE FROM receipt_claims WHERE order_id=?", (order_id,))
             if reclaim:
                 self.db._write(c, user_id=o["user_id"], llm_id=o["llm_id"], kind="ADJUST", delta=-reclaim, ref=f"refund:{order_id}",
                                meta={"reason": f"refund of {o['reference']}", "by": admin["name"]})
@@ -378,8 +393,7 @@ class BillingService:
             checkout_id = payload["Body"]["stkCallback"]["CheckoutRequestID"]
         except (KeyError, TypeError):
             return ack
-        with self.db._lock:
-            r = self.db.conn.execute(f"SELECT {ORDER_COLS} FROM orders WHERE external_ref=? AND provider='mpesa'", (checkout_id,)).fetchone()
+        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE external_ref=? AND provider='mpesa'", (checkout_id,))
         if r:
             try:
                 await self._confirm(_row(r), callback_receipt(payload))
@@ -394,7 +408,7 @@ class BillingService:
         if q["state"] == "PAID":
             try:
                 return self.mark_paid(o["id"], receipt=receipt_hint, method="mpesa")
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 # Safaricom says paid but the receipt code is already on another order: don't guess — a human decides
                 self._set_status(o["id"], ("PENDING", "EXPIRED", "CANCELLED"), "AWAITING_REVIEW", note="M-Pesa confirmed payment but the receipt code is already used")
                 return self.get_order(o["id"])
@@ -415,9 +429,8 @@ class BillingService:
         if not self.mpesa:
             return 0
         now = self.clock.now()
-        with self.db._lock:
-            rows = self.db.conn.execute(f"SELECT {ORDER_COLS} FROM orders WHERE provider='mpesa' AND external_ref IS NOT NULL AND status IN ('PENDING','EXPIRED') "
-                                        "AND created_at<? AND created_at>? ORDER BY created_at LIMIT ?", (now - 20_000, now - 3 * 3600_000, limit)).fetchall()
+        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE provider='mpesa' AND external_ref IS NOT NULL AND status IN ('PENDING','EXPIRED') "
+                              "AND created_at<? AND created_at>? ORDER BY created_at LIMIT ?", (now - 20_000, now - 3 * 3600_000, limit))
         settled = 0
         for r in rows:
             try:
@@ -435,16 +448,15 @@ class BillingService:
         with self.db.tx() as c:
             return c.execute("UPDATE orders SET status='EXPIRED', updated_at=? WHERE status='PENDING' AND "
                              "((provider!='manual' AND created_at<?) OR (provider='manual' AND created_at<?))",
-                             (now, now - self.ORDER_TTL_MS, now - self.MANUAL_ORDER_TTL_MS)).rowcount
+                             (now, now - self.ORDER_TTL_MS, now - self.MANUAL_ORDER_TTL_MS))
 
     # ------------------------------------------------------------------ reporting
 
     def revenue_report(self, since_ms: int = 0) -> dict:
-        with self.db._lock:
-            paid = self.db.conn.execute("SELECT llm_id, COUNT(*) n, SUM(amount_kes) kes, SUM(tokens) tok FROM orders WHERE status='PAID' AND updated_at>=? GROUP BY llm_id", (since_ms,)).fetchall()
-            pending = self.db.conn.execute("SELECT COUNT(*) FROM orders WHERE status='AWAITING_REVIEW'").fetchone()[0]
+        paid = self.sql.query("SELECT llm_id, COUNT(*) AS n, SUM(amount_kes) AS kes, SUM(tokens) AS tok FROM orders WHERE status='PAID' AND updated_at>=? GROUP BY llm_id", (since_ms,))
+        pending = self.sql.scalar("SELECT COUNT(*) FROM orders WHERE status='AWAITING_REVIEW'", (), 0)
         totals, liability = self.db.token_totals(since_ms), self.db.outstanding_liability()
-        by = {r["llm_id"]: dict(r) for r in paid}
+        by = {r["llm_id"]: {**r, "n": int(r["n"]), "kes": int(r["kes"] or 0)} for r in paid}
         rows, revenue, cost = [], 0, 0.0
         for llm_id in set(by) | set(totals) | set(liability):
             e = self.store.llms.get(llm_id, {"name": f"(deleted {llm_id[:6]})"})

@@ -16,11 +16,13 @@ log = logging.getLogger("kenyabidder.runtime")
 
 
 class Runtime:
-    def __init__(self, data_file: str | None = None, mcp_port: int | None = None, mcp_host: str = "127.0.0.1", tick_ms: int = 50):
+    def __init__(self, data_file: str | None = None, mcp_port: int | None = None, mcp_host: str = "127.0.0.1", tick_ms: int = 50, database_url: str | None = None):
         self.data_file = data_file
         self.store = Store.load(data_file) if data_file else Store()
-        wallet_path = str(Path(data_file).with_name("wallet.db")) if data_file else ":memory:"  # money lives in SQLite, not the JSON snapshot
-        self.app = create_app(store=self.store, clock=SystemClock(), wallet_path=wallet_path)
+        if database_url is None and data_file:
+            database_url = os.environ.get("KENYABIDDER_DATABASE_URL") or "duckdb://" + str(Path(data_file).with_name("kenyabidder.duckdb"))
+        self.database_url = database_url or os.environ.get("KENYABIDDER_DATABASE_URL") or ":memory:"
+        self.app = create_app(store=self.store, clock=SystemClock(), database=self.database_url)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
         self._last_payload: str | None = None
