@@ -33,6 +33,11 @@ def is_reverse(a: dict) -> bool:
     return a["auction_type"] in REVERSE
 
 
+def _verified(store, agent: dict | None) -> bool:
+    u = store.users.get((agent or {}).get("principal_user_id") or "")
+    return bool(u and u.get("verified_business"))
+
+
 def poster_of(a: dict) -> str | None:
     """The agent that created the listing: the seller of a forward auction, the buyer of a reverse one (RFQ)."""
     return a.get("poster_agent_id") or a.get("seller_agent_id")
@@ -61,7 +66,7 @@ class AuctionEngine:
 
     def create_listing(self, *, seller_agent_id, product_spec, auction_type, duration_ms, reserve_price=0,
                        start_price=None, min_increment=1, starts_at=None, dutch=None, anti_snipe=None,
-                       relist_of=None, relist_count=0, demo=False) -> dict:
+                       relist_of=None, relist_count=0, demo=False, verified_only=False) -> dict:
         now = self.clock.now()
         seller = self.store.agents.get(seller_agent_id)
         if not seller or seller["agent_type"] != "SELLER":
@@ -95,7 +100,7 @@ class AuctionEngine:
             "dutch": None, "anti_snipe": {"window_ms": 0, "extend_ms": 0}, "bids": [],
             "starts_at": starts_at, "ends_at": starts_at + duration_ms, "extended_until": None,
             "result": None, "relist_of": relist_of, "relist_count": relist_count, "created_at": now,
-            "closed_at": None, "demo": bool(demo),
+            "closed_at": None, "demo": bool(demo), "verified_only": bool(verified_only),
         }
         if auction_type == "ENGLISH":
             sp = reserve_price if start_price is None else start_price
@@ -125,7 +130,7 @@ class AuctionEngine:
         return self.view(a, seller_agent_id)
 
     def create_rfq(self, *, buyer_agent_id, product_spec, auction_type, duration_ms, max_price, min_decrement=1, starts_at=None,
-                   anti_snipe=None, demo=False) -> dict:
+                   anti_snipe=None, demo=False, verified_only=False) -> dict:
         """Post a request for quotes: suppliers (SELLER agents) bid the price DOWN from ``max_price``; the lowest valid bid wins."""
         now = self.clock.now()
         buyer = self.store.agents.get(buyer_agent_id)
@@ -155,6 +160,7 @@ class AuctionEngine:
             "dutch": None, "anti_snipe": {"window_ms": 0, "extend_ms": 0}, "bids": [],
             "starts_at": starts_at, "ends_at": starts_at + duration_ms, "extended_until": None,
             "result": None, "relist_of": None, "relist_count": 0, "created_at": now, "closed_at": None, "demo": bool(demo),
+            "verified_only": bool(verified_only),
         }
         if auction_type == "REVERSE_ENGLISH":
             if not is_pos_int(min_decrement):
@@ -277,6 +283,7 @@ class AuctionEngine:
             "dutch": copy.deepcopy(a["dutch"]), "anti_snipe": dict(a["anti_snipe"]),
             "starts_at": a["starts_at"], "ends_at": a["ends_at"], "extended_until": a["extended_until"],
             "bid_count": len(a["bids"]), "created_at": a["created_at"], "relist_of": a["relist_of"], "demo": a.get("demo", False),
+            "verified_only": a.get("verified_only", False), "poster_verified": _verified(self.store, self.store.agents.get(poster_of(a) or "")),
             "reserve_met": (a["current_price"] >= a["reserve_price"] and bool(a["bids"]))
             if a["auction_type"] == "ENGLISH" else None,
             "result": copy.deepcopy(a["result"]) if a["result"] and (is_seller or a["status"] == "SETTLED") else None,
@@ -415,6 +422,12 @@ class AuctionEngine:
             return fail("SELF_BID", "principal cannot bid on their own listing")
         if not is_pos_int(amount):
             return fail("INVALID_AMOUNT", "amount must be a positive integer")
+        if not _verified(self.store, agent):  # trust gates: verified-only listings, and high-value deals for verified businesses
+            if a.get("verified_only"):
+                return fail("VERIFIED_ONLY", "this listing accepts verified businesses only — apply for the badge in Profile")
+            limit = self.store.settings.get("verification_required_above") or 0
+            if limit and amount > limit:
+                return fail("VERIFICATION_REQUIRED", f"amounts above {limit:,} KES require a verified business — apply for the badge in Profile")
 
         now = self.clock.now()
         bid = {"bid_id": str(uuid.uuid4()), "agent_id": agent_id, "amount": amount, "at": now,

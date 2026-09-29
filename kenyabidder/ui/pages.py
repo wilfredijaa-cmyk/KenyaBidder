@@ -145,6 +145,10 @@ def auctions_page():
                                 ui.label(left(v["extended_until"] or v["ends_at"]))
                             if v["poster_agent_id"] == agent["agent_id"]:
                                 badge("yours", "primary")
+                            if v["poster_verified"]:
+                                badge("✓ verified business", "positive")
+                            if v["verified_only"]:
+                                badge("verified bidders only", "warning")
         grid()
         ui.timer(1.0, grid.refresh)
 
@@ -188,7 +192,7 @@ def status_badge(v: dict) -> None:
 def listing_form(agent: dict) -> None:
     allowed = [t for t in agent["constraints"]["authorized_auction_types"] if t in FORWARD_TYPES] or list(FORWARD_TYPES)
     f = {"title": "", "category": "", "qty": 1, "type": allowed[0], "reserve": 1000, "start": 1000, "inc": 100, "mins": 5,
-         "dstart": 5000, "dfloor": 1000, "ddec": 250, "dstep": 20}
+         "dstart": 5000, "dfloor": 1000, "ddec": 250, "dstep": 20, "vonly": False}
     with ui.expansion("New listing", icon="add_circle", value=not any(a["poster_agent_id"] == agent["agent_id"] for a in core().store.auctions.values())).classes("w-full border rounded"):
         with ui.column().classes("w-full gap-2 p-2"):
             with ui.row().classes("w-full"):
@@ -208,6 +212,8 @@ def listing_form(agent: dict) -> None:
                         fields.refresh()
                     rec.set_text(f"Agent recommends {pretty(r['auction_type'])} ({r['source']}): {r['reasoning']}")
                 ui.button("Ask my agent", icon="psychology", on_click=ask).props("outline")
+
+            ui.checkbox("Only verified businesses may bid", value=False, on_change=lambda e: f.update(vonly=e.value))
 
             @ui.refreshable
             def fields():
@@ -230,7 +236,7 @@ def listing_form(agent: dict) -> None:
             @guard
             def create():
                 kw = dict(seller_agent_id=agent["agent_id"], product_spec={"title": f["title"], "category": f["category"], "quantity": f["qty"]},
-                          auction_type=f["type"], reserve_price=int(f["reserve"] or 0), duration_ms=int(float(f["mins"] or 0) * 60_000))
+                          auction_type=f["type"], reserve_price=int(f["reserve"] or 0), duration_ms=int(float(f["mins"] or 0) * 60_000), verified_only=f["vonly"])
                 if f["type"] == "ENGLISH":
                     kw.update(start_price=int(f["start"] or 0), min_increment=int(f["inc"] or 1), anti_snipe={"window_ms": 10_000, "extend_ms": 15_000})
                 if f["type"] == "DUTCH":
@@ -242,7 +248,7 @@ def listing_form(agent: dict) -> None:
 
 def rfq_form(agent: dict) -> None:
     """A buyer posts what it needs and the most it will pay; supplier agents compete by quoting the price down."""
-    f = {"title": "", "category": "", "qty": 1, "type": "REVERSE_ENGLISH", "max": 50_000, "dec": 100, "mins": 30}
+    f = {"title": "", "category": "", "qty": 1, "type": "REVERSE_ENGLISH", "max": 50_000, "dec": 100, "mins": 30, "vonly": False}
     with ui.expansion("Request quotes (RFQ)", icon="request_quote").classes("w-full border rounded"):
         with ui.column().classes("w-full gap-2 p-2"):
             ui.label("Post what you need and the most you would pay in total. Suppliers' agents bid the price down — the lowest valid quote wins the introduction.").classes("text-sm opacity-70")
@@ -256,10 +262,12 @@ def rfq_form(agent: dict) -> None:
                 dec = ui.number("Min. undercut (KES)", value=f["dec"], min=1, precision=0, on_change=lambda e: f.update(dec=int(e.value or 1))).classes("w-44")
                 ui.number("Duration (minutes)", value=f["mins"], min=0.1, precision=1, on_change=lambda e: f.update(mins=e.value)).classes("w-44")
 
+            ui.checkbox("Only verified businesses may quote", value=False, on_change=lambda e: f.update(vonly=e.value))
+
             @guard
             def post():
                 kw = dict(buyer_agent_id=agent["agent_id"], product_spec={"title": f["title"], "category": f["category"], "quantity": f["qty"]},
-                          auction_type=f["type"], max_price=int(f["max"] or 0), duration_ms=int(float(f["mins"] or 0) * 60_000), min_decrement=int(f["dec"] or 1))
+                          auction_type=f["type"], max_price=int(f["max"] or 0), duration_ms=int(float(f["mins"] or 0) * 60_000), min_decrement=int(f["dec"] or 1), verified_only=f["vonly"])
                 if f["type"] == "REVERSE_ENGLISH":
                     kw["anti_snipe"] = {"window_ms": 10_000, "extend_ms": 15_000}
                 core().engine.create_rfq(**kw)
@@ -303,6 +311,12 @@ def auction_page(auction_id: str):
                     bits.append(f"next valid bid {kes(v['min_next_bid'])}")
                 if v["max_next_bid"] is not None:
                     bits.append(f"next quote must be at most {kes(v['max_next_bid'])}")
+                if v["poster_verified"] or v["verified_only"]:
+                    with ui.row().classes("gap-1"):
+                        if v["poster_verified"]:
+                            badge("✓ verified business", "positive")
+                        if v["verified_only"]:
+                            badge("verified bidders only", "warning")
                 if reverse:
                     ui.label(f"Request for quotes — the buyer will pay at most {kes(v['max_price'])}; the lowest quote wins.").classes("text-sm text-primary")
                 ui.label(" · ".join(bits)).classes("text-sm opacity-70")
@@ -449,9 +463,11 @@ def matches_page():
                     if cr:
                         for k, label in (("seller_contact", "Seller"), ("buyer_contact", "Buyer")):
                             c = cr[k]
-                            ui.label(f"{label}: {c['name']} · {c['phone'] or 'no phone'} · {c['email'] or 'no email'}")
-                    if m["status"] == "DISPUTED":
-                        ui.label("You and the other party reported different outcomes. KenyaBidder does not judge disputes, so neither reputation is affected.").classes("text-sm text-amber-700")
+                            ui.label(f"{label}: {c['name']}" + (f" ✓ verified business ({c['verified_business']})" if c.get("verified_business") else "")
+                                     + f" · {c['phone'] or 'no phone'} · {c['email'] or 'no email'}")
+                    if m["status"] == "DISPUTED" and not core().trust.dispute_for_match(m["match_id"]):
+                        ui.label("You and the other party reported different outcomes. Nobody's reputation is affected unless you open a dispute for our team to review.").classes("text-sm text-amber-700")
+                    dispute_section(m, agent, body.refresh)
                     mine_reported = any(r["agent_id"] == agent["agent_id"] for r in m["outcome_reports"])
                     if m["status"] == "CONTACT_REVEALED" and mine_reported:
                         ui.label("Thanks — waiting for the other party to report their side. Nothing is decided until they do (or 72 hours pass).").classes("text-sm opacity-70")
@@ -468,6 +484,57 @@ def matches_page():
                                 ui.button(pretty(o), on_click=report).props("outline no-caps")
         body()
         ui.timer(2.0, body.refresh)
+
+
+def dispute_section(m: dict, agent: dict, refresh) -> None:
+    """Open / answer / follow a dispute for one match."""
+    from ..trust import CATEGORIES, RULINGS
+    t = core().trust
+    d = t.dispute_for_match(m["match_id"])
+    if not d:
+        if m.get("contact_reveal") and m["status"] in ("CONTACT_REVEALED", "COMPLETED", "FELL_THROUGH", "DISPUTED"):
+            with ui.expansion("Something went wrong? Open a dispute", icon="gavel").classes("w-full border rounded"):
+                f = {"cat": "NOT_DELIVERED", "text": ""}
+                with ui.column().classes("w-full gap-2 p-2"):
+                    ui.select(CATEGORIES, value=f["cat"], label="What happened?", on_change=lambda e: f.update(cat=e.value)).classes("w-full")
+                    ui.textarea("Describe it (10-1000 characters). The other party will see this.", on_change=lambda e: f.update(text=e.value)).classes("w-full").props("rows=3")
+
+                    @guard
+                    def open_it(i=m["match_id"]):
+                        t.open_dispute(agent["agent_id"], i, f["cat"], f["text"])
+                        ui.notify("Dispute opened — the other party has been asked to respond", type="positive")
+                        refresh()
+                    ui.button("Open dispute", icon="gavel", on_click=open_it).props("unelevated color=negative no-caps")
+        return
+    mine_opened = d["opened_by"] == agent["agent_id"]
+    with ui.card().classes("w-full bg-amber-50 dark:bg-transparent border"):
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Dispute").classes("font-medium")
+            badge(d["status"].lower(), {"RULED": "positive", "WITHDRAWN": "grey"}.get(d["status"], "warning"))
+            ui.label(CATEGORIES[d["category"]]).classes("text-xs opacity-70")
+        for s in d["statements"]:
+            who = "You" if s["agent_id"] == agent["agent_id"] else "Other party"
+            ui.label(f"{who} ({fmt_time(s['at'])}): {s['text']}").classes("text-sm")
+        if d["ruling"]:
+            ui.label(f"Ruling: {RULINGS[d['ruling']['outcome']]} — {d['ruling']['note']}").classes("text-sm font-medium text-primary")
+        elif d["status"] in ("OPEN", "RESPONDED"):
+            if not mine_opened and d["status"] == "OPEN":
+                ui.label(f"Please answer by {fmt_time(d['respond_by'])}. An administrator will review both sides.").classes("text-sm text-amber-700")
+            mine_n = sum(1 for s in d["statements"] if s["agent_id"] == agent["agent_id"])
+            if mine_n < 3:
+                box = ui.input("Add your statement").classes("w-full")
+
+                @guard
+                def add(i=d["id"]):
+                    t.add_statement(agent["agent_id"], i, box.value)
+                    refresh()
+                ui.button("Send", on_click=add).props("outline no-caps dense")
+            if mine_opened:
+                @guard
+                def withdraw(i=d["id"]):
+                    t.withdraw(agent["agent_id"], i)
+                    refresh()
+                ui.button("Withdraw dispute", on_click=withdraw).props("flat no-caps dense color=negative")
 
 
 # ----------------------------------------------------------------------------- activity

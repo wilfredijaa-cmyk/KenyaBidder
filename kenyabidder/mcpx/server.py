@@ -112,18 +112,18 @@ def build_server(app, *, internal: bool = False, auth=None) -> FastMCP:
     @_guard
     def create_listing(seller_agent_id: str, product_spec: dict, auction_type: str, duration_ms: int,
                        reserve_price: int = 0, start_price: int | None = None, min_increment: int = 1,
-                       dutch: dict | None = None) -> dict:
+                       dutch: dict | None = None, verified_only: bool = False) -> dict:
         """Create an auction listing on behalf of a seller agent."""
         return engine.create_listing(seller_agent_id=seller_agent_id, product_spec=product_spec, auction_type=auction_type,
                                      duration_ms=duration_ms, reserve_price=reserve_price, start_price=start_price,
-                                     min_increment=min_increment, dutch=dutch)
+                                     min_increment=min_increment, dutch=dutch, verified_only=verified_only)
 
     @mcp.tool(tags={"internal", "auction"})
     @_guard
-    def create_rfq(buyer_agent_id: str, product_spec: dict, auction_type: str, duration_ms: int, max_price: int, min_decrement: int = 1) -> dict:
+    def create_rfq(buyer_agent_id: str, product_spec: dict, auction_type: str, duration_ms: int, max_price: int, min_decrement: int = 1, verified_only: bool = False) -> dict:
         """Post a request for quotes (reverse auction) on behalf of a buyer agent: suppliers bid the price down from max_price."""
         return engine.create_rfq(buyer_agent_id=buyer_agent_id, product_spec=product_spec, auction_type=auction_type,
-                                 duration_ms=duration_ms, max_price=max_price, min_decrement=min_decrement)
+                                 duration_ms=duration_ms, max_price=max_price, min_decrement=min_decrement, verified_only=verified_only)
 
     @mcp.tool(tags={"internal", "auction"})
     @_guard

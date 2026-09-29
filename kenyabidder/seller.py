@@ -34,7 +34,7 @@ class SellerService:
             return None
         factor = 1 - cfg.get("discount_pct", 10) / 100
         reserve = max(seller["constraints"].get("reserve_floor", 0), int(a["reserve_price"] * factor))
-        kw = dict(seller_agent_id=seller["agent_id"], product_spec=a["product_spec"], auction_type=a["auction_type"],
+        kw = dict(seller_agent_id=seller["agent_id"], product_spec=a["product_spec"], auction_type=a["auction_type"], verified_only=a.get("verified_only", False),
                   reserve_price=reserve, duration_ms=a["ends_at"] - a["starts_at"], relist_of=a["auction_id"],
                   relist_count=a["relist_count"] + 1, demo=a.get("demo", False))  # a relisted demo lot must stay a demo lot
         if a["auction_type"] == "ENGLISH":

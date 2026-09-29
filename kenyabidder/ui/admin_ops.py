@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from .common import badge, core, empty, fmt_datetime, guard_admin
+from .common import admin_user, badge, core, empty, fmt_datetime, guard_admin
 
 
 def messaging_panel() -> None:
@@ -41,3 +41,97 @@ def messaging_panel() -> None:
             ui.table(columns=[{"name": k, "label": l, "field": k, "align": "left"} for k, l in (("at", "Time (EAT)"), ("channel", "Channel"), ("to", "To"), ("kind", "Kind"), ("status", "Status"))],
                      rows=[{"id": i, "at": fmt_datetime(r["at"]), "channel": r["channel"], "to": r["to"], "kind": r["kind"], "status": "sent" if r["ok"] else f"failed: {r.get('error') or ''}"}
                            for i, r in enumerate(rows)], row_key="id").classes("w-full").props("dense flat")
+
+
+def _ask(title: str, label: str, on_ok, ok_label: str = "Confirm", options: dict | None = None, required: bool = True) -> None:
+    """Small modal: an optional choice plus a note."""
+    with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
+        ui.label(title).classes("font-medium")
+        pick = ui.select(options, value=next(iter(options)), label="Decision").classes("w-full") if options else None
+        note = ui.textarea(label).classes("w-full").props("rows=3")
+
+        @guard_admin
+        def go():
+            if required and not (note.value or "").strip():
+                ui.notify("A note is required", type="negative")
+                return
+            on_ok(pick.value if pick else None, note.value or "")
+            d.close()
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=d.close).props("flat no-caps")
+            ui.button(ok_label, on_click=go).props("unelevated color=primary no-caps")
+    d.open()
+
+
+def trust_panel() -> None:
+    from ..trust import CATEGORIES, KINDS, RULINGS
+    c = core()
+
+    @ui.refreshable
+    def body():
+        with ui.card().classes("w-full"):
+            ui.label("Verification policy").classes("font-medium")
+            thr = ui.number("Require a verified business for any bid or quote above (KES) — 0 = never", value=c.store.settings.get("verification_required_above", 0), min=0, precision=0).classes("w-full max-w-xl")
+
+            @guard_admin
+            def save():
+                c.store.settings["verification_required_above"] = int(thr.value or 0)
+                ui.notify("Saved", type="positive")
+            ui.button("Save", icon="save", on_click=save).props("unelevated color=primary")
+
+        ui.label(f"Applications waiting ({len(c.trust.pending_applications())})").classes("text-lg font-medium mt-2")
+        pend = c.trust.pending_applications()
+        if not pend:
+            empty("No applications waiting.")
+        for b in pend:
+            u = c.store.users.get(b["user_id"], {"name": "?"})
+            with ui.card().classes("w-full"):
+                ui.label(f"{b['business_name']} — applicant {u['name']}").classes("font-medium")
+                ui.label(f"{KINDS[b['kind']]}: {b['registration_no']} · submitted {fmt_datetime(b['submitted_at'])}").classes("text-sm")
+                if b["notes"]:
+                    ui.label(f"Applicant notes: {b['notes']}").classes("text-xs opacity-70")
+                ui.label("Check the number against iTax / the Business Registration Service before approving — the platform cannot do that for you.").classes("text-xs opacity-60")
+
+                def decide(kind, note, b=b):
+                    c.trust.review(admin_user(), b["id"], kind == "approve", note)
+                    c.billing.log_admin(admin_user(), "verification_" + kind, user=u["name"], business=b["business_name"])
+                    body.refresh()
+                with ui.row():
+                    ui.button("Approve", icon="verified", on_click=lambda b=b: _ask("Approve verification", "Note (optional)", lambda k, n, b=b: decide("approve", n, b), "Approve", required=False)).props("unelevated dense no-caps color=primary")
+                    ui.button("Reject", icon="close", on_click=lambda b=b: _ask("Reject verification", "Reason (the applicant sees it)", lambda k, n, b=b: decide("reject", n, b), "Reject")).props("outline dense no-caps color=negative")
+
+        ui.label("Verified businesses").classes("text-lg font-medium mt-2")
+        vs = [u for u in c.store.users.values() if u.get("verified_business")]
+        if not vs:
+            empty("None yet.")
+        for u in vs:
+            with ui.row().classes("w-full items-center gap-2"):
+                badge("✓ verified", "positive")
+                ui.label(f"{u['name']} — {u['verified_business']['name']} ({KINDS[u['verified_business']['kind']]})").classes("grow")
+
+                def revoke(k, note, u=u):
+                    c.trust.revoke(admin_user(), u["id"], note)
+                    c.billing.log_admin(admin_user(), "verification_revoke", user=u["name"], reason=note)
+                    body.refresh()
+                ui.button("Revoke", on_click=lambda u=u: _ask("Revoke badge", "Reason", lambda k, n, u=u: revoke(k, n, u), "Revoke")).props("outline dense no-caps color=negative")
+
+        ui.label(f"Open disputes ({len(c.trust.open_disputes())})").classes("text-lg font-medium mt-2")
+        ds = c.trust.open_disputes()
+        if not ds:
+            empty("No open disputes.")
+        for d in ds:
+            m = c.store.matches.get(d["match_id"], {})
+            name = lambda aid: c.store.users.get((c.store.agents.get(aid) or {}).get("principal_user_id"), {}).get("name", "?")  # noqa: E731
+            with ui.card().classes("w-full"):
+                ui.label(f"{m.get('agreed_terms', {}).get('title', '?')} — {CATEGORIES[d['category']]}").classes("font-medium")
+                ui.label(f"Opened by {name(d['opened_by'])} against {name(d['against'])} · {fmt_datetime(d['opened_at'])} · {d['status'].lower()}").classes("text-xs opacity-70")
+                for s in d["statements"]:
+                    ui.label(f"{name(s['agent_id'])}: {s['text']}").classes("text-sm")
+
+                def rule(outcome, note, d=d):
+                    c.trust.rule(admin_user(), d["id"], outcome, note)
+                    c.billing.log_admin(admin_user(), "dispute_ruling", dispute=d["id"][:8], outcome=outcome)
+                    body.refresh()
+                ui.button("Rule on this dispute", icon="gavel", on_click=lambda d=d: _ask("Rule on dispute", "Explanation (both parties see it)", lambda k, n, d=d: rule(k, n, d), "Issue ruling", options=RULINGS)).props("unelevated dense no-caps color=primary")
+    body()
+

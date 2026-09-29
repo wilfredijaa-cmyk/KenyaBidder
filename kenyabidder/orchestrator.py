@@ -108,6 +108,8 @@ class Orchestrator:
         poster = self.store.agents.get(poster_of(a))
         if poster and poster["principal_user_id"] == agent["principal_user_id"]:
             return "own listing"
+        if a.get("verified_only") and not (self.store.users.get(agent["principal_user_id"]) or {}).get("verified_business"):
+            return "this listing accepts verified businesses only"
         if w:
             s = a["product_spec"]
             if w.get("category") and w["category"].lower() != s["category"].lower():

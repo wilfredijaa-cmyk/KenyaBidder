@@ -218,6 +218,46 @@ def buy_dialog(user: dict, pack: dict, methods: list[dict], done) -> None:
 
 # ----------------------------------------------------------------------------- profile
 
+def business_card(user: dict) -> None:
+    """Apply for the verified-business badge; an administrator checks the registration out-of-band (iTax / BRS / eCitizen)."""
+    from ..trust import KINDS
+    c = core()
+
+    @ui.refreshable
+    def card():
+        u = c.store.users[user["id"]]
+        app = c.trust.application_for(user["id"])
+        with ui.card().classes("w-full max-w-xl"):
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Verified business").classes("font-medium")
+                if u.get("verified_business"):
+                    badge("✓ verified", "positive")
+            ui.label("A verified badge shows counterparties you are a real, registered business. Some listings accept verified businesses only, "
+                     "and larger deals may require it.").classes("text-xs opacity-70")
+            if u.get("verified_business"):
+                vb = u["verified_business"]
+                ui.label(f"{vb['name']} · {KINDS[vb['kind']]} · since {fmt_datetime(vb['since'])}")
+                return
+            if app and app["status"] == "PENDING":
+                ui.label(f"Application for \"{app['business_name']}\" is under review (submitted {fmt_datetime(app['submitted_at'])}).").classes("text-sm text-amber-700")
+                return
+            if app and app["status"] in ("REJECTED", "REVOKED"):
+                ui.label(f"Your last application was {app['status'].lower()}: {app['review_note']}").classes("text-sm text-negative")
+            f = {"name": u["name"], "kind": "KRA_PIN", "reg": "", "notes": ""}
+            ui.input("Business or legal name", value=f["name"], on_change=lambda e: f.update(name=e.value)).classes("w-full")
+            ui.select(KINDS, value=f["kind"], label="Registration type", on_change=lambda e: f.update(kind=e.value)).classes("w-full")
+            ui.input("Registration number", placeholder="A123456789Z", on_change=lambda e: f.update(reg=e.value)).classes("w-full")
+            ui.textarea("Anything that helps us check it (optional)", on_change=lambda e: f.update(notes=e.value)).classes("w-full").props("rows=2")
+
+            @guard
+            def submit():
+                c.trust.apply(user["id"], f["name"], f["kind"], f["reg"], f["notes"])
+                ui.notify("Application submitted — an administrator will review it", type="positive")
+                card.refresh()
+            ui.button("Apply for the badge", icon="verified", on_click=submit).props("unelevated color=primary")
+    card()
+
+
 def profile_page():
     user = require_user()
     if not user:
@@ -274,6 +314,7 @@ def profile_page():
                         ui.button("Send code", on_click=send).props("outline dense no-caps")
                         ui.button("Confirm", on_click=confirm_it).props("unelevated dense no-caps color=primary")
         verify_card()
+        business_card(user)
         with ui.card().classes("w-full max-w-xl"):
             ui.label("Change password").classes("font-medium")
             old = ui.input("Current password", password=True, password_toggle_button=True).classes("w-full")

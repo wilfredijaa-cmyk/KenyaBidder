@@ -16,6 +16,7 @@ class MatchService:
         self.notify = notify or (lambda *a, **k: None)
         self.match_ttl_ms = match_ttl_ms
         self.report_grace_ms = report_grace_ms  # how long the other side has to answer a first report
+        self.dispute_blocks_finalize = None  # fn(match) -> bool: an open dispute keeps automatic outcome logic from deciding the match
         self.confirm_gate = None  # composition root: fn(user) -> raises if the user may not exchange contact details yet
         # create_match is triggered by the deterministic layer when an auction closes with a winner.
         engine.events.on("auction.settled", self._on_settled)
@@ -97,11 +98,12 @@ class MatchService:
 
         def contact(agent_id):
             u = self.store.users[self.store.agents[agent_id]["principal_user_id"]]
-            return {"name": u["name"], "phone": u["phone"], "email": u["email"]}
+            return {"name": u["name"], "phone": u["phone"], "email": u["email"],
+                    "verified_business": (u.get("verified_business") or {}).get("name")}
 
         m["contact_reveal"] = {"seller_contact": contact(m["seller_agent_id"]), "buyer_contact": contact(m["buyer_agent_id"])}
         m["status"] = "CONTACT_REVEALED"
-        m["updated_at"] = self.clock.now()
+        m["updated_at"] = m["revealed_at"] = self.clock.now()
         self.store.reveal_log.append({"match_id": match_id, "at": m["updated_at"],
                                       "seller_agent_id": m["seller_agent_id"], "buyer_agent_id": m["buyer_agent_id"]})
         for aid in (m["seller_agent_id"], m["buyer_agent_id"]):
@@ -134,6 +136,8 @@ class MatchService:
 
         A single unilateral report never damages anyone's reputation. Contradictory reports are DISPUTED: the platform does not
         adjudicate (spec §2), so neither side is penalised or credited. Where both blame each other, both are at fault."""
+        if self.dispute_blocks_finalize and self.dispute_blocks_finalize(m):
+            return False  # an administrator will rule; nothing is decided automatically meanwhile
         reports = m["outcome_reports"]
         if len(reports) < 2 and not force:
             return False
