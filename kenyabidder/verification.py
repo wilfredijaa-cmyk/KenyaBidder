@@ -16,6 +16,7 @@ import secrets
 import uuid
 
 from .errors import AppError, bad, not_found
+from .i18n import template
 from .messaging import mask
 
 TTL_MS = 10 * 60_000
@@ -111,7 +112,7 @@ class VerificationService:
             raise bad("NO_PHONE", "add a phone number to your profile first")
         if u.get("phone_verified"):
             raise bad("ALREADY_VERIFIED", "this phone number is already verified")
-        return await self._issue(u, "PHONE", "SMS", u["phone"], lambda c: f"KenyaBidder code: {c}. Valid 10 minutes. Never share it.")
+        return await self._issue(u, "PHONE", "SMS", u["phone"], lambda c: template("phone_code", u.get("lang"), code=c))
 
     def confirm_phone(self, user_id: str, code: str) -> dict:
         u = self._user(user_id)
@@ -129,7 +130,7 @@ class VerificationService:
             raise bad("NO_EMAIL", "add an email address to your profile first")
         if u.get("email_verified"):
             raise bad("ALREADY_VERIFIED", "this email address is already verified")
-        return await self._issue(u, "EMAIL", "EMAIL", u["email"], lambda c: f"Your KenyaBidder verification code is {c}. It is valid for 10 minutes. If you did not ask for it, ignore this message.")
+        return await self._issue(u, "EMAIL", "EMAIL", u["email"], lambda c: template("email_code", u.get("lang"), code=c))
 
     def confirm_email(self, user_id: str, code: str) -> dict:
         u = self._user(user_id)
@@ -160,9 +161,9 @@ class VerificationService:
         if u and not u.get("suspended"):
             try:
                 if u.get("phone") and u.get("phone_verified"):
-                    await self._issue(u, "RESET", "SMS", u["phone"], lambda c: f"KenyaBidder password reset code: {c}. Valid 10 minutes. If you did not ask, ignore this.")
+                    await self._issue(u, "RESET", "SMS", u["phone"], lambda c: template("reset_sms", u.get("lang"), code=c))
                 elif u.get("email") and u.get("email_verified"):
-                    await self._issue(u, "RESET", "EMAIL", u["email"], lambda c: f"Your KenyaBidder password reset code is {c}. It is valid for 10 minutes. If you did not ask for it, ignore this message.")
+                    await self._issue(u, "RESET", "EMAIL", u["email"], lambda c: template("reset_email", u.get("lang"), code=c))
             except AppError:
                 pass  # rate limit / delivery problems must look identical to success from the outside
         return {"message": GENERIC_RESET}

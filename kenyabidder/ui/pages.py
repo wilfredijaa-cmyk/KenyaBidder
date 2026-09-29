@@ -7,7 +7,7 @@ from nicegui import ui
 
 from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .common import (active_agent, agent_picker, badge, core, current_user, empty, fmt_time, frame, guard, kes, left,
-                     login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
+                     lang_toggle, login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
 
 
 def register() -> None:
@@ -29,6 +29,8 @@ def login_page():
         return
     first = not core().store.users
     with ui.column().classes("absolute-center items-stretch w-96 max-w-full gap-3 p-2"):
+        with ui.row().classes("w-full justify-end"):
+            lang_toggle()
         with ui.row().classes("items-center justify-center gap-0"):
             ui.label("Kenya").classes("text-3xl font-semibold")
             ui.label("Bidder").classes("text-3xl font-semibold text-primary")

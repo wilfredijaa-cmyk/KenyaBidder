@@ -8,7 +8,9 @@ from datetime import datetime, timedelta, timezone
 from nicegui import app as ng_app
 from nicegui import context, ui
 
+from .. import i18n
 from ..errors import AppError
+from ..i18n import LANGS
 from ..timeutil import EAT
 
 _rt = None
@@ -27,8 +29,25 @@ def core():
     return _rt.app
 
 
+def lang() -> str:
+    return ng_app.storage.user.get("lang", "en")
+
+
+def set_lang(code: str) -> None:
+    ng_app.storage.user["lang"] = code if code in LANGS else "en"
+    u = core().store.users.get(ng_app.storage.user.get("uid") or "")
+    if u:
+        u["lang"] = ng_app.storage.user["lang"]  # remembered for SMS/email too
+    ui.navigate.reload()
+
+
+def lang_toggle() -> None:
+    ui.toggle({"en": "EN", "sw": "SW"}, value=lang(), on_change=lambda e: set_lang(e.value)).props("dense no-caps unelevated").tooltip("Language / Lugha")
+
+
 def theme() -> None:
     """Brand colours + follow the OS light/dark preference. Called by every page (login included)."""
+    i18n.install(ui, lang)
     ui.colors(primary="#0b7a4b", positive="#067647", negative="#b42318", warning="#b54708")
     ui.dark_mode(None)
 
@@ -215,6 +234,7 @@ def frame(user: dict, active: str):
             with ui.menu():
                 for path, label, _ in NAV + ([("/admin", "Admin", "")] if user["role"] == "admin" else []):
                     ui.menu_item(label, on_click=lambda p=path: ui.navigate.to(p))
+        lang_toggle()
         label, color, tip = token_chip_state(user)
         if label:
             ui.button(label, icon="bolt", on_click=lambda: ui.navigate.to("/wallet")).props(f"flat dense no-caps color={color}").tooltip(tip)
