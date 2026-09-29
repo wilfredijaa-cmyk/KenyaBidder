@@ -150,3 +150,34 @@ def test_records_written_before_reverse_auctions_are_upgraded_on_load(db):
     StatePersistence(db).flush_all(s)
     a = StatePersistence(db).load().auctions["old"]
     assert a["poster_agent_id"] == "s1" and a["direction"] == "FORWARD" and a["verified_only"] is False
+
+
+def test_finished_records_are_frozen_and_slow_collections_are_throttled_but_shutdown_flushes_everything(db):
+    from kenyabidder.clock import FakeClock
+    clock = FakeClock()
+    s = Store()
+    s.triggers["t1"] = {"id": "t1", "status": "DONE"}
+    s.triggers["t2"] = {"id": "t2", "status": "ACTIVE"}
+    s.approvals["ap"] = {"id": "ap", "status": "APPROVED"}
+    s.matches["old"] = {"match_id": "old", "status": "COMPLETED", "updated_at": clock.now() - 41 * 24 * 3600_000}
+    s.matches["fresh"] = {"match_id": "fresh", "status": "COMPLETED", "updated_at": clock.now()}
+    s.kbs["kb"] = {"id": "kb", "docs": ["x"]}
+    p = StatePersistence(db, clock)
+    p.flush_all(s)
+    assert p._frozen["triggers"] == {"t1"} and p._frozen["approvals"] == {"ap"} and p._frozen["matches"] == {"old"}
+    s.kbs["kb"]["docs"].append("y")
+    assert p.collect(s, "kbs")["upserts"] == []  # looked at within the last 30s: skipped
+    clock.advance(31_000)
+    assert [e for e, _ in p.collect(s, "kbs")["upserts"]] == ["kb"]
+    s.kbs["kb"]["docs"].append("z")
+    p.flush_all(s)  # a shutdown flush ignores the throttle: nothing edited in the last seconds is ever lost
+    assert StatePersistence(db).load().kbs["kb"]["docs"] == ["x", "y", "z"]
+
+
+def test_considered_keys_of_closed_auctions_are_pruned():
+    s = Store()
+    s.auctions["open"] = {"status": "ACTIVE", "bids": []}
+    s.auctions["done"] = {"status": "SETTLED", "bids": []}
+    s.considered.update({"a1:open", "a1:done", "a2:gone"})
+    s.prune(0)
+    assert s.considered == {"a1:open"}

@@ -132,8 +132,9 @@ def test_seller_auto_relist_respects_floor_and_max(env):
 
 async def test_omnichannel_one_agent_many_channels(env):
     _, b = env.bidder(ceiling=50_000)
-    env.agents.link_channel(b["agent_id"], "WHATSAPP", "+254711111111")
-    _, other = env.bidder()
+    env.link_whatsapp(b, "+254711111111")
+    ou, other = env.bidder()
+    env.store.users[ou["id"]].update(phone="+254711111111", phone_verified=True)  # (forced: two accounts cannot normally share a number)
     with pytest.raises(AppError) as e:
         env.agents.link_channel(other["agent_id"], "WHATSAPP", "+254711111111")
     assert e.value.code == "CHANNEL_TAKEN"
@@ -152,7 +153,7 @@ async def test_approve_escalated_bid_from_whatsapp(env):
     _, s = env.seller()
     _, b = env.bidder(ceiling=10_000, constraints={"escalation_threshold_pct": 50}, memory={"watch": WATCH, "preferred_channel": "WHATSAPP"},
                       config={"algorithms": algos("baseline")})
-    env.agents.link_channel(b["agent_id"], "WHATSAPP", "+254722222222")
+    env.link_whatsapp(b, "+254722222222")
     a = env.english(s["agent_id"], start_price=6000, reserve_price=6000)
     await env.orchestrator.idle()
     msg = next(m for m in env.store.outbox if "Approval needed" in m["text"])
@@ -245,7 +246,7 @@ async def test_whatsapp_webhook_requires_valid_signature(env):
     import hashlib, hmac, json
     from kenyabidder.channels import handle_whatsapp_webhook
     _, b = env.bidder(ceiling=1000)
-    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254711000111")
+    env.link_whatsapp(b, "254711000111")
     body = json.dumps({"entry": [{"changes": [{"value": {"messages": [{"from": "254711000111", "text": {"body": "ceiling 4000"}}]}}]}]}).encode()
     sig = "sha256=" + hmac.new(b"appsecret", body, hashlib.sha256).hexdigest()
 
@@ -308,7 +309,7 @@ def test_mutual_blame_faults_both_and_lone_completed_report_stands_after_grace(e
 async def test_suspended_users_cannot_resume_via_whatsapp_or_service(env):
     admin = env.agents.create_user(name="Root Admin", password="password123")
     u, b = env.bidder(name="Banned One")
-    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254799000111")
+    env.link_whatsapp(b, "254799000111")
     env.agents.set_suspended(u["id"], True, by=admin["id"])
     r = await env.router.handle_inbound("WHATSAPP", "254799000111", "resume")
     assert "suspended" in r["reply"] and b["status"] == "SUSPENDED"
@@ -325,7 +326,7 @@ async def test_whatsapp_batched_deliveries_run_every_message_and_odd_headers_are
     import hashlib, hmac, json
     from kenyabidder.channels import handle_whatsapp_webhook
     _, b = env.bidder(ceiling=1000)
-    env.agents.link_channel(b["agent_id"], "WHATSAPP", "254711000222")
+    env.link_whatsapp(b, "254711000222")
     msgs = lambda *texts: [{"from": "254711000222", "text": {"body": t}} for t in texts]
     body = json.dumps({"entry": [{"changes": [{"value": {"messages": msgs("status", "ceiling 4000")}}]}, {"changes": [{"value": {"messages": msgs("pause")}}]}]}).encode()
     out = await handle_whatsapp_webhook(env.router, body, None, secret="", allow_unsigned=True)
@@ -397,3 +398,28 @@ async def test_valuation_scales_per_unit_history_to_the_size_of_the_lot(env):
     lot = env.english(s["agent_id"], product_spec={"category": "electronics", "title": "Bulk phones", "quantity": 100}, start_price=1000, reserve_price=1000)
     r = await env.orchestrator.consider(b["agent_id"], lot["auction_id"], manual=True)
     assert r["trigger"]["params"]["max_bid"] == 105_000                            # 1,000/unit x 100 units x 1.05, not 1,050
+
+
+def test_only_the_verified_own_number_can_be_linked_to_whatsapp(env):
+    ua, a = env.bidder(phone="+254711000777")
+    with pytest.raises(AppError) as e:  # not verified yet
+        env.agents.link_channel(a["agent_id"], "WHATSAPP", "+254711000777")
+    assert e.value.code == "NUMBER_NOT_VERIFIED"
+    env.store.users[ua["id"]]["phone_verified"] = True
+    with pytest.raises(AppError):  # someone else's number
+        env.agents.link_channel(a["agent_id"], "WHATSAPP", "+254799999999")
+    linked = env.agents.link_channel(a["agent_id"], "WHATSAPP", "0711 000 777")
+    assert linked["channel_identity_map"] == [{"channel": "WHATSAPP", "external_id": "254711000777"}]  # stored the way WhatsApp delivers it
+    assert env.agents.find_by_channel("WHATSAPP", "+254711000777")["agent_id"] == a["agent_id"]
+
+
+async def test_concurrent_wrong_passwords_are_all_counted_before_the_lockout_check(env):
+    import asyncio
+    u = env.agents.create_user(name="Target", password="password123")
+    res = await asyncio.gather(*[env.agents.authenticate_async("Target", f"guess-{i}") for i in range(30)], return_exceptions=True)
+    assert sum(isinstance(r, AppError) and r.code == "TOO_MANY_ATTEMPTS" for r in res) >= 20  # only the first few got a guess
+    with pytest.raises(AppError):
+        await env.agents.authenticate_async("Target", "password123")  # locked, even with the right password
+    env.clock.advance(6 * 60_000)
+    assert (await env.agents.authenticate_async("Target", "password123"))["id"] == u["id"]
+    assert not env.store.settings["login_failures"].get("target")  # success clears the counter

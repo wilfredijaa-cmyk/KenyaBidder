@@ -27,6 +27,13 @@ class Env:
         a = self.app.agents.create_agent(user_id=u["id"], type="BIDDER", constraints={"budget_ceiling": ceiling, **(constraints or {})}, memory=memory, config=config)
         return u, a
 
+    def link_whatsapp(self, agent, number):
+        """Link a WhatsApp number the way production allows it: it must be the account's own VERIFIED phone."""
+        from kenyabidder.phone import normalize_phone
+        u = self.store.users[agent["principal_user_id"]]
+        u.update(phone=normalize_phone(number), phone_verified=True)
+        return self.app.agents.link_channel(agent["agent_id"], "WHATSAPP", number)
+
     def english(self, seller_agent_id, **over):
         base = dict(seller_agent_id=seller_agent_id, product_spec={"category": "electronics", "title": "Samsung A15 phones", "quantity": 10},
                     auction_type="ENGLISH", reserve_price=1000, start_price=1000, min_increment=100, duration_ms=60_000)

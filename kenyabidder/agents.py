@@ -137,24 +137,31 @@ class AgentService:
             raise AppError("TOO_MANY_ATTEMPTS", "too many failed sign-in attempts — try again in a few minutes", 429)
         return fails
 
+    def _record_attempt(self, key: str, now: int) -> list[int]:
+        """Check the lockout, then count this attempt as a failure immediately (undone by a successful login)."""
+        fails = [*self._lockout_check(key, now), now]
+        self.store.settings["login_failures"][key] = fails
+        return fails
+
     def _find(self, name: str) -> dict | None:
         return next((u for u in self.store.users.values() if u["name"].lower() == (name or "").strip().lower()), None)
 
     def _login_result(self, key: str, fails: list[int], now: int, u: dict | None, ok: bool) -> dict | None:
+        """``fails`` already includes this attempt: it was recorded BEFORE the (awaited) password check, so a burst of concurrent
+        guesses cannot all slip past the lockout counter. A success clears it."""
         if u and ok and u.get("suspended"):  # only revealed to someone who knows the password
+            self.store.settings["login_failures"][key] = [t for t in fails if t != now][-self.MAX_FAILURES:]
             raise AppError("ACCOUNT_SUSPENDED", "this account has been suspended — contact support", 403)
-        book = self.store.settings["login_failures"]
         if u and ok:
-            book.pop(key, None)
+            self.store.settings["login_failures"].pop(key, None)
             return u
-        book[key] = [*fails, now]
         return None
 
     def authenticate(self, name: str, password: str) -> dict | None:
         """Verify credentials (blocking; fine for scripts/tests). After 5 failures for a name (existing or not) further
         attempts are refused for 5 minutes. Unknown names cost the same scrypt time, so timing reveals nothing."""
         key, now = (name or "").strip().lower(), self.clock.now()
-        fails = self._lockout_check(key, now)
+        fails = self._record_attempt(key, now)
         u = self._find(name)
         return self._login_result(key, fails, now, u, verify_password(password or "", u["password_hash"] if u else self._DUMMY_HASH))
 
@@ -162,7 +169,7 @@ class AgentService:
         """Same as authenticate, but the ~50ms scrypt runs on a worker thread so a flood of logins can never stall bidding."""
         import asyncio
         key, now = (name or "").strip().lower(), self.clock.now()
-        fails = self._lockout_check(key, now)
+        fails = self._record_attempt(key, now)  # counted before the await
         u = self._find(name)
         ok = await asyncio.to_thread(verify_password, password or "", u["password_hash"] if u else self._DUMMY_HASH)
         return self._login_result(key, fails, now, u, ok)
@@ -216,7 +223,7 @@ class AgentService:
             raise not_found("USER_NOT_FOUND", "user not found")
         if role not in ("admin", "user"):
             raise bad("INVALID_ROLE", "role must be admin or user")
-        if u["role"] == "admin" and role != "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin") <= 1:
+        if u["role"] == "admin" and role != "admin" and sum(1 for x in self.store.users.values() if x["role"] == "admin" and not x.get("suspended")) <= 1:
             raise bad("LAST_ADMIN", "there must always be at least one administrator")
         u["role"] = role
         return u
@@ -425,6 +432,17 @@ class AgentService:
             raise bad("INVALID_CHANNEL", "external_id required")
         external_id = external_id.strip()
         agent = self.get_agent(agent_id)
+        if channel == "WHATSAPP":
+            # WhatsApp identifies people by phone number, and an approved message from a linked number can approve bids:
+            # only the account's own VERIFIED number may be linked (otherwise anyone could claim a victim's number).
+            u = self.store.users.get(agent["principal_user_id"], {})
+            canon = self.canonical_whatsapp(external_id)
+            if not canon:
+                raise bad("INVALID_CHANNEL", "enter a valid WhatsApp number")
+            if not (u.get("phone") and u.get("phone_verified") and self.canonical_whatsapp(u["phone"]) == canon):
+                raise forbidden("NUMBER_NOT_VERIFIED", "you can only link the WhatsApp number of your VERIFIED phone — verify it under Profile first")
+            external_id = canon
+        agent = self.get_agent(agent_id)
         for other in self.store.agents.values():
             if other["agent_id"] != agent_id and any(c["channel"] == channel and c["external_id"] == external_id for c in other["channel_identity_map"]):
                 raise conflict("CHANNEL_TAKEN", "that channel identity is already linked to another agent")
@@ -432,7 +450,14 @@ class AgentService:
             agent["channel_identity_map"].append({"channel": channel, "external_id": external_id})
         return agent
 
+    @staticmethod
+    def canonical_whatsapp(raw: str | None) -> str | None:
+        p = normalize_phone(raw or "")
+        return p[1:] if p else None  # digits only, the form WhatsApp delivers
+
     def find_by_channel(self, channel: str, external_id: str) -> dict | None:
+        if channel == "WHATSAPP":
+            external_id = self.canonical_whatsapp(external_id) or external_id
         for a in self.store.agents.values():
             if any(c["channel"] == channel and c["external_id"] == external_id for c in a["channel_identity_map"]):
                 return a

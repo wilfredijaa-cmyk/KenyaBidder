@@ -24,6 +24,10 @@ from .store import LIST_KEYS, MAP_KEYS, Log, Store
 log = logging.getLogger("kenyabidder.persist")
 
 TERMINAL_AUCTION = {"SETTLED", "CANCELLED"}
+FINAL_MATCH = {"COMPLETED", "FELL_THROUGH", "NO_RESPONSE", "DISPUTED"}
+DEAD_TRIGGER = {"DONE", "CANCELLED", "EXHAUSTED"}
+MATCH_FREEZE_MS = 40 * 24 * 3600_000  # past the 30-day dispute window nothing can touch a finished match any more
+SLOW = {"kbs": 30_000, "llms": 10_000, "mcps": 10_000, "packs": 10_000}  # big or rarely-edited documents: look at them every N ms, not every flush
 TAIL_RECHECK = 100  # newest log rows are re-compared on every flush (a few histories flip a flag after being appended)
 LEASE_MS = 30_000
 
@@ -52,6 +56,7 @@ class StatePersistence:
         self._log_tail: dict[str, dict[int, bytes]] = {k: {} for k in LIST_KEYS}
         self._log_version: dict[str, int] = {k: 0 for k in LIST_KEYS}  # Log.version last made durable
         self._kv_seen: dict[str, bytes] = {}
+        self._checked_at: dict[str, int] = {}
 
     def now(self) -> int:
         import time
@@ -124,17 +129,38 @@ class StatePersistence:
         row = self.db.query_one("SELECT body FROM kv WHERE key = ?", (key,))
         return json.loads(row["body"]) if row else None
 
+    def _freezable(self, name: str, ent, now: int) -> bool:
+        """Records that can no longer change are never serialised again — this is what keeps a year-old marketplace cheap to persist."""
+        if not isinstance(ent, dict):
+            return name == "idempotency"
+        if name == "idempotency":
+            return True
+        if name == "auctions":
+            return ent.get("status") in TERMINAL_AUCTION
+        if name == "matches":
+            return ent.get("status") in FINAL_MATCH and not ent.get("dispute_open") and now - ent.get("updated_at", now) > MATCH_FREEZE_MS
+        if name == "triggers":
+            return ent.get("status") in DEAD_TRIGGER
+        if name == "approvals":
+            return ent.get("status") not in ("PENDING",)
+        return False
+
     def _maybe_freeze(self, name: str, eid: str, ent) -> None:
-        if name == "idempotency" or (name == "auctions" and isinstance(ent, dict) and ent.get("status") in TERMINAL_AUCTION):
+        if self._freezable(name, ent, self.now()):
             self._frozen[name].add(eid)
 
     # ------------------------------------------------------------------ flush
     def names(self) -> list[str]:
         return MAP_KEYS + LIST_KEYS + ["kv"]
 
-    def collect(self, store: Store, name: str) -> dict:
+    def collect(self, store: Store, name: str, *, force: bool = False) -> dict:
         """Diff one collection against what was last written. Call on the event-loop thread; pure CPU, no I/O."""
         op: dict = {"name": name, "upserts": [], "deletes": [], "seen": {}, "freeze": []}
+        now = self.now()
+        if name in SLOW:
+            if not force and now - self._checked_at.get(name, -10**18) < SLOW[name]:
+                return op  # unchanged since we last looked, as far as this slow collection is concerned
+            self._checked_at[name] = now
         if name in MAP_KEYS:
             cur = getattr(store, name)
             seen, frozen = self._seen[name], self._frozen[name]
@@ -146,7 +172,7 @@ class StatePersistence:
                 if seen.get(eid) != d:
                     op["upserts"].append((eid, body))
                     op["seen"][eid] = d
-                if name == "idempotency" or (name == "auctions" and ent.get("status") in TERMINAL_AUCTION):
+                if self._freezable(name, ent, now):
                     op["freeze"].append(eid)
             op["deletes"] = [eid for eid in seen if eid not in cur]
         elif name in LIST_KEYS:
@@ -188,6 +214,11 @@ class StatePersistence:
     def apply(self, ops: list[dict]) -> None:
         """Write collected diffs in one transaction, then advance the caches (only after the commit succeeded)."""
         now = self.now()
+        for op in ops:
+            self._apply_one(op, now)  # one short transaction per collection: the shared database lock is never held for the whole flush
+
+    def _apply_one(self, op: dict, now: int) -> None:
+        ops = [op]
         with self.db.tx() as c:
             for op in ops:
                 name = op["name"]
@@ -233,7 +264,7 @@ class StatePersistence:
 
     def flush_all(self, store: Store) -> None:
         """Synchronous full flush (startup import, shutdown, tests)."""
-        self.apply([self.collect(store, n) for n in self.names()])
+        self.apply([self.collect(store, n, force=True) for n in self.names()])
 
     # ------------------------------------------------------------------ legacy import
     def import_legacy_json(self, path: str | os.PathLike) -> Store | None:

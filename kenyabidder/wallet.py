@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from .db import Database, open_database
+from .db import Database, IntegrityError, open_database
 from .errors import AppError, bad
 
 LEDGER_COLS = "seq, entry_id, user_id, llm_id, agent_id, kind, tokens, used, balance_after, ref, ts, meta"
@@ -76,12 +76,17 @@ class WalletDB:
         return c.scalar("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (user_id, llm_id), 0)
 
     def _write(self, c, *, user_id, llm_id, kind, delta, used=0, agent_id=None, ref=None, meta=None) -> dict:
-        bal = self._bal(c, user_id, llm_id) + delta
-        if bal < 0:
-            raise bad("NEGATIVE_BALANCE", "operation would make the balance negative")
         if delta:
-            c.execute("INSERT INTO balances(user_id, llm_id, balance) VALUES(?,?,?) "
-                      "ON CONFLICT (user_id, llm_id) DO UPDATE SET balance = excluded.balance", (user_id, llm_id, bal))
+            # One atomic statement (relative update): concurrent writers on PostgreSQL serialise on the row instead of overwriting each
+            # other's read-modify-write. The CHECK constraint is the final judge of "never negative".
+            try:
+                bal = c.query_one("INSERT INTO balances(user_id, llm_id, balance) VALUES(?,?,?) "
+                                  "ON CONFLICT (user_id, llm_id) DO UPDATE SET balance = balances.balance + excluded.balance RETURNING balance",
+                                  (user_id, llm_id, delta))["balance"]
+            except IntegrityError:
+                raise bad("NEGATIVE_BALANCE", "operation would make the balance negative") from None
+        else:
+            bal = self._bal(c, user_id, llm_id)
         entry_id, at = str(uuid.uuid4()), self.now()
         seq = c.query_one("INSERT INTO ledger(entry_id,user_id,llm_id,agent_id,kind,tokens,used,balance_after,ref,ts,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING seq",
                           (entry_id, user_id, llm_id, agent_id, kind, delta, used, bal, ref, at, json.dumps(meta or {})))["seq"]

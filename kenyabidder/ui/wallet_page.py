@@ -179,7 +179,7 @@ def order_actions(user: dict, o: dict, refresh_orders, refresh_balances, typed: 
         refresh_orders()
         refresh_balances()
 
-    if o["status"] in ("PENDING", "EXPIRED") and o["provider"] == "manual":
+    if o["status"] in ("PENDING", "EXPIRED") and (o["provider"] == "manual" or (o["provider"] == "mpesa" and not o["external_ref"])):
         ui.label(c.billing.manual_instructions()).classes("text-sm font-medium whitespace-pre-line")
         ui.label(f"Use {o['reference']} as the account/reference, then enter the M-Pesa confirmation code from your SMS:").classes("text-xs opacity-70")
         code = ui.input("M-Pesa code", placeholder="SGH7X2K9LP", value=typed.get(o["id"], ""), on_change=lambda e, i=o["id"]: typed.__setitem__(i, e.value or "")).props("dense").classes("w-56")

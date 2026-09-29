@@ -127,6 +127,9 @@ class Store:
             del self.triggers[tid]
         for aid in [a["id"] for a in self.approvals.values() if a["status"] != "PENDING" and now - (a.get("resolved_at") or a["created_at"]) > 30 * 24 * 3600_000]:
             del self.approvals[aid]
+        live = {i for i, a in self.auctions.items() if a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING")}
+        if any(k.partition(":")[2] not in live for k in self.considered):
+            self.considered = {k for k in self.considered if k.partition(":")[2] in live}  # a closed auction is never considered again
         for vid in [v["id"] for v in self.verifications.values() if now - v["created_at"] > 24 * 3600_000]:
             del self.verifications[vid]  # one-time codes are worthless after their 10 minutes; keep a day for support questions
         fails = self.settings.get("login_failures", {})

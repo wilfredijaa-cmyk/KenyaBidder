@@ -262,11 +262,16 @@ def channels_tab(agent: dict) -> None:
         ui.select({"WEB": "Web only", "WHATSAPP": "WhatsApp", "SMS": "SMS (verified phone)", "EMAIL": "Email (verified address)"}, value=m["preferred_channel"], label="Send notifications to",
                   on_change=guard(lambda e: core().agents.update(agent["agent_id"], memory={"preferred_channel": e.value}))).classes("w-64")
         linked = ui.label(", ".join(f"{c['channel']} {c['external_id']}" for c in agent["channel_identity_map"]) or "Nothing linked yet").classes("text-sm")
-        num = ui.input("WhatsApp number (digits, with country code)", placeholder="254700000000").classes("w-96")
+        owner = core().store.users.get(agent["principal_user_id"], {})
+        if owner.get("phone") and owner.get("phone_verified"):
+            ui.label(f"WhatsApp number to link: {owner['phone']} (your verified phone)").classes("text-sm")
+        else:
+            ui.label("To link WhatsApp, first add and verify your phone number in your profile — only your own verified number can be linked.").classes("text-sm text-amber-700")
+            ui.link("Open profile", "/profile")
 
         @guard
         def link():
-            a = core().agents.link_channel(agent["agent_id"], "WHATSAPP", num.value)
+            a = core().agents.link_channel(agent["agent_id"], "WHATSAPP", owner.get("phone") or "")
             linked.set_text(", ".join(f"{c['channel']} {c['external_id']}" for c in a["channel_identity_map"]))
             ui.notify("Linked", type="positive")
         ui.button("Link WhatsApp", icon="link", on_click=link).props("outline")

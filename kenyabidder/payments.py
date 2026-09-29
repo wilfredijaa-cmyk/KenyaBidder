@@ -108,10 +108,17 @@ class MpesaClient:
                 "TransactionType": self.cfg.transaction_type, "Amount": int(amount), "PartyA": msisdn,
                 "PartyB": self.cfg.party_b or self.cfg.shortcode, "PhoneNumber": msisdn, "CallBackURL": self.callback_url,
                 "AccountReference": account_ref[:12], "TransactionDesc": description[:13]}
-        data = await self._request("POST", "/mpesa/stkpush/v1/processrequest", json=body, headers={"Authorization": f"Bearer {await self.token()}"})
+        headers = {"Authorization": f"Bearer {await self.token()}"}  # a failure up to here means nothing was sent
+        try:
+            data = await self._request("POST", "/mpesa/stkpush/v1/processrequest", json=body, headers=headers)
+        except AppError as e:
+            e.ambiguous = e.code == "MPESA_UNREACHABLE"  # a timeout AFTER the request left: Safaricom may already have prompted the customer
+            raise
         if str(data.get("ResponseCode")) != "0" or not data.get("CheckoutRequestID"):
             msg = data.get("errorMessage") or data.get("ResponseDescription") or "M-Pesa did not accept the request"
-            raise AppError("MPESA_REJECTED", f"M-Pesa: {msg}", 502)
+            err = AppError("MPESA_REJECTED", f"M-Pesa: {msg}", 502)
+            err.ambiguous = int(data.get("_http") or 0) >= 500  # a 5xx says nothing about whether the prompt went out
+            raise err
         return {"checkout_request_id": data["CheckoutRequestID"], "merchant_request_id": data.get("MerchantRequestID"),
                 "customer_message": data.get("CustomerMessage", "")}
 

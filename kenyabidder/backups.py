@@ -78,5 +78,8 @@ def restore_backup(src: str | os.PathLike, dest: str | os.PathLike) -> None:
         raise FileNotFoundError(src)
     if dest.exists():
         shutil.move(dest, dest.with_name(dest.name + ".before-restore"))
+    wal = dest.with_name(dest.name + ".wal")
+    if wal.exists():  # a leftover write-ahead log belongs to the OLD file and must never be replayed onto the backup
+        shutil.move(wal, dest.with_name(dest.name + ".wal.before-restore"))
     shutil.copy2(src, dest)
     os.chmod(dest, 0o600)

@@ -321,6 +321,12 @@ class BillingService:
         try:
             r = await self.mpesa.stk_push(msisdn, o["amount_kes"], o["reference"], "KenyaBidder")
         except AppError as e:
+            if getattr(e, "ambiguous", False):
+                # The prompt may already be on the customer's phone. Failing the order would strand a payment nobody can match, so it stays
+                # PENDING and the customer can finish it by entering the M-Pesa code (manual review), or cancel it.
+                self.sql.execute("UPDATE orders SET note=? WHERE id=?", ("M-Pesa did not confirm the prompt — pay and enter the code if you received one", o["id"]))
+                raise AppError("MPESA_UNCERTAIN", "We could not confirm the M-Pesa prompt was sent. If you did receive one and paid, open My orders and enter the M-Pesa code; "
+                               "otherwise cancel that order and try again in a minute.", 502) from None
             self._set_status(o["id"], ("PENDING",), "FAILED", note=e.message[:200])
             raise
         self._set_status(o["id"], ("PENDING",), "PENDING", external_ref=r["checkout_request_id"])
@@ -328,7 +334,7 @@ class BillingService:
 
     def submit_receipt(self, user: dict, order_id: str, receipt: str) -> dict:
         o = self.owned_order(user["id"], order_id)
-        if o["provider"] != "manual" or o["status"] not in ("PENDING", "EXPIRED"):  # a slow customer who paid the Till is still credited
+        if not (o["provider"] == "manual" or (o["provider"] == "mpesa" and not o["external_ref"])) or o["status"] not in ("PENDING", "EXPIRED"):  # a slow customer who paid the Till is still credited
             raise bad("INVALID_STATE", "this order is not waiting for a payment code")
         code = re.sub(r"\s", "", receipt or "").upper()
         if not RECEIPT_RE.match(code):

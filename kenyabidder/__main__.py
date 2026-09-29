@@ -34,14 +34,14 @@ def build(runtime: runtime_mod.Runtime) -> None:
         return {"ok": True}  # liveness: the process is up
 
     @ng_app.get("/readyz")
-    def readyz():
+    async def readyz():  # async: runs on the event loop that owns the state (a worker thread would iterate dicts being mutated)
         ok, checks = metrics_mod.readiness(runtime)  # readiness: safe to route traffic here
         if not ok:
             raise HTTPException(503, detail=checks)
         return {"ok": True, "checks": checks}
 
     @ng_app.get("/metrics")
-    def metrics(request: Request):
+    async def metrics(request: Request):
         token = os.environ.get("KENYABIDDER_METRICS_TOKEN")
         auth = request.headers.get("authorization", "")
         if token:

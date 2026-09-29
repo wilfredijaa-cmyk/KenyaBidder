@@ -424,3 +424,27 @@ async def test_revenue_margin_report_and_csv_hardening(shop):
     assert "'=cmd" in csv_text and ",=cmd" not in csv_text
     assert "'+SUM(A1)" in b.orders_csv() and ",+SUM(A1)" not in b.orders_csv()
     assert "REPORT0001" in b.orders_csv() and len(b.orders_csv(user_id=shop.user["id"]).splitlines()) == 3
+
+
+async def test_a_timeout_after_the_push_leaves_the_order_recoverable_by_receipt(make_env):
+    """If the request left but the answer never came, Safaricom may have prompted the customer: the order must NOT be failed
+    (a payment nobody can match), it stays pending so the customer can finish it with the M-Pesa code."""
+    def handler(req):
+        if "oauth" in str(req.url):
+            return httpx.Response(200, json={"access_token": "t", "expires_in": "3599"})
+        raise httpx.ReadTimeout("slow")
+    cfg = MpesaConfig("ck", "cs", "174379", "passkey", "https://kb.example.com", callback_secret="s")
+    env = make_env(mpesa_client=MpesaClient(cfg, http=httpx.AsyncClient(transport=httpx.MockTransport(handler)), clock=None))
+    admin = env.agents.create_user(name="Boss", password="password123")
+    llm = env.llms.add(name="Claude", provider="anthropic", model="m", api_key="k")
+    pack = env.billing.add_pack(admin, name="Starter", llm_id=llm["id"], tokens=100_000, price_kes=500)
+    u, _ = env.bidder(name="Payer")
+    with pytest.raises(AppError) as e:
+        await env.billing.checkout(u, pack["id"], "mpesa", "0712 345 678")
+    assert e.value.code == "MPESA_UNCERTAIN"
+    o = env.billing.list_orders(user_id=u["id"])[0]
+    assert o["status"] == "PENDING" and not o["external_ref"]
+    env.billing.submit_receipt(u, o["id"], "SGH7X2K9LP")  # the customer did get the prompt and pay: they enter the code
+    assert env.billing.get_order(o["id"])["status"] == "AWAITING_REVIEW"
+    env.billing.admin_review(admin, o["id"], True)
+    assert env.wallet.balance(u["id"], llm["id"]) == 100_000

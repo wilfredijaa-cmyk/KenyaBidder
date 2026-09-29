@@ -512,6 +512,7 @@ def endpoint_panel():
             ui.label("Bearer key").classes("text-xs opacity-60 mt-2")
             shown = ui.label("••••••••••••••••").classes("font-mono text-sm")
 
+            @guard_admin
             def reveal():
                 shown.set_text(r.mcp_key)
             ui.button("Reveal key", icon="visibility", on_click=reveal).props("outline no-caps dense")
@@ -667,9 +668,16 @@ def billing_panel():
             ui.label("Outstanding tokens are service you owe customers. Est. cost uses each LLM's 'cost per 1k tokens' and includes tokens you gave away or funded.").classes("text-xs opacity-60")
         revenue()
         ui.timer(10.0, revenue.refresh)
+        @guard_admin
+        def export_ledger():
+            ui.download.content(c.billing.ledger_csv(), "ledger.csv", "text/csv")
+
+        @guard_admin
+        def export_orders():
+            ui.download.content(c.billing.orders_csv(), "orders.csv", "text/csv")
         with ui.row():
-            ui.button("Export ledger (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.ledger_csv(), "ledger.csv", "text/csv")).props("outline no-caps")
-            ui.button("Export orders (CSV)", icon="download", on_click=lambda: ui.download.content(c.billing.orders_csv(), "orders.csv", "text/csv")).props("outline no-caps")
+            ui.button("Export ledger (CSV)", icon="download", on_click=export_ledger).props("outline no-caps")
+            ui.button("Export orders (CSV)", icon="download", on_click=export_orders).props("outline no-caps")
 
 
 def pack_dialog(done) -> None:
