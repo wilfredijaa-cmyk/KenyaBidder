@@ -17,6 +17,7 @@ def readiness(rt) -> tuple[bool, dict]:
     if rt.started_at:  # only judge liveness of loops once they have been started
         checks["tick_loop"] = now - rt.last_tick_at < TICK_STALE_S
         if rt.persistence:
+            checks["writer_lease"] = not rt.lost_lease
             checks["state_flush"] = now - max(rt.last_flush_at, rt.started_at) < FLUSH_STALE_S and rt.flush_errors_streak < 3
     return all(checks.values()), checks
 

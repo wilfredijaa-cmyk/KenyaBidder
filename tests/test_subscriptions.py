@@ -97,3 +97,53 @@ async def test_the_plan_bought_is_the_plan_delivered_even_if_the_pack_changes(pl
     o = await env.billing.checkout(plan.user, plan.pack["id"], "dev")  # dev method pays immediately; edit the pack first for a manual-style flow
     env.billing.update_pack(plan.admin, plan.pack["id"], plan={"days": 1})
     assert env.subscriptions.active(plan.user["id"])["current_period_end"] == env.clock.now() + 30 * DAY_MS
+
+
+async def test_refunding_one_order_takes_back_only_its_days(plan):
+    env = plan.env
+    o1 = await buy(plan)
+    o2 = await buy(plan)  # stacked: 60 days
+    s = env.subscriptions.active(plan.user["id"])
+    assert s["current_period_end"] == env.clock.now() + 60 * DAY_MS
+    env.billing.admin_refund(plan.admin, o1["id"], "duplicate purchase")
+    s = env.subscriptions.active(plan.user["id"])
+    assert s and s["current_period_end"] == env.clock.now() + 30 * DAY_MS and s["order_ids"] == [o2["id"]]
+    env.billing.admin_refund(plan.admin, o2["id"], "customer request")
+    assert env.store.subscriptions[plan.user["id"]]["status"] == "CANCELLED"
+
+
+async def test_a_lost_activation_is_healed_by_recovery_and_by_repeat_payment_calls(plan):
+    env = plan.env
+    env.billing.on_paid = None  # simulate the process dying between the payment commit and the plan activation
+    o = await buy(plan)
+    assert not env.subscriptions.active(plan.user["id"]) and env.billing.get_order(o["id"])["status"] == "PAID"
+    env.billing.on_paid = env.subscriptions.activate
+    env.clock.advance(2 * DAY_MS)
+    assert env.subscriptions.recover(env.billing.paid_plan_orders(0)) == 1
+    s = env.subscriptions.active(plan.user["id"])
+    assert s["current_period_end"] == env.clock.now() - 2 * DAY_MS + 30 * DAY_MS  # the days run from when it was PAID, not from now
+    assert env.subscriptions.recover(env.billing.paid_plan_orders(0)) == 0  # idempotent
+    env.store.subscriptions.clear()
+    env.billing.mark_paid(o["id"], receipt=None, method="retry")  # a repeated payment callback heals it too
+    assert env.subscriptions.active(plan.user["id"])
+
+
+async def test_recovery_grants_nothing_for_an_order_whose_days_already_ran_out(plan):
+    env = plan.env
+    env.billing.on_paid = None
+    await buy(plan)
+    env.clock.advance(40 * DAY_MS)
+    assert env.subscriptions.recover(env.billing.paid_plan_orders(0)) == 0 and not env.subscriptions.active(plan.user["id"])
+
+
+def test_refund_reclaims_only_what_is_left_even_after_tokens_were_spent(env):
+    admin = env.agents.create_user(name="Boss", password="password123")
+    llm = env.llms.add(name="Claude", provider="anthropic", model="m", api_key="k")
+    pack = env.billing.add_pack(admin, name="P", llm_id=llm["id"], tokens=100_000, price_kes=500)
+    u = env.agents.create_user(name="Cust", password="password123")
+    o = env.billing._insert_order(u, pack, "manual", None)
+    env.billing.mark_paid(o["id"], receipt="ABC123", method="test")
+    env.wallet.record_usage(u["id"], llm["id"], 60_000, agent_id="a", metered=True)
+    r = env.billing.admin_refund(admin, o["id"], "changed my mind")
+    assert r["status"] == "REFUNDED" and env.wallet.balance(u["id"], llm["id"]) == 0 and "reclaimed 40,000" in r["note"]
+    assert env.wallet.verify_integrity() == []

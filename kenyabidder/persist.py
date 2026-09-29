@@ -50,6 +50,7 @@ class StatePersistence:
         self._log_next: dict[str, int] = {k: 0 for k in LIST_KEYS}   # first absolute seq NOT yet written
         self._log_floor: dict[str, int] = {k: 0 for k in LIST_KEYS}  # rows below this were already deleted
         self._log_tail: dict[str, dict[int, bytes]] = {k: {} for k in LIST_KEYS}
+        self._log_version: dict[str, int] = {k: 0 for k in LIST_KEYS}  # Log.version last made durable
         self._kv_seen: dict[str, bytes] = {}
 
     def now(self) -> int:
@@ -100,6 +101,7 @@ class StatePersistence:
             rows = self.db.query("SELECT seq, body FROM logs WHERE collection = ? ORDER BY seq", (name,))
             for r in rows:
                 lst.append(json.loads(r["body"]))
+            self._log_version[name] = lst.version
             if rows:
                 lst.dropped = rows[0]["seq"]
                 self._log_next[name] = rows[-1]["seq"] + 1
@@ -150,6 +152,14 @@ class StatePersistence:
         elif name in LIST_KEYS:
             lst = getattr(store, name)
             base = getattr(lst, "dropped", 0)
+            version = getattr(lst, "version", 0)
+            if version != self._log_version[name] or base + len(lst) < self._log_next[name]:
+                op["rewrite"] = True  # something other than append / front-trim happened: replace the whole durable log
+                op["rows"] = [(base + i, _dump(lst[i])) for i in range(len(lst))]
+                op.update(next=base + len(lst), floor=base, version=version, upserts=[],
+                          tail={base + i: _digest(body) for i, (_, body) in enumerate(op["rows"]) if i >= len(lst) - TAIL_RECHECK})
+                return op
+            op["version"] = version
             nxt = self._log_next[name]
             start = max(nxt - base, 0)
             op["rows"] = [(base + i, _dump(lst[i])) for i in range(start, len(lst))]
@@ -188,6 +198,8 @@ class StatePersistence:
                     for eid in op["deletes"]:
                         c.execute("DELETE FROM docs WHERE collection = ? AND id = ?", (name, eid))
                 elif name in LIST_KEYS:
+                    if op.get("rewrite"):
+                        c.execute("DELETE FROM logs WHERE collection = ?", (name,))
                     for seq, body in op["rows"]:
                         c.execute("INSERT INTO logs(collection, seq, body) VALUES (?,?,?) ON CONFLICT (collection, seq) DO UPDATE SET body = excluded.body", (name, seq, body))
                     for seq, body in op["upserts"]:
@@ -207,9 +219,14 @@ class StatePersistence:
                     self._frozen[name].discard(eid)
                 self._frozen[name].update(op["freeze"])
             elif name in LIST_KEYS:
-                self._log_next[name] = max(self._log_next[name], op["next"])
-                self._log_floor[name] = max(self._log_floor[name], op["floor"])
-                self._log_tail[name] = {k: v for k, v in {**self._log_tail[name], **op["tail"]}.items() if k >= op["next"] - TAIL_RECHECK}
+                if op.get("rewrite"):
+                    self._log_next[name], self._log_floor[name] = op["next"], op["floor"]
+                    self._log_tail[name] = dict(op["tail"])
+                else:
+                    self._log_next[name] = max(self._log_next[name], op["next"])
+                    self._log_floor[name] = max(self._log_floor[name], op["floor"])
+                    self._log_tail[name] = {k: v for k, v in {**self._log_tail[name], **op["tail"]}.items() if k >= op["next"] - TAIL_RECHECK}
+                self._log_version[name] = op["version"]
             else:
                 for key, (_b, d) in op["kv"].items():
                     self._kv_seen[key] = d

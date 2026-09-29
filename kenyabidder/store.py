@@ -9,17 +9,65 @@ LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log",
 
 
 class Log(list):
-    """Append-mostly list that counts items trimmed off the front, so the durable copy stays aligned."""
+    """Append-mostly list. Front trims are counted (``dropped``) so the durable copy stays aligned; every OTHER kind of change
+    (in-place edit far from the end, insert, sort, slice assignment…) bumps ``version`` so the durable copy is rewritten wholesale."""
 
     dropped = 0
+    version = 0
+    TAIL = 100  # edits to the newest rows are handled by the incremental tail re-check
+
+    def _dirty(self) -> None:
+        self.version += 1
 
     def __delitem__(self, key):
         if isinstance(key, slice):
+            n = len(range(*key.indices(len(self))))
             if key.start in (None, 0) and key.step in (None, 1):
-                self.dropped += len(range(*key.indices(len(self))))
+                self.dropped += n
+            elif n:
+                self._dirty()
         elif key in (0, -len(self)):
             self.dropped += 1
+        else:
+            self._dirty()
         super().__delitem__(key)
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice) or not (-self.TAIL <= (key if key < 0 else key - len(self)) < 0):
+            self._dirty()
+        super().__setitem__(key, value)
+
+    def clear(self):
+        self.dropped += len(self)
+        super().clear()
+
+    def pop(self, index=-1):
+        if index in (0, -len(self)) and len(self) > 1:
+            self.dropped += 1
+        elif index not in (-1, len(self) - 1):
+            self._dirty()
+        return super().pop(index)
+
+    def insert(self, index, obj):
+        if index < len(self):
+            self._dirty()
+        super().insert(index, obj)
+
+    def remove(self, value):
+        self._dirty()
+        super().remove(value)
+
+    def sort(self, *a, **k):
+        self._dirty()
+        super().sort(*a, **k)
+
+    def reverse(self):
+        self._dirty()
+        super().reverse()
+
+    def __iadd__(self, other):
+        self.extend(other)
+        return self
 
 
 class Store:

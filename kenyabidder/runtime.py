@@ -14,13 +14,15 @@ from .mcpx.server import build_server
 from .backups import BackupService
 from .db import open_database
 from .db.legacy import import_sqlite_wallet
-from .persist import StatePersistence
+from .persist import StateLocked, StatePersistence
 from .store import Store
 
 log = logging.getLogger("kenyabidder.runtime")
 
 
 class Runtime:
+    LEASE_RENEW_EVERY = 10  # save-loop beats (1s each)
+
     def __init__(self, data_file: str | None = None, mcp_port: int | None = None, mcp_host: str = "127.0.0.1", tick_ms: int = 50, database_url: str | None = None):
         self.data_file = data_file
         url = database_url or os.environ.get("KENYABIDDER_DATABASE_URL")
@@ -50,6 +52,7 @@ class Runtime:
         self.started_at = 0.0
         self.last_tick_at = self.last_flush_at = 0.0
         self.flush_errors = self.flush_errors_streak = 0
+        self.lost_lease = False
         self.app = create_app(store=self.store, clock=SystemClock(), database=self.db)
         self.mcp_host, self.mcp_port, self.tick_ms = mcp_host, mcp_port, tick_ms
         self.tasks: list[asyncio.Task] = []
@@ -96,12 +99,20 @@ class Runtime:
         beats = 0
         while True:
             await asyncio.sleep(1)
+            beats += 1
+            if beats % self.LEASE_RENEW_EVERY == 0 and not self.lost_lease:  # the lease is renewed whether or not flushing works: a failing disk must not hand the database to a second process
+                try:
+                    await asyncio.to_thread(self.persistence.renew_lease)
+                except StateLocked:
+                    self.lost_lease = True
+                    log.critical("LOST THE WRITER LEASE — another process now owns this database. This instance stops writing; restart it after checking for a duplicate deployment.")
+                except Exception:  # noqa: BLE001  transient database error: try again at the next beat
+                    log.exception("lease renewal failed")
+            if self.lost_lease:
+                continue  # never write state we no longer own
             try:
                 await self.flush()
                 self.flush_errors_streak = 0
-                beats += 1
-                if beats % 10 == 0:
-                    await asyncio.to_thread(self.persistence.renew_lease)
             except Exception:  # noqa: BLE001
                 self.flush_errors += 1
                 self.flush_errors_streak += 1
@@ -122,7 +133,8 @@ class Runtime:
                     await asyncio.to_thread(self.backups.run)
                 except Exception:  # noqa: BLE001
                     log.exception("backup failed")
-            for name, sync_step in (("order expiry", a.billing.expire_stale), ("subscriptions", a.subscriptions.tick), ("evening summaries", a.sellers.send_daily_summaries),
+            for name, sync_step in (("order expiry", a.billing.expire_stale), ("subscriptions", a.subscriptions.tick),
+                                    ("plan recovery", lambda: a.subscriptions.recover(a.billing.paid_plan_orders(a.clock.now() - 400 * 24 * 3600_000))), ("evening summaries", a.sellers.send_daily_summaries),
                                     ("pruning", lambda: self.store.prune(a.clock.now()))):
                 try:
                     sync_step()
@@ -155,7 +167,7 @@ class Runtime:
         for t in self.tasks:
             t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        if self.persistence:
+        if self.persistence and not self.lost_lease:
             try:
                 self.persistence.flush_all(self.store)
                 self.persistence.release_lease()

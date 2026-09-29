@@ -64,7 +64,7 @@ class VerificationService:
         if sum(1 for v in mine if v["user_id"] == user_id) >= MAX_PER_HOUR or sum(1 for v in mine if v["dest"] == dest) >= MAX_PER_HOUR:
             raise AppError("CODE_LIMIT", "too many codes requested — try again in an hour", 429)
 
-    async def _issue(self, user: dict, purpose: str, channel: str, dest: str, text_for) -> dict:
+    async def _issue(self, user: dict, purpose: str, channel: str, dest: str, text_for, *, background: bool = False) -> dict:
         now = self.clock.now()
         self._limits(user["id"], purpose, dest, now)
         for v in self.store.verifications.values():  # a new code retires every older pending one
@@ -74,14 +74,23 @@ class VerificationService:
         rec = {"id": vid, "user_id": user["id"], "purpose": purpose, "channel": channel, "dest": dest, "code_hash": self._code_hash(vid, code),
                "created_at": now, "expires_at": now + TTL_MS, "attempts": 0, "status": "PENDING"}
         self.store.verifications[vid] = rec
-        try:
-            if channel == "SMS":
-                await self.messenger.send_sms(dest, text_for(code), purpose.lower())
-            else:
-                await self.messenger.send_email(dest, "Your KenyaBidder code", text_for(code), purpose.lower())
-        except AppError:
-            rec["status"] = "FAILED"  # the user may ask again straight away (the attempt still counts toward the hourly cap)
-            raise
+
+        async def deliver():
+            try:
+                if channel == "SMS":
+                    await self.messenger.send_sms(dest, text_for(code), purpose.lower())
+                else:
+                    await self.messenger.send_email(dest, "Your KenyaBidder code", text_for(code), purpose.lower())
+            except AppError:
+                rec["status"] = "FAILED"
+                if background:  # the user was told "sent" regardless: let an immediate retry through instead of trapping them in the cooldown
+                    self.store.verifications.pop(vid, None)
+                raise
+        if background:  # password reset: answer immediately so response time cannot reveal whether the account exists
+            if not self.messenger.spawn(deliver()):
+                await deliver()
+        else:
+            await deliver()
         out = {"id": vid, "channel": channel, "sent_to": mask(dest), "expires_in_s": TTL_MS // 1000}
         provider = self.messenger.sms if channel == "SMS" else self.messenger.email
         if not getattr(provider, "real", False):
@@ -161,9 +170,9 @@ class VerificationService:
         if u and not u.get("suspended"):
             try:
                 if u.get("phone") and u.get("phone_verified"):
-                    await self._issue(u, "RESET", "SMS", u["phone"], lambda c: template("reset_sms", u.get("lang"), code=c))
+                    await self._issue(u, "RESET", "SMS", u["phone"], lambda c: template("reset_sms", u.get("lang"), code=c), background=True)
                 elif u.get("email") and u.get("email_verified"):
-                    await self._issue(u, "RESET", "EMAIL", u["email"], lambda c: template("reset_email", u.get("lang"), code=c))
+                    await self._issue(u, "RESET", "EMAIL", u["email"], lambda c: template("reset_email", u.get("lang"), code=c), background=True)
             except AppError:
                 pass  # rate limit / delivery problems must look identical to success from the outside
         return {"message": GENERIC_RESET}

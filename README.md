@@ -18,8 +18,8 @@ python -m kenyabidder --mcp-port 8765     # …and serve KenyaBidder's own MCP e
 pytest                                    # unit tests + real-browser end-to-end tests (skipped without Chromium)
 ```
 
-The **first account you register becomes the administrator**. State is snapshotted to `data/state.json`
-(`--data ''` for in-memory only).
+The **first account you register becomes the administrator**. Everything is stored in one **DuckDB** file,
+`data/kenyabidder.duckdb` (`--data ''` for in-memory only). PostgreSQL is supported by the same code path — see [Database](#database).
 
 ## What you can configure in the UI
 
@@ -47,7 +47,7 @@ Agents think with LLMs, and LLM calls cost money — so the platform **sells tok
 * **Buying:** Admin creates *packs* (e.g. 100,000 tokens for KES 500). Users pay by **M-Pesa STK push**, or by paying your Till/Paybill and entering
   the M-Pesa code for admin approval. `KENYABIDDER_DEV_PAYMENTS=1` adds an instant fake payment for development only.
 * **Free trial:** an optional sign-up grant, once per account *and* per phone number, with a platform-wide daily budget.
-* **Money-grade storage:** balances, the append-only ledger and orders live in SQLite (`wallet.db`, WAL, fsync) — the database itself forbids negative
+* **Money-grade storage:** balances, the append-only ledger and orders live in the SQL database (DuckDB, transactional; see Database) — the database itself forbids negative
   balances and double-crediting one payment. Admin → Audit log verifies every balance against the ledger; every money/user/pricing action is logged.
 * **Reports:** revenue, estimated LLM cost and margin per LLM, tokens outstanding (service you owe), and CSV export of ledger and orders.
 
@@ -84,14 +84,66 @@ and a periodic reconciler recovers lost callbacks.
 * **The agent, not the channel, is the identity.** Web and WhatsApp share one memory and one command set.
 
 ### Auction algorithms
-English (with anti-sniping), Dutch, first-price sealed, second-price sealed (Vickrey). Reverse, multi-unit and
-combinatorial are reserved for a later milestone (they need a winner-determination solver).
+Forward auctions (a seller lists, buyer agents bid up): English (with anti-sniping), Dutch, first-price sealed, second-price sealed (Vickrey).
+
+**Reverse auctions / RFQs** (a buyer posts what it needs and the most it will pay; *supplier* agents bid the price down):
+`REVERSE_ENGLISH` (open; each quote must undercut the best by the minimum decrement; anti-sniping) and `REVERSE_SEALED` (lowest sealed quote wins,
+earliest breaks ties). Buyers post from **Auctions → Request quotes**; sellers configure a supplier strategy per RFQ type
+(`baseline` undercut-to-floor, `heuristic` priced off comparable clearing prices, or `llm`) and a category watch, exactly like buyers.
+The supplier's **price floor** is a hard guardrail limit; a buyer's `max_price` may not exceed its budget ceiling. In the resulting match the
+winning supplier is the *seller* and the RFQ poster the *buyer*, so confirmation, contact reveal, outcome reports, disputes and reputation all work unchanged.
+Multi-unit and combinatorial auctions remain reserved (they need a winner-determination solver).
+
+## Trust & safety
+
+* **Phone / email verification** — 6-digit codes (only an HMAC is stored), 10-minute expiry, 5 guesses, resend cooldown, hourly caps per account *and* per
+  destination, and a platform-wide **daily SMS budget** against SMS-pumping fraud. With a real SMS gateway configured, a verified phone is required for the
+  free-trial tokens and for exchanging contact details (Admin → Messaging can override).
+* **Self-service password reset** — code to a *verified* phone/email; the answer never reveals whether an account exists; a reset ends every signed-in session.
+* **Verified businesses** — users apply with a KRA PIN / business registration / ID number; an admin checks it out-of-band and approves. The badge shows
+  on listings and contact details; listings and RFQs can be **verified-only**, and the platform can require verification above a KES amount.
+* **Disputes** — after contact exchange either party can open a dispute (30-day window); the other side answers (7 days); an administrator rules
+  (completed / seller at fault / buyer at fault / both / no fault). The ruling — not a unilateral report — updates reputation, and automatic outcome logic is paused meanwhile.
+* **Privacy (Kenya DPA 2019)** — *Profile → Your data*: download everything we hold as JSON, or delete the account (identifiers erased/anonymised, financial
+  records kept under an anonymous id, refused while money/deals/disputes are unresolved). Register with the ODPC as a data controller/processor and have the Terms
+  reviewed by a lawyer before launch — those are organisational steps no code can do.
+
+## Plans, languages, operations
+
+* **Subscription plans** — a token pack with a *plan* (days + more agents + higher per-agent LLM decision allowance). Same audited payment flow; buying again
+  extends; reminder 3 days before it ends; a refund cancels it.
+* **Kiswahili** — language toggle (EN/SW) on every page; navigation, sign-in, listing/bidding, wallet, profile and SMS templates are translated. ⚠ First-draft
+  translations without a native reviewer — have a Kiswahili speaker review `kenyabidder/i18n.py` before launch. Dynamic sentences still show in English.
+* **Health & metrics** — `/healthz` (liveness), `/readyz` (database, tick loop, state flush), Prometheus `/metrics` (loopback only, or bearer
+  `KENYABIDDER_METRICS_TOKEN`), JSON logs with `KENYABIDDER_LOG_JSON=1`.
+* **Backups** — verified, retained (14 by default) DuckDB backups every 24h under `data/backups` (Admin → Health & backups; copy them off the machine!).
+  Restore with the app stopped: `python -m kenyabidder restore data/backups/<file>`.
+
+## Database
+
+All money data (balances, the append-only token ledger, orders, M-Pesa receipt claims) and **all application state** (users, agents, auctions, matches…) live
+in the SQL database. The engine keeps a working set in memory for bid latency and flushes *only what changed* about once a second (finished auctions are frozen;
+append-only logs are trimmed in step); a graceful shutdown flushes everything. Money writes are transactional and never go through that path.
+
+* **DuckDB** (default): `duckdb:///data/kenyabidder.duckdb`, embedded, single process. A **writer lease** stops a second process from silently forking the state.
+* **PostgreSQL**: `KENYABIDDER_DATABASE_URL=postgresql://user:pw@host/db` (`pip install "psycopg[binary]"`). The SQL is one portable subset (`?` placeholders, sequences,
+  `ON CONFLICT`, no partial indexes) with versioned migrations; the Postgres adapter is written but **only DuckDB is exercised in this repository's tests** — run the suite against your
+  server with `KENYABIDDER_TEST_DATABASE_URL=postgresql://…` before relying on it.
+* Multiple *processes* can safely share the database for money/orders, but the in-memory auction engine is a single writer by design (the lease enforces it). Scaling the engine
+  horizontally means sharding auctions by id — the next architectural step, not attempted here.
+* Upgrading from the earlier JSON + SQLite version imports `state.json` and `wallet.db` automatically on first start (files are renamed `.imported`, never deleted).
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
-| `KENYABIDDER_DATA` | State snapshot path (default `data/state.json`). Contains LLM/MCP credentials → written `0600`. |
+| `KENYABIDDER_DATA` | Data location (default `data/state.json`); the database file `kenyabidder.duckdb` and `backups/` live beside it. Contains LLM/MCP credentials → `0600`. |
+| `KENYABIDDER_DATABASE_URL` | `duckdb:///path.duckdb` (default beside the data file) or `postgresql://…`. |
+| `KENYABIDDER_BACKUP_DIR` / `_KEEP` / `_EVERY_HOURS` | Backup location, how many to retain (14) and the interval (24). |
+| `KENYABIDDER_FORCE_LEASE=1` | Take over the writer lease after a crash left it held (never while another instance is alive). |
+| `AT_USERNAME`, `AT_API_KEY`, `AT_SENDER_ID`, `AT_SANDBOX=1` | Africa's Talking SMS gateway (codes and alerts). Without them SMS runs in development mode (codes are shown on screen, nothing is sent). |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_STARTTLS` | Email for verification codes and alerts. |
+| `KENYABIDDER_METRICS_TOKEN` | Bearer token to scrape `/metrics` remotely (otherwise loopback only). `KENYABIDDER_LOG_JSON=1` for JSON logs. |
 | `KENYABIDDER_MCP_PORT` / `KENYABIDDER_MCP_KEY` | Serve KenyaBidder's read-only FastMCP endpoint on `127.0.0.1:<port>/mcp`; bearer key (generated if unset). |
 | `KENYABIDDER_SECRET` | Session-cookie secret (generated and persisted if unset). |
 | `KENYABIDDER_ALLOW_STDIO=1` | Allow admins to register stdio MCP servers (they execute local commands). |
@@ -102,20 +154,19 @@ combinatorial are reserved for a later milestone (they need a winner-determinati
 | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` | Cloud API verification handshake and outbound messages. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Default key sources for LLMs registered without an explicit key. |
 
-## Not built yet (recommended next)
+## Next steps
 
-1. **Phone verification (SMS OTP)** — phones are unverified today; the free-trial budget bounds abuse but OTP closes it and makes contact reveals trustworthy.
-2. **Reverse auctions / RFQs** — procurement managers' natural workflow; needs the winner-determination work in spec Milestone 4.
-3. **A real database + multiple workers** — the rest of the state is an in-memory store with JSON snapshots (single process). Wallet data is already SQLite.
-4. **Email/SMS notifications and self-service password reset** (admins reset passwords manually today).
-5. **Seller verification** (business registration / KRA PIN badges) for high-value lots, and a dispute workflow (contradicting reports are recorded as
-   `DISPUTED` with no penalty; the platform does not adjudicate).
-6. **Subscription tiers** (spec §4) on top of tokens, Swahili localisation, ODPC registration and data-export/deletion tooling, monitoring and wallet backups.
+1. **Run the suite against PostgreSQL** (`KENYABIDDER_TEST_DATABASE_URL`) and shard the auction engine by id for multi-process scale.
+2. **Native review of the Kiswahili strings**, and translating dynamic sentences / the agent-generated messages.
+3. **Automatic recurring billing** (M-Pesa Ratiba) for subscriptions; today a renewal is a fresh purchase.
+4. **Document upload for business verification** (today an admin checks the registration number out-of-band) and dispute evidence attachments.
+5. Multi-unit and combinatorial auctions (winner-determination solver), per-IP sign-in limits, and a proper billing/accounting export.
 
 ## Assumptions & known limits
 
 * Amounts are integer **KES**; the spec does not define a currency.
-* State is an in-memory store with atomic JSON snapshots (a stand-in for Postgres + Redis, spec §15). Single process.
+* The engine's working set is in memory and flushed to the database about every second, so a hard crash can lose at most ~1 second of *non-money* state
+  (money is transactional). Single active engine process (enforced by the writer lease).
 * The Execution Engine calls the auction engine in-process. The internal FastMCP server (`build_server(app, internal=True)`)
   exposes the same operations for a future out-of-process harness.
 * Fall-through fault assumption: a `FELL_THROUGH`/`NO_RESPONSE` report counts against the reporter's counterparty.

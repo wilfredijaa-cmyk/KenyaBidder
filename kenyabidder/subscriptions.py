@@ -22,18 +22,21 @@ class SubscriptionService:
         s = self.store.subscriptions.get(user_id)
         return s if s and s["status"] == "ACTIVE" and s["current_period_end"] > self.clock.now() else None
 
-    def activate(self, order: dict) -> dict:
-        """Called once an order for a plan pack is PAID. Idempotent per order."""
+    def activate(self, order: dict, *, at: int | None = None) -> dict | None:
+        """Called once an order for a plan pack is PAID. Idempotent per order. ``at`` = when it was paid (recovery only)."""
         plan = order["data"]["plan"]
         now = self.clock.now()
         s = self.store.subscriptions.get(order["user_id"])
         if s and order["id"] in s["order_ids"]:
             return s
+        if at is not None and at + plan["days"] * DAY_MS <= now:
+            return None  # a recovered order whose days have already run out: nothing left to grant
+        base = now if at is None else at
         if s and s["status"] == "ACTIVE" and s["current_period_end"] > now:
             s["current_period_end"] += plan["days"] * DAY_MS  # buying early extends, never wastes days
             s["renewals"] += 1
         else:
-            s = {"user_id": order["user_id"], "started_at": now, "current_period_end": now + plan["days"] * DAY_MS, "renewals": 0,
+            s = {"user_id": order["user_id"], "started_at": base, "current_period_end": base + plan["days"] * DAY_MS, "renewals": 0,
                  "order_ids": [], "reminded_for": None}
             self.store.subscriptions[order["user_id"]] = s
         s.update(status="ACTIVE", plan_name=order["pack_name"], plan=dict(plan), reminded_for=None)
@@ -42,10 +45,26 @@ class SubscriptionService:
         return s
 
     def cancel_for_order(self, order: dict) -> None:
+        """A refund takes back only the days that order bought; other paid orders keep theirs."""
         s = self.store.subscriptions.get(order["user_id"])
-        if s and order["id"] in s["order_ids"]:
+        if not s or order["id"] not in s["order_ids"]:
+            return
+        s["order_ids"] = [i for i in s["order_ids"] if i != order["id"]]
+        s["current_period_end"] -= order["data"]["plan"]["days"] * DAY_MS
+        if not s["order_ids"] or s["current_period_end"] <= self.clock.now():
             s["status"] = "CANCELLED"
             self._tell(order["user_id"], "Your plan was cancelled after a refund.")
+        else:
+            self._tell(order["user_id"], f"A refund took back {order['data']['plan']['days']} days — your plan now ends on {self._date(s['current_period_end'])}.")
+
+    def recover(self, paid_plan_orders: list[dict]) -> int:
+        """Safety net: a PAID plan order whose activation was lost (crash between the payment commit and the plan) is activated now."""
+        n = 0
+        known = {i for s in self.store.subscriptions.values() for i in s["order_ids"]}
+        for o in paid_plan_orders:
+            if o["id"] not in known and o["data"].get("plan") and self.activate(o, at=o["updated_at"]):
+                n += 1
+        return n
 
     def tick(self) -> int:
         """Maintenance: expire lapsed plans, remind those about to lapse. Returns how many changed."""

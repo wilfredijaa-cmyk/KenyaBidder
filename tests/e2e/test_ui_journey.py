@@ -34,7 +34,7 @@ async def list_english(s, title, *, category="electronics", reserve=1000, start=
 async def test_seller_listing_to_match_and_contact_reveal(make_session):
     seller, buyer = await make_session("Seller"), await make_session("Buyer")
     await create_agent(seller, "seller")
-    await save_rules(seller, **{"Reserve floor (KES) — never list below this": 500})
+    await save_rules(seller, **{"Price floor (KES) — never list or quote below this": 500})
     await create_agent(buyer, "buyer")
     await save_rules(buyer, **{"Budget ceiling per bid (KES)": 5000, "Category": "cat-journey"})
     await buyer.p.get_by_role("tab", name="Brain, tools & knowledge").click()
@@ -110,7 +110,7 @@ async def test_llm_tools_and_kb_end_to_end(make_session, mock_llm):
     await admin.p.get_by_role("button", name="Add", exact=True).click()
     await admin.p.wait_for_selector("text=1 doc(s)")
     await admin.p.get_by_role("tab", name="MCP servers").click()
-    await admin.p.wait_for_selector("text=7 tool(s) discovered")
+    await admin.p.wait_for_selector("text=8 tool(s) discovered")
 
     seller, buyer = await make_session("LlmSeller"), await make_session("LlmBuyer")
     await create_agent(seller, "seller")

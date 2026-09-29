@@ -85,3 +85,26 @@ async def test_readiness_and_metrics(tmp_path):
     await rt.stop()
     line = metrics.JsonFormatter().format(__import__("logging").LogRecord("x", 20, "f", 1, "hello %s", ("w",), None))
     assert json.loads(line)["msg"] == "hello w"
+
+
+async def test_losing_the_writer_lease_stops_writes_and_flips_readiness(tmp_path):
+    import json, time
+    from kenyabidder import metrics
+    rt = Runtime(data_file=str(tmp_path / "state.json"))
+    rt.LEASE_RENEW_EVERY = 1
+    rt.start()
+    await asyncio.sleep(0.1)
+    # another process force-takes the lease (e.g. an operator ran a second instance with KENYABIDDER_FORCE_LEASE=1)
+    rt.db.execute("UPDATE kv SET body = ? WHERE key = 'writer_lease'", (json.dumps({"owner": "someone-else", "expires": int(time.time() * 1000) + 60_000}),))
+    for _ in range(30):
+        if rt.lost_lease:
+            break
+        await asyncio.sleep(0.2)
+    assert rt.lost_lease
+    ok, checks = metrics.readiness(rt)
+    assert not ok and checks["writer_lease"] is False
+    before = rt.db.scalar("SELECT count(*) FROM docs")
+    rt.app.agents.create_user(name="Late", password="password123")
+    await asyncio.sleep(1.5)
+    assert rt.db.scalar("SELECT count(*) FROM docs") == before  # nothing written after the lease was lost
+    await rt.stop()

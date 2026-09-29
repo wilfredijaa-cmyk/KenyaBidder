@@ -253,6 +253,10 @@ class BillingService:
             raise forbidden("NOT_YOUR_ORDER", "that order belongs to another user")
         return o
 
+    def paid_plan_orders(self, since_ms: int) -> list[dict]:
+        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE status='PAID' AND updated_at>=? AND data LIKE ?", (since_ms, '%"plan"%'))
+        return [_row(r) for r in rows]
+
     def list_orders(self, *, user_id: str | None = None, status: str | None = None, limit: int = 100) -> list[dict]:
         where, args = [], []
         if user_id:
@@ -369,6 +373,8 @@ class BillingService:
                 raise not_found("ORDER_NOT_FOUND", "order not found")
             o = _row(row)
             if o["status"] == "PAID":
+                if self.on_paid and o["data"].get("plan"):
+                    self.on_paid(o)  # idempotent: also heals a plan whose first activation was interrupted
                 return {**o, "already_paid": True}
             recoverable = ("PENDING", "AWAITING_REVIEW") + (("EXPIRED", "CANCELLED") if o["provider"] == "mpesa" else ())  # a late STK approval still counts
             if o["status"] not in recoverable:
@@ -396,8 +402,9 @@ class BillingService:
             raise bad("INVALID_STATE", "only paid orders can be refunded")
         if not (reason or "").strip():
             raise bad("REASON_REQUIRED", "a reason is required")
-        reclaim = min(o["tokens"], self.db.balance(o["user_id"], o["llm_id"]))
         with self.db.tx() as c:
+            # read the balance INSIDE the transaction: tokens spent a moment ago must not turn the reclaim into a CHECK violation
+            reclaim = min(o["tokens"], c.scalar("SELECT balance FROM balances WHERE user_id=? AND llm_id=?", (o["user_id"], o["llm_id"]), 0))
             if not c.execute("UPDATE orders SET status='REFUNDED', updated_at=?, note=? WHERE id=? AND status='PAID'",
                              (self.clock.now(), f"refunded: {reason.strip()[:150]} (reclaimed {reclaim:,} unspent tokens)", order_id)):
                 raise bad("INVALID_STATE", "order is no longer refundable")

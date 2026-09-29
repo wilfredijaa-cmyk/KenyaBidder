@@ -84,3 +84,20 @@ def test_the_only_administrator_cannot_delete_themselves(env):
     with pytest.raises(AppError) as e:
         env.privacy.delete_account(admin["id"], "password123")
     assert "only administrator" in e.value.message
+
+
+def test_deleted_users_notifications_do_not_come_back_from_the_database(env):
+    from kenyabidder.db import open_database
+    from kenyabidder.persist import StatePersistence
+    us, seller, ub, buyer, m = deal(env)
+    env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
+    env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
+    assert any(n["agent_id"] == buyer["agent_id"] for n in env.store.notifications)
+    db = open_database(":memory:")
+    p = StatePersistence(db)
+    p.flush_all(env.store)  # the notifications were durable before the deletion…
+    env.privacy.delete_account(ub["id"], "password123")
+    p.flush_all(env.store)
+    back = StatePersistence(db).load()  # …and are gone after a restart
+    assert not any(n["agent_id"] == buyer["agent_id"] for n in back.notifications)
+    assert "David" not in json.dumps(back.users) and back.users[ub["id"]]["phone"] is None

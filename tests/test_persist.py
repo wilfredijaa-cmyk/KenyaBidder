@@ -117,3 +117,27 @@ def test_legacy_snapshot_is_imported_once(db, tmp_path):
     assert got.users == {"u": {"id": "u"}} and not legacy.exists() and (tmp_path / "state.json.imported").exists()
     assert StatePersistence(db).load().users == {"u": {"id": "u"}}
     assert p.import_legacy_json(legacy) is None
+
+
+def test_any_non_append_change_to_a_log_is_made_durable(db):
+    """Mid-list removal, slice assignment, insert and sort all rewrite the durable copy — nothing stale can come back after a restart."""
+    s = Store()
+    s.notifications.extend({"i": i, "u": "a" if i % 2 else "b"} for i in range(300))
+    p = StatePersistence(db)
+    p.flush_all(s)
+    s.notifications[:] = [n for n in s.notifications if n["u"] == "a"]  # what privacy deletion does
+    p.flush_all(s)
+    assert [n["i"] for n in StatePersistence(db).load().notifications] == [i for i in range(300) if i % 2]
+    del s.notifications[10]  # removal in the middle
+    s.notifications.insert(5, {"i": -1, "u": "a"})
+    p.flush_all(s)
+    assert list(StatePersistence(db).load().notifications) == list(s.notifications)
+    s.notifications.sort(key=lambda n: -n["i"])
+    p.flush_all(s)
+    assert list(StatePersistence(db).load().notifications) == list(s.notifications)
+    del s.notifications[-3:]  # shrinking from the END
+    p.flush_all(s)
+    assert list(StatePersistence(db).load().notifications) == list(s.notifications)
+    s.notifications.clear()
+    p.flush_all(s)
+    assert list(StatePersistence(db).load().notifications) == []

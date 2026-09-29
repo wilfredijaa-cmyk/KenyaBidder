@@ -1,4 +1,5 @@
 """SMS/email one-time codes: phone & email verification, self-service password reset, alerts."""
+import asyncio
 import re
 
 import pytest
@@ -107,6 +108,7 @@ async def test_password_reset_via_verified_phone_and_sessions_end(env):
     assert env.agents.authenticate("Wanjiru", "password123")
     before = env.store.users[u["id"]]["session_version"] if "session_version" in env.store.users[u["id"]] else 0
     out = await env.verification.request_password_reset("wanjiru")
+    await asyncio.sleep(0.01)  # delivery is deliberately off the request path (no timing difference between real and invented accounts)
     code = last_code(env)
     with pytest.raises(AppError):
         env.verification.reset_password("Wanjiru", "123456" if code != "123456" else "654321", "brand-new-pass")
@@ -257,3 +259,27 @@ def test_env_configuration_picks_the_real_adapters(monkeypatch):
     assert AfricasTalkingSms.from_env().real and SmtpEmail.from_env().host == "smtp.example.com"
     monkeypatch.delenv("AT_API_KEY")
     assert AfricasTalkingSms.from_env() is None
+
+
+async def test_a_failed_reset_delivery_does_not_lock_the_user_out_of_retrying(make_env):
+    class Flaky:
+        name, real = "flaky", True
+
+        def __init__(self):
+            self.sent, self.fail = [], True
+
+        async def send(self, to, text):
+            if self.fail:
+                raise RuntimeError("gateway down")
+            self.sent.append(text)
+    sms = Flaky()
+    env = make_env(sms=sms)
+    u = user(env)
+    env.store.users[u["id"]]["phone_verified"] = True
+    await env.verification.request_password_reset("Wanjiru")
+    await asyncio.sleep(0.01)
+    assert not sms.sent
+    sms.fail = False
+    await env.verification.request_password_reset("Wanjiru")  # immediate retry works: no cooldown from the failed attempt
+    await asyncio.sleep(0.01)
+    assert len(sms.sent) == 1
