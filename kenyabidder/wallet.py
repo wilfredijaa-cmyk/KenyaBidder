@@ -260,6 +260,7 @@ class TokenMeter:
     def __init__(self, store, clock, db: WalletDB, llms, notify=None):
         self.store, self.clock, self.db, self.llms = store, clock, db, llms
         self.notify = notify or (lambda *a, **k: None)
+        self.limit_boost = None  # fn(user_id) -> int | None: hourly decision allowance granted by a subscription plan
         self._holds: dict[tuple[str, str], int] = {}
         self._low_notified: dict[tuple[str, str], int] = {}
         self._decisions: dict[str, list[int]] = {}
@@ -316,11 +317,18 @@ class TokenMeter:
         self._decisions[agent_id] = w
         return len(w) + self._inflight.get(agent_id, 0)
 
+    def hourly_limit(self, agent_id: str) -> int:
+        """Platform limit, raised by the owner's subscription plan (0 = unlimited stays unlimited)."""
+        base = self.store.settings.get("max_llm_decisions_per_hour", 60)
+        agent = self.store.agents.get(agent_id)
+        boost = self.limit_boost(agent["principal_user_id"]) if (self.limit_boost and agent) else None
+        return max(base, boost) if (base and boost) else base
+
     def begin_decision(self, agent_id: str) -> "Decision":
         """Call ONCE per LLM decision, before any provider call. In-flight decisions are counted immediately (so a burst of
         concurrent listings cannot slip past), but a decision only *spends* allowance when it actually reaches the LLM — being
         blocked for lack of tokens must not burn the hourly budget. Always call ``finish()`` on the returned Decision."""
-        limit = self.store.settings.get("max_llm_decisions_per_hour", 60)
+        limit = self.hourly_limit(agent_id)
         n = self.decisions_last_hour(agent_id)
         if limit and n >= limit:
             raise AgentRateLimited(n, limit)
@@ -361,7 +369,7 @@ class TokenMeter:
         cap = agent["config"].get("max_tokens_per_day")
         used24 = self.db.used_since(agent["agent_id"], self.clock.now() - 24 * 3600_000) if cap else 0
         cap_hit = bool(cap) and used24 >= cap
-        limit = self.store.settings.get("max_llm_decisions_per_hour", 60)
+        limit = self.hourly_limit(agent["agent_id"])
         rate_hit = bool(limit) and self.decisions_last_hour(agent["agent_id"]) >= limit
         return {"ok": ok and not cap_hit and not rate_hit, "rate_limited": rate_hit, "llms": rows, "cap": cap, "used_24h": used24, "cap_reached": cap_hit,
                 "avg_decision_tokens": self.db.recent_usage_avg(agent["agent_id"])}

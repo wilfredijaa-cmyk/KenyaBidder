@@ -673,7 +673,7 @@ def billing_panel():
 def pack_dialog(done) -> None:
     c = core()
     llms = [e for e in c.llms.list() if c.meter.is_metered(e)]
-    f = {"name": "", "llm_id": llms[0]["id"] if llms else None, "tokens": 100_000, "price": 500, "desc": ""}
+    f = {"name": "", "llm_id": llms[0]["id"] if llms else None, "tokens": 100_000, "price": 500, "desc": "", "plan": False, "days": 30, "agents": 25, "dph": 240}
     with ui.dialog() as d, ui.card().classes("w-96 max-w-full"):
         ui.label("Add token pack").classes("text-lg font-medium")
         if not llms:
@@ -683,10 +683,17 @@ def pack_dialog(done) -> None:
         ui.number("Tokens", value=f["tokens"], min=1000, precision=0, on_change=lambda e: f.update(tokens=int(e.value or 0))).classes("w-full")
         ui.number("Price (KES)", value=f["price"], min=10, precision=0, on_change=lambda e: f.update(price=int(e.value or 0))).classes("w-full")
         ui.input("Description (optional)", on_change=lambda e: f.update(desc=e.value)).classes("w-full")
+        sw = ui.switch("Subscription plan (also buys days of perks)", value=False, on_change=lambda e: (f.update(plan=e.value), perks.set_visibility(e.value)))
+        with ui.column().classes("w-full gap-1") as perks:
+            ui.number("Days of access", value=f["days"], min=1, max=366, precision=0, on_change=lambda e: f.update(days=int(e.value or 1))).classes("w-full")
+            ui.number("Agents allowed (platform default applies below this)", value=f["agents"], min=1, precision=0, on_change=lambda e: f.update(agents=int(e.value or 1))).classes("w-full")
+            ui.number("LLM decisions per agent per hour", value=f["dph"], min=1, precision=0, on_change=lambda e: f.update(dph=int(e.value or 1))).classes("w-full")
+        perks.set_visibility(False)
 
         @guard_admin
         def save():
-            c.billing.add_pack(admin_user(), name=f["name"], llm_id=f["llm_id"], tokens=f["tokens"], price_kes=f["price"], description=f["desc"])
+            plan = {"days": f["days"], "max_agents": f["agents"], "decisions_per_hour": f["dph"]} if f["plan"] else None
+            c.billing.add_pack(admin_user(), name=f["name"], llm_id=f["llm_id"], tokens=f["tokens"], price_kes=f["price"], description=f["desc"], plan=plan)
             d.close()
             done()
         with ui.row().classes("justify-end w-full"):

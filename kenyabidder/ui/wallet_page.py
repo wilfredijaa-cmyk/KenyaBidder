@@ -74,8 +74,19 @@ def wallet_page():
                             badge("your agents are waiting for tokens", "negative")
         balances()
 
+        sub = c.store.subscriptions.get(user["id"])
+        if sub and sub["status"] in ("ACTIVE", "EXPIRED"):
+            with ui.card().classes("w-full border " + ("border-primary" if c.subscriptions.active(user["id"]) else "border-amber-500")):
+                live = bool(c.subscriptions.active(user["id"]))
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"{sub['plan_name']} plan").classes("font-medium")
+                    badge("active" if live else "ended", "positive" if live else "warning")
+                ui.label(("Renews by buying it again — days stack. Ends " if live else "Ended ") + fmt_datetime(sub["current_period_end"]) + ".").classes("text-sm opacity-70")
+                pl = sub["plan"]
+                ui.label(f"Up to {pl.get('max_agents') or 'the default number of'} agents · {pl.get('decisions_per_hour') or 'default'} LLM decisions per agent per hour").classes("text-xs opacity-70")
+
         # ---- buy
-        ui.label("Buy tokens").classes("text-lg font-medium mt-2")
+        ui.label("Buy tokens & plans").classes("text-lg font-medium mt-2")
         methods = c.billing.methods()
         packs = c.billing.list_packs(enabled_only=True)
         if not packs:
@@ -89,6 +100,10 @@ def wallet_page():
                     ui.label(p["name"]).classes("font-medium")
                     ui.label(f"{p['tokens']:,} tokens").classes("text-xl font-bold")
                     ui.label(f"for {llm['name']} · KES {p['price_kes']:,} · ≈ KES {p['price_kes'] / p['tokens'] * 1000:.2f} per 1k").classes("text-xs opacity-70")
+                    if p.get("plan"):
+                        pl = p["plan"]
+                        badge(f"{pl['days']}-day plan", "primary")
+                        ui.label(" · ".join(x for x in (f"up to {pl['max_agents']} agents" if pl.get("max_agents") else "", f"{pl['decisions_per_hour']} decisions/agent/hour" if pl.get("decisions_per_hour") else "") if x)).classes("text-xs")
                     if p["description"]:
                         ui.label(p["description"]).classes("text-sm")
                     if methods:
@@ -218,6 +233,33 @@ def buy_dialog(user: dict, pack: dict, methods: list[dict], done) -> None:
 
 # ----------------------------------------------------------------------------- profile
 
+def data_card(user: dict) -> None:
+    """Your data, your call (Kenya Data Protection Act 2019): download a copy, or delete the account."""
+    from .common import logout
+    c = core()
+    with ui.card().classes("w-full max-w-xl"):
+        ui.label("Your data").classes("font-medium")
+        ui.label("You can download everything we hold about you, or delete your account. Payment and token-ledger records must be kept "
+                 "by law and stay under an anonymous ID.").classes("text-xs opacity-70")
+        ui.button("Download my data (JSON)", icon="download",
+                  on_click=lambda: ui.download.content(c.privacy.export_json(user["id"]).encode(), "kenyabidder-my-data.json")).props("outline no-caps")
+        with ui.expansion("Delete my account", icon="delete_forever").classes("w-full border rounded"):
+            with ui.column().classes("w-full gap-2 p-2"):
+                blockers = c.privacy.blockers(user["id"])
+                for b in blockers:
+                    ui.label(f"• Not yet: {b}").classes("text-sm text-amber-700")
+                held = sum(v for v in c.wallet.balances(user["id"]).values() if v > 0)
+                pw = ui.input("Your password", password=True, password_toggle_button=True).classes("w-full")
+                forfeit = ui.checkbox(f"I understand my {held:,} remaining tokens are forfeited") if held else None
+
+                @guard
+                def delete():
+                    c.privacy.delete_account(user["id"], pw.value, forfeit_tokens=bool(forfeit and forfeit.value))
+                    ui.notify("Your account was deleted", type="positive")
+                    logout()
+                ui.button("Delete my account permanently", icon="delete_forever", on_click=delete).props("unelevated color=negative no-caps")
+
+
 def business_card(user: dict) -> None:
     """Apply for the verified-business badge; an administrator checks the registration out-of-band (iTax / BRS / eCitizen)."""
     from ..trust import KINDS
@@ -328,5 +370,6 @@ def profile_page():
                 new.set_value("")
                 ui.notify("Password changed", type="positive")
             ui.button("Change password", on_click=change).props("outline")
+        data_card(user)
         ui.label(f"Accepted the Terms & Privacy Notice (version {user.get('terms_version', '-')}). ").classes("text-xs opacity-60")
         ui.link("Read the terms", "/terms", new_tab=True).classes("text-xs")

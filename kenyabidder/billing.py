@@ -47,6 +47,7 @@ class BillingService:
         self.store, self.clock, self.db, self.llms, self.meter = store, clock, db, llms, meter
         self.notify = notify or (lambda *a, **k: None)
         self.mpesa, self.dev_payments, self.on_credit = mpesa, dev_payments, on_credit
+        self.on_paid = self.on_refund = None  # fn(order): subscription plans activate / cancel here
         self.grant_gate = None  # fn(user) -> bool; set by the composition root (verified phone required?)
         self.sql = db.database  # orders / claims are plain SQL on the same database as the ledger
 
@@ -98,6 +99,24 @@ class BillingService:
 
     # ------------------------------------------------------------------ packs
 
+    @staticmethod
+    def _validate_plan(plan) -> dict | None:
+        """A pack with a plan is a subscription: it also buys ``days`` of perks (more agents, a higher LLM decision allowance)."""
+        if plan in (None, {}):
+            return None
+        if not isinstance(plan, dict):
+            raise bad("INVALID_PLAN", "plan must be an object")
+
+        def whole(key, lo, hi, optional):
+            v = plan.get(key)
+            if v is None and optional:
+                return None
+            if not (isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi):
+                raise bad("INVALID_PLAN", f"plan.{key} must be a whole number from {lo} to {hi}")
+            return v
+        return {"days": whole("days", 1, 366, False), "max_agents": whole("max_agents", 1, 200, True),
+                "decisions_per_hour": whole("decisions_per_hour", 1, 10_000, True)}
+
     def _validate_pack(self, name, llm_id, tokens, price_kes) -> None:
         if not str(name or "").strip():
             raise bad("INVALID_PACK", "name is required")
@@ -109,10 +128,11 @@ class BillingService:
         if not (isinstance(price_kes, int) and not isinstance(price_kes, bool) and MIN_PRICE_KES <= price_kes <= MAX_PRICE_KES):
             raise bad("INVALID_PACK", f"price must be a whole number of KES between {MIN_PRICE_KES} and {MAX_PRICE_KES:,}")
 
-    def add_pack(self, admin: dict, *, name: str, llm_id: str, tokens: int, price_kes: int, description: str = "", enabled: bool = True) -> dict:
+    def add_pack(self, admin: dict, *, name: str, llm_id: str, tokens: int, price_kes: int, description: str = "", enabled: bool = True,
+                 plan: dict | None = None) -> dict:
         self._validate_pack(name, llm_id, tokens, price_kes)
         p = {"id": str(uuid.uuid4()), "name": name.strip()[:60], "llm_id": llm_id, "tokens": tokens, "price_kes": price_kes,
-             "description": (description or "").strip()[:200], "enabled": enabled, "created_at": self.clock.now()}
+             "description": (description or "").strip()[:200], "enabled": enabled, "created_at": self.clock.now(), "plan": self._validate_plan(plan)}
         self.store.packs[p["id"]] = p
         self.log_admin(admin, "add_pack", pack=p["name"], tokens=tokens, price_kes=price_kes)
         return p
@@ -121,6 +141,8 @@ class BillingService:
         p = self.get_pack(pack_id)
         merged = {**p, **{k: v for k, v in patch.items() if k in ("name", "llm_id", "tokens", "price_kes", "description", "enabled") and v is not None}}
         self._validate_pack(merged["name"], merged["llm_id"], merged["tokens"], merged["price_kes"])
+        if "plan" in patch:
+            merged["plan"] = self._validate_plan(patch["plan"])
         merged["name"], merged["description"] = merged["name"].strip()[:60], (merged["description"] or "").strip()[:200]
         p.update(merged)
         self.log_admin(admin, "update_pack", pack=p["name"], tokens=p["tokens"], price_kes=p["price_kes"], enabled=p["enabled"])
@@ -247,8 +269,10 @@ class BillingService:
             open_n = c.scalar("SELECT COUNT(*) FROM orders WHERE user_id=? AND status IN ('PENDING','AWAITING_REVIEW')", (user["id"],), 0)
             if open_n >= self.MAX_OPEN_ORDERS_PER_USER:
                 raise AppError("TOO_MANY_ORDERS", f"you already have {open_n} unfinished orders — finish or cancel one first", 429)
-            c.execute("INSERT INTO orders(id,user_id,pack_id,pack_name,llm_id,tokens,amount_kes,provider,status,phone,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (oid, user["id"], pack["id"], pack["name"], pack["llm_id"], pack["tokens"], pack["price_kes"], provider, status, phone, now, now))
+            import json
+            c.execute("INSERT INTO orders(id,user_id,pack_id,pack_name,llm_id,tokens,amount_kes,provider,status,phone,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (oid, user["id"], pack["id"], pack["name"], pack["llm_id"], pack["tokens"], pack["price_kes"], provider, status, phone, now, now,
+                       json.dumps({"plan": pack.get("plan")} if pack.get("plan") else {})))  # snapshot: the plan bought is the plan delivered
         return self.get_order(oid)
 
     def _set_status(self, order_id: str, frm: tuple[str, ...], to: str, **fields) -> bool:
@@ -361,6 +385,8 @@ class BillingService:
         paid = self.get_order(order_id)
         name = self.store.llms.get(paid["llm_id"], {}).get("name", "LLM")
         self._credited(paid["user_id"], paid["llm_id"], f"Payment received — {paid['tokens']:,} {name} tokens added to your wallet.")
+        if self.on_paid and paid["data"].get("plan"):
+            self.on_paid(paid)
         return paid
 
     def admin_refund(self, admin: dict, order_id: str, reason: str) -> dict:
@@ -380,6 +406,8 @@ class BillingService:
                 self.db._write(c, user_id=o["user_id"], llm_id=o["llm_id"], kind="ADJUST", delta=-reclaim, ref=f"refund:{order_id}",
                                meta={"reason": f"refund of {o['reference']}", "by": admin["name"]})
         self.log_admin(admin, "refund_order", order=o["reference"], amount_kes=o["amount_kes"], reclaimed=reclaim, reason=reason)
+        if self.on_refund and o["data"].get("plan"):
+            self.on_refund(o)
         return self.get_order(order_id)
 
     # ------------------------------------------------------------------ M-Pesa callbacks & reconciliation

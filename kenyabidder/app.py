@@ -25,6 +25,8 @@ from .llm.registry import LlmRegistry
 from .errors import AppError
 from .matches import MatchService
 from .messaging import Messenger
+from .privacy import PrivacyService
+from .subscriptions import SubscriptionService
 from .trust import TrustService
 from .verification import VerificationService
 from .mcpx.manager import McpManager
@@ -86,6 +88,12 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
     app.billing = BillingService(store, clock, wallet, llms, meter, notify, mpesa_client, dev_payments, on_credit)
     app.agents.on_identity_change = app.billing.grant_signup_tokens
     app.trust = TrustService(store, clock, matches, notify)
+    app.subscriptions = SubscriptionService(store, clock, notify)
+    app.privacy = PrivacyService(store, clock, wallet, app.billing, app.agents)
+    app.billing.on_paid = app.subscriptions.activate
+    app.billing.on_refund = app.subscriptions.cancel_for_order
+    app.agents.agent_limit = app.subscriptions.max_agents
+    meter.limit_boost = app.subscriptions.decisions_per_hour
     app.messenger = messenger
     app.verification = VerificationService(store, clock, messenger, app.agents)
     app.billing.grant_gate = lambda u: not app.verification.phone_required() or bool(u.get("phone_verified"))

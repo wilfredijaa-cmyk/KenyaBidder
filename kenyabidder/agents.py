@@ -58,6 +58,7 @@ class AgentService:
     def __init__(self, store, clock, execution=None, llms=None, mcps=None, kbs=None):
         self.store, self.clock = store, clock
         self.execution, self.llms, self.mcps, self.kbs = execution, llms, mcps, kbs
+        self.agent_limit = None  # fn(user_id) -> int (0 = unlimited); set by the composition root from the subscription plan
         self.on_identity_change = None  # set by the composition root: claims the once-per-phone signup token grant
 
     # ---------- users ----------
@@ -228,6 +229,9 @@ class AgentService:
             raise not_found("USER_NOT_FOUND", "user not found")
         if type not in ("SELLER", "BIDDER"):
             raise bad("INVALID_AGENT_TYPE", "type must be SELLER or BIDDER")
+        limit = self.agent_limit(user_id) if self.agent_limit else 0
+        if limit and len(self.agents_for(user_id)) >= limit:
+            raise AppError("AGENT_LIMIT", f"you can run up to {limit} agents — a subscription plan raises this limit", 403)
         agent = {
             "agent_id": str(uuid.uuid4()), "agent_type": type, "principal_user_id": user_id, "channel_identity_map": [],
             "constraints": self._constraints(type, constraints or {}),
