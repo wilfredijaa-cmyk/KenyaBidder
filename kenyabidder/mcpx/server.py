@@ -59,6 +59,16 @@ def build_server(app, *, internal: bool = False, auth=None) -> FastMCP:
 
     @mcp.tool(tags={"read", "auction"})
     @_guard
+    def list_open_rfqs(
+        category: Annotated[str | None, Field(description="Product category, e.g. 'electronics'")] = None,
+        min_quantity: int | None = None,
+        q: Annotated[str | None, Field(description="Keyword in title/description")] = None,
+    ) -> list[dict]:
+        """Open requests for quotes (reverse auctions): buyers who want something supplied, with their maximum price."""
+        return engine.list_active_auctions(category=category, min_quantity=min_quantity, q=q, direction="REVERSE")
+
+    @mcp.tool(tags={"read", "auction"})
+    @_guard
     def get_auction_detail(auction_id: str) -> dict:
         """Public state of one auction: price, bids (sealed bids hidden), time remaining, rules."""
         return engine.get_auction_detail(auction_id)
@@ -107,6 +117,13 @@ def build_server(app, *, internal: bool = False, auth=None) -> FastMCP:
         return engine.create_listing(seller_agent_id=seller_agent_id, product_spec=product_spec, auction_type=auction_type,
                                      duration_ms=duration_ms, reserve_price=reserve_price, start_price=start_price,
                                      min_increment=min_increment, dutch=dutch)
+
+    @mcp.tool(tags={"internal", "auction"})
+    @_guard
+    def create_rfq(buyer_agent_id: str, product_spec: dict, auction_type: str, duration_ms: int, max_price: int, min_decrement: int = 1) -> dict:
+        """Post a request for quotes (reverse auction) on behalf of a buyer agent: suppliers bid the price down from max_price."""
+        return engine.create_rfq(buyer_agent_id=buyer_agent_id, product_spec=product_spec, auction_type=auction_type,
+                                 duration_ms=duration_ms, max_price=max_price, min_decrement=min_decrement)
 
     @mcp.tool(tags={"internal", "auction"})
     @_guard

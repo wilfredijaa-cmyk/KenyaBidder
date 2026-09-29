@@ -32,16 +32,19 @@ class MatchService:
             if m["auction_id"] == auction_id:
                 return m  # idempotent
         now = self.clock.now()
-        m = {"match_id": str(uuid.uuid4()), "auction_id": auction_id, "seller_agent_id": a["seller_agent_id"],
-             "buyer_agent_id": a["result"]["winner_agent_id"],
+        # roles follow the money: in an RFQ the poster is the BUYER and the lowest-quoting supplier is the SELLER
+        reverse = a.get("direction") == "REVERSE"
+        seller_id, buyer_id = (a["result"]["winner_agent_id"], a["poster_agent_id"]) if reverse else (a["seller_agent_id"], a["result"]["winner_agent_id"])
+        m = {"match_id": str(uuid.uuid4()), "auction_id": auction_id, "seller_agent_id": seller_id,
+             "buyer_agent_id": buyer_id, "direction": "REVERSE" if reverse else "FORWARD",
              "agreed_terms": {"price": a["result"]["price"], "quantity": a["product_spec"]["quantity"],
                               "title": a["product_spec"]["title"], "delivery_terms": None},
              "status": "PROPOSED", "confirmations": {"seller_at": None, "buyer_at": None},
              "contact_reveal": None, "outcome_reports": [], "fault_agent_ids": [], "created_at": now, "updated_at": now}
         self.store.matches[m["match_id"]] = m
         text = f"Match created for \"{a['product_spec']['title']}\" at {a['result']['price']} KES. Confirm to exchange contact details"
-        self.notify(m["seller_agent_id"], "match", f"{text} — you are the seller.", match_id=m["match_id"])
-        self.notify(m["buyer_agent_id"], "match", f"{text} — you won this auction.", match_id=m["match_id"])
+        self.notify(m["seller_agent_id"], "match", f"{text} — you are the seller" + (" (your quote won the RFQ)." if reverse else "."), match_id=m["match_id"])
+        self.notify(m["buyer_agent_id"], "match", f"{text} — " + ("the lowest supplier quote on your RFQ." if reverse else "you won this auction."), match_id=m["match_id"])
         return m
 
     def _side(self, m: dict, agent_id: str) -> str:

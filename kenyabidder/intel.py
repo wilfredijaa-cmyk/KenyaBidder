@@ -16,10 +16,10 @@ class MarketIntel:
     def __init__(self, store, clock, engine):
         self.store, self.clock, self.engine = store, clock, engine
 
-    def historical_clearing_prices(self, category: str, auction_type: str | None = None, since_ms: int | None = None) -> dict:
+    def historical_clearing_prices(self, category: str, auction_type: str | None = None, since_ms: int | None = None, direction: str = "FORWARD") -> dict:
         cat = (category or "").lower()
         since = self.clock.now() - since_ms if since_ms is not None else float("-inf")
-        rows = [r for r in self.store.market_history if r["category"] == cat and (not auction_type or r["auction_type"] == auction_type) and r["at"] >= since]
+        rows = [r for r in self.store.market_history if r["category"] == cat and bool(r.get("reverse")) == (direction == "REVERSE") and (not auction_type or r["auction_type"] == auction_type) and r["at"] >= since]
         prices = sorted(r["price"] for r in rows)
         units = sorted(r["price"] / max(1, r.get("quantity") or 1) for r in rows)  # price per unit: lots of different sizes are comparable
         return {"category": cat, "count": len(prices), "min": prices[0] if prices else None, "p25": _pct(prices, 0.25),
@@ -30,7 +30,7 @@ class MarketIntel:
         cat = (category or "").lower()
         active = bids = 0
         for a in self.store.auctions.values():
-            if a["product_spec"]["category"].lower() == cat and is_open(a):
+            if a["product_spec"]["category"].lower() == cat and is_open(a) and a.get("direction", "FORWARD") == "FORWARD":
                 active += 1
                 bids += len(a["bids"])
         watchers = sum(1 for ag in self.store.agents.values()

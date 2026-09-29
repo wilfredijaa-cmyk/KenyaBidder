@@ -4,7 +4,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from ..agents import ADVISORS, STRATEGIES
-from ..engine import AUCTION_TYPES
+from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .common import badge, core, empty, flash, frame, guard, kes, pretty, require_user, set_active_agent
 
 
@@ -104,9 +104,18 @@ def rules_tab(agent: dict) -> None:
             ui.number("Budget ceiling per bid (KES)", value=f["ceiling"], min=1, precision=0, on_change=lambda e: f.update(ceiling=int(e.value or 0))).classes("w-64")
             ui.number("Ask me before bidding above this % of the ceiling", value=f["esc"], min=1, max=100, on_change=lambda e: f.update(esc=e.value)).classes("w-96")
         else:
-            ui.number("Reserve floor (KES) — never list below this", value=f["floor"], min=0, precision=0, on_change=lambda e: f.update(floor=int(e.value or 0))).classes("w-96")
-        ui.select({t: pretty(t) for t in AUCTION_TYPES}, value=f["types"], multiple=True, label="Auction types this agent may " + ("join without asking" if role == "BIDDER" else "list"),
+            ui.number("Price floor (KES) — never list or quote below this", value=f["floor"], min=0, precision=0, on_change=lambda e: f.update(floor=int(e.value or 0))).classes("w-96")
+        type_opts = {t: pretty(t) for t in (FORWARD_TYPES if role == "BIDDER" else AUCTION_TYPES)}
+        ui.select(type_opts, value=[t for t in f["types"] if t in type_opts], multiple=True,
+                  label="Auction types this agent may " + ("join without asking" if role == "BIDDER" else "list or quote on"),
                   on_change=lambda e: f.update(types=e.value)).props("use-chips").classes("w-full")
+        if role == "SELLER":
+            ui.label("Which buyer requests (RFQs) should it quote on?").classes("font-medium mt-2")
+            ui.switch("Quote automatically on new matching RFQs", value=f["auto"], on_change=lambda e: f.update(auto=e.value))
+            with ui.row().classes("w-full"):
+                ui.input("Category", value=f["cat"], placeholder="electronics", on_change=lambda e: f.update(cat=e.value)).classes("w-56")
+                ui.input("Keywords (comma separated)", value=f["kw"], on_change=lambda e: f.update(kw=e.value)).classes("grow")
+                ui.number("Min quantity", value=f["minq"], min=1, precision=0, on_change=lambda e: f.update(minq=int(e.value or 1))).classes("w-36")
         if role == "BIDDER":
             ui.label("What should it hunt for?").classes("font-medium mt-2")
             ui.switch("Bid automatically on new matching listings", value=f["auto"], on_change=lambda e: f.update(auto=e.value))
@@ -129,8 +138,9 @@ def rules_tab(agent: dict) -> None:
                 watch = {"category": f["cat"], "keywords": [k.strip() for k in f["kw"].split(",") if k.strip()], "min_quantity": f["minq"]} if f["cat"].strip() or f["kw"].strip() else None
                 core().agents.update(agent["agent_id"], constraints=constraints, memory={"auto_bid": f["auto"], "watch": watch})
             else:
+                watch = {"category": f["cat"], "keywords": [k.strip() for k in f["kw"].split(",") if k.strip()], "min_quantity": f["minq"]} if f["cat"].strip() or f["kw"].strip() else None
                 core().agents.update(agent["agent_id"], constraints={"reserve_floor": f["floor"], "authorized_auction_types": f["types"]},
-                                     memory={"auto_relist": {"max_relists": f["maxr"], "discount_pct": f["disc"]} if f["relist"] else None, "daily_summary": f["summary"]})
+                                     memory={"auto_bid": f["auto"], "watch": watch, "auto_relist": {"max_relists": f["maxr"], "discount_pct": f["disc"]} if f["relist"] else None, "daily_summary": f["summary"]})
             ui.notify("Saved", type="positive")
         ui.button("Save rules", icon="save", on_click=save).props("unelevated color=primary").classes("mt-2")
 
@@ -147,6 +157,8 @@ def brain_tab(agent: dict) -> None:
             llm_opts[lid] = f"{core().store.llms[lid]['name']} (disabled)"
     st = {"cap": cfg.get("max_tokens_per_day"), "llm": cfg["llm_id"] or "", "algos": {t: dict(v) for t, v in cfg["algorithms"].items()}, "advisor": dict(cfg["advisor"] or {"strategy": "rules", "llm_id": None}),
           "tools": set(cfg["tools"]), "kbs": set(cfg["kb_ids"]), "steps": cfg["max_tool_steps"]}
+    for t in (FORWARD_TYPES if role == "BIDDER" else REVERSE_TYPES):
+        st["algos"].setdefault(t, {"strategy": "heuristic", "llm_id": None})  # agents created before RFQs existed
 
     with ui.card().classes("w-full"):
         ui.label("Brain").classes("font-medium")
@@ -154,17 +166,16 @@ def brain_tab(agent: dict) -> None:
         if not llms:
             ui.label(f"No LLMs are enabled for {role.lower()} agents yet. An administrator can add one under Admin → LLMs. Deterministic algorithms (baseline, heuristic) work without one.").classes("text-sm text-amber-700")
         ui.select(llm_opts, value=st["llm"], label="Default LLM", on_change=lambda e: st.update(llm=e.value)).classes("w-96")
-        if role == "BIDDER":
-            with ui.column().classes("w-full gap-1"):
-                ui.label("Algorithm per auction type").classes("text-sm font-medium mt-2")
-                for t in AUCTION_TYPES:
-                    with ui.row().classes("w-full items-center gap-3"):
-                        ui.label(pretty(t).capitalize()).classes("w-44")
-                        ui.select({s: {"baseline": "baseline — bid up to ceiling", "heuristic": "heuristic — market-price valuation", "llm": "llm — tool-using model"}[s] for s in STRATEGIES},
-                                  value=st["algos"][t]["strategy"], on_change=lambda e, t=t: st["algos"][t].update(strategy=e.value)).classes("w-80")
-                        ui.select(llm_opts, value=st["algos"][t]["llm_id"] or "", label="LLM override",
-                                  on_change=lambda e, t=t: st["algos"][t].update(llm_id=e.value or None)).classes("w-72")
-        else:
+        with ui.column().classes("w-full gap-1"):
+            ui.label("Algorithm per auction type" if role == "BIDDER" else "Algorithm per RFQ type (how this agent quotes)").classes("text-sm font-medium mt-2")
+            for t in (FORWARD_TYPES if role == "BIDDER" else REVERSE_TYPES):
+                with ui.row().classes("w-full items-center gap-3"):
+                    ui.label(pretty(t).capitalize()).classes("w-44")
+                    ui.select({s: {"baseline": "baseline — bid up to ceiling", "heuristic": "heuristic — market-price valuation", "llm": "llm — tool-using model"}[s] for s in STRATEGIES},
+                              value=st["algos"][t]["strategy"], on_change=lambda e, t=t: st["algos"][t].update(strategy=e.value)).classes("w-80")
+                    ui.select(llm_opts, value=st["algos"][t]["llm_id"] or "", label="LLM override",
+                              on_change=lambda e, t=t: st["algos"][t].update(llm_id=e.value or None)).classes("w-72")
+        if role == "SELLER":
             with ui.row().classes("items-center gap-3"):
                 ui.select({s: {"rules": "rules — market statistics", "llm": "llm — tool-using model"}[s] for s in ADVISORS}, value=st["advisor"]["strategy"],
                           label="Listing advisor", on_change=lambda e: st["advisor"].update(strategy=e.value)).classes("w-80")
@@ -207,7 +218,7 @@ def brain_tab(agent: dict) -> None:
 
     @guard
     def save():
-        core().agents.update(agent["agent_id"], config={"llm_id": st["llm"] or None, "algorithms": st["algos"] if role == "BIDDER" else {},
+        core().agents.update(agent["agent_id"], config={"llm_id": st["llm"] or None, "algorithms": st["algos"],
                                                         "advisor": st["advisor"] if role == "SELLER" else None, "tools": sorted(st["tools"]),
                                                         "kb_ids": sorted(st["kbs"]), "max_tool_steps": st["steps"], "max_tokens_per_day": st["cap"]})
         ui.notify("Brain configuration saved", type="positive")

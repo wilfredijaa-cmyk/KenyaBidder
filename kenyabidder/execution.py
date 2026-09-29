@@ -7,6 +7,8 @@ Trigger kinds:
   ENGLISH_INCREMENTAL {max_bid, increment_pct, snipe_window_ms}
   DUTCH_ACCEPT        {threshold}        accept when price <= threshold
   SEALED_BID          {amount}
+  REVERSE_UNDERCUT    {min_price, decrement_pct, snipe_window_ms}   supplier: undercut the best quote, never below min_price
+  REVERSE_SEALED_BID  {amount}                                      supplier: one sealed quote
 """
 from __future__ import annotations
 
@@ -15,13 +17,15 @@ import math
 import time
 import uuid
 
-from .engine import effective_end, is_open
+from .engine import effective_end, is_open, is_reverse
 from .errors import bad, forbidden, not_found
 
 log = logging.getLogger("kenyabidder.execution")
 
 KIND_FOR_TYPE = {"ENGLISH": "ENGLISH_INCREMENTAL", "DUTCH": "DUTCH_ACCEPT",
-                 "FIRST_PRICE_SEALED": "SEALED_BID", "SECOND_PRICE_SEALED": "SEALED_BID"}
+                 "FIRST_PRICE_SEALED": "SEALED_BID", "SECOND_PRICE_SEALED": "SEALED_BID",
+                 "REVERSE_ENGLISH": "REVERSE_UNDERCUT", "REVERSE_SEALED": "REVERSE_SEALED_BID"}
+REPEATING = ("ENGLISH_INCREMENTAL", "REVERSE_UNDERCUT")  # kinds that keep bidding as the auction moves
 LIVE = ("ACTIVE", "AWAITING_APPROVAL")
 
 
@@ -56,13 +60,14 @@ class ExecutionEngine:
 
     def register_trigger(self, *, agent_id, auction_id, kind, params, reasoning="", source="strategy") -> dict:
         agent = self.store.agents.get(agent_id)
-        if not agent or agent["agent_type"] != "BIDDER":
-            raise bad("INVALID_AGENT", "bidder agent required")
-        if agent["status"] != "ACTIVE":
-            raise forbidden("AGENT_NOT_ACTIVE", "agent is not active")
         a = self.store.auctions.get(auction_id)
         if not a:
             raise not_found("AUCTION_NOT_FOUND", "auction not found")
+        want = "SELLER" if is_reverse(a) else "BIDDER"
+        if not agent or agent["agent_type"] != want:
+            raise bad("INVALID_AGENT", "supplier (seller) agent required for an RFQ" if want == "SELLER" else "bidder agent required")
+        if agent["status"] != "ACTIVE":
+            raise forbidden("AGENT_NOT_ACTIVE", "agent is not active")
         if KIND_FOR_TYPE[a["auction_type"]] != kind:
             raise bad("KIND_MISMATCH", f"{kind} cannot be used on a {a['auction_type']} auction")
         _validate_params(kind, params)
@@ -174,6 +179,24 @@ class ExecutionEngine:
             stepped = math.ceil(last["amount"] * (100 + (p.get("increment_pct") or 0)) / 100) if last else needed
             cap = min(p["max_bid"], self.guardrail.soft_cap(agent, t["approved_up_to"]))  # a step must never overshoot the agent's own limits
             return self._fire(t, a, int(max(needed, min(stepped, cap))))
+        if t["kind"] == "REVERSE_UNDERCUT":
+            if a["bids"] and a["bids"][-1]["agent_id"] == t["agent_id"]:
+                return False  # already the lowest quote
+            needed = self.engine.max_next_bid(a)  # the most we may quote to be valid
+            if needed < p["min_price"]:
+                t["status"] = "EXHAUSTED"
+                self.notify(t["agent_id"], "outbid",
+                            f"Undercut on \"{a['product_spec']['title']}\": the next valid quote ({needed}) is below your agent's floor ({p['min_price']}).",
+                            auction_id=a["auction_id"])
+                return False
+            snipe = p.get("snipe_window_ms") or 0
+            if snipe > 0 and effective_end(a) - now > snipe:
+                return False
+            last = a["bids"][-1] if a["bids"] else None
+            stepped = math.floor(last["amount"] * (100 - (p.get("decrement_pct") or 0)) / 100) if last else needed
+            return self._fire(t, a, int(min(needed, max(stepped, p["min_price"]))))
+        if t["kind"] == "REVERSE_SEALED_BID":
+            return self._fire(t, a, p["amount"])
         if t["kind"] == "DUTCH_ACCEPT":
             price = self.engine.current_price(a, now)
             return self._fire(t, a, price) if price <= p["threshold"] else False
@@ -226,12 +249,12 @@ class ExecutionEngine:
                                             "reconciled": bool(res.get("reconciled")), "latency_ms": latency})
         if res["ok"]:
             t["fired_count"] += 1
-            if t["kind"] != "ENGLISH_INCREMENTAL":
+            if t["kind"] not in REPEATING:
                 t["status"] = "DONE"
-            return t["kind"] == "ENGLISH_INCREMENTAL"
+            return t["kind"] in REPEATING
         if res.get("code") == "AUCTION_NOT_OPEN":
             t["status"] = "DONE"
-        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST"):
+        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST", "BID_TOO_HIGH", "ALREADY_LOWEST"):
             t["status"], t["last_error"] = "BLOCKED", res.get("code")
         return False
 
@@ -305,6 +328,18 @@ def _validate_params(kind: str, p: dict) -> None:
         sw = p.get("snipe_window_ms")
         if sw is not None and not (isinstance(sw, int) and sw >= 0):
             raise bad("INVALID_PARAMS", "snipe_window_ms must be >= 0")
+    elif kind == "REVERSE_UNDERCUT":
+        if not pos(p.get("min_price")):
+            raise bad("INVALID_PARAMS", "min_price must be a positive integer")
+        pct = p.get("decrement_pct")
+        if pct is not None and not (isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100):
+            raise bad("INVALID_PARAMS", "decrement_pct must be 0-100")
+        sw = p.get("snipe_window_ms")
+        if sw is not None and not (isinstance(sw, int) and sw >= 0):
+            raise bad("INVALID_PARAMS", "snipe_window_ms must be >= 0")
+    elif kind == "REVERSE_SEALED_BID":
+        if not pos(p.get("amount")):
+            raise bad("INVALID_PARAMS", "amount must be a positive integer")
     elif kind == "DUTCH_ACCEPT":
         if not pos(p.get("threshold")):
             raise bad("INVALID_PARAMS", "threshold must be a positive integer")

@@ -335,11 +335,10 @@ class TokenMeter:
     def llm_ids_for(self, agent: dict) -> list[str]:
         cfg = agent["config"]
         ids: list[str] = []
-        if agent["agent_type"] == "BIDDER":
-            for spec in cfg["algorithms"].values():
-                if spec["strategy"] == "llm":
-                    ids.append(spec.get("llm_id") or cfg.get("llm_id"))
-        else:
+        for spec in cfg["algorithms"].values():  # bidders: per auction type; suppliers: per RFQ type
+            if spec["strategy"] == "llm":
+                ids.append(spec.get("llm_id") or cfg.get("llm_id"))
+        if agent["agent_type"] == "SELLER":
             adv = cfg.get("advisor") or {}
             if adv.get("strategy") == "llm":
                 ids.append(adv.get("llm_id") or cfg.get("llm_id"))

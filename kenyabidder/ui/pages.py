@@ -5,7 +5,7 @@ import json
 
 from nicegui import ui
 
-from ..engine import AUCTION_TYPES
+from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .common import (active_agent, agent_picker, badge, core, current_user, empty, fmt_time, frame, guard, kes, left,
                      login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
 
@@ -89,7 +89,9 @@ def auctions_page():
         checklist(user, agent)
         if agent["agent_type"] == "SELLER":
             listing_form(agent)
-        ui.label("Auctions").classes("text-lg font-medium")
+        else:
+            rfq_form(agent)
+        ui.label("Auctions & requests for quotes").classes("text-lg font-medium")
 
         @ui.refreshable
         def grid():
@@ -108,11 +110,13 @@ def auctions_page():
                             status_badge(v)
                         ui.label(f"{v['product_spec']['category']} · qty {v['product_spec']['quantity']} · {pretty(v['auction_type'])}").classes("text-xs opacity-70")
                         ui.label("sealed" if v["current_price"] is None else kes(v["current_price"])).classes("text-2xl font-bold")
+                        if v["direction"] == "REVERSE":
+                            ui.label("RFQ — suppliers quote the price down" + (f" (buyer's max {kes(v['max_price'])})" if v["max_price"] else "")).classes("text-xs text-primary")
                         with ui.row().classes("text-xs opacity-70 gap-3"):
                             ui.label(f"{v['bid_count']} bid{'s' if v['bid_count'] != 1 else ''}")
                             if v["status"] in ("ACTIVE", "EXTENDING", "SCHEDULED"):
                                 ui.label(left(v["extended_until"] or v["ends_at"]))
-                            if v["seller_agent_id"] == agent["agent_id"]:
+                            if v["poster_agent_id"] == agent["agent_id"]:
                                 badge("yours", "primary")
         grid()
         ui.timer(1.0, grid.refresh)
@@ -126,7 +130,7 @@ def checklist(user: dict, agent: dict) -> None:
     if agent["agent_type"] == "BIDDER":
         steps.append(("Tell your agent what to hunt for (category & budget)", bool((agent["durable_memory"].get("watch") or {}).get("category")), f"/agent/{agent['agent_id']}"))
     else:
-        steps.append(("Create your first listing", any(a["seller_agent_id"] == agent["agent_id"] for a in c.store.auctions.values()), "/"))
+        steps.append(("Create your first listing", any(a["poster_agent_id"] == agent["agent_id"] for a in c.store.auctions.values()), "/"))
     if c.meter.llm_ids_for(agent):
         st = c.meter.status_for_agent(agent)
         steps.append(("Top up tokens so your agent's LLM can decide", st["ok"], "/wallet"))
@@ -155,10 +159,10 @@ def status_badge(v: dict) -> None:
 
 
 def listing_form(agent: dict) -> None:
-    allowed = agent["constraints"]["authorized_auction_types"]
+    allowed = [t for t in agent["constraints"]["authorized_auction_types"] if t in FORWARD_TYPES] or list(FORWARD_TYPES)
     f = {"title": "", "category": "", "qty": 1, "type": allowed[0], "reserve": 1000, "start": 1000, "inc": 100, "mins": 5,
          "dstart": 5000, "dfloor": 1000, "ddec": 250, "dstep": 20}
-    with ui.expansion("New listing", icon="add_circle", value=not any(a["seller_agent_id"] == agent["agent_id"] for a in core().store.auctions.values())).classes("w-full border rounded"):
+    with ui.expansion("New listing", icon="add_circle", value=not any(a["poster_agent_id"] == agent["agent_id"] for a in core().store.auctions.values())).classes("w-full border rounded"):
         with ui.column().classes("w-full gap-2 p-2"):
             with ui.row().classes("w-full"):
                 ui.input("Product", on_change=lambda e: f.update(title=e.value)).classes("grow")
@@ -209,6 +213,33 @@ def listing_form(agent: dict) -> None:
             ui.button("Create listing", icon="check", on_click=create).props("unelevated color=primary")
 
 
+def rfq_form(agent: dict) -> None:
+    """A buyer posts what it needs and the most it will pay; supplier agents compete by quoting the price down."""
+    f = {"title": "", "category": "", "qty": 1, "type": "REVERSE_ENGLISH", "max": 50_000, "dec": 100, "mins": 30}
+    with ui.expansion("Request quotes (RFQ)", icon="request_quote").classes("w-full border rounded"):
+        with ui.column().classes("w-full gap-2 p-2"):
+            ui.label("Post what you need and the most you would pay in total. Suppliers' agents bid the price down — the lowest valid quote wins the introduction.").classes("text-sm opacity-70")
+            with ui.row().classes("w-full"):
+                ui.input("What do you need?", on_change=lambda e: f.update(title=e.value)).classes("grow")
+                ui.input("Category", placeholder="electronics", on_change=lambda e: f.update(category=e.value)).classes("w-48")
+                ui.number("Quantity", value=1, min=1, precision=0, on_change=lambda e: f.update(qty=int(e.value or 1))).classes("w-28")
+            with ui.row().classes("w-full items-end"):
+                ui.select({t: pretty(t) for t in REVERSE_TYPES}, value=f["type"], label="Format", on_change=lambda e: (f.update(type=e.value), dec.set_visibility(e.value == "REVERSE_ENGLISH"))).classes("w-64")
+                ui.number("Maximum total price (KES)", value=f["max"], min=1, precision=0, on_change=lambda e: f.update(max=int(e.value or 0))).classes("w-56")
+                dec = ui.number("Min. undercut (KES)", value=f["dec"], min=1, precision=0, on_change=lambda e: f.update(dec=int(e.value or 1))).classes("w-44")
+                ui.number("Duration (minutes)", value=f["mins"], min=0.1, precision=1, on_change=lambda e: f.update(mins=e.value)).classes("w-44")
+
+            @guard
+            def post():
+                kw = dict(buyer_agent_id=agent["agent_id"], product_spec={"title": f["title"], "category": f["category"], "quantity": f["qty"]},
+                          auction_type=f["type"], max_price=int(f["max"] or 0), duration_ms=int(float(f["mins"] or 0) * 60_000), min_decrement=int(f["dec"] or 1))
+                if f["type"] == "REVERSE_ENGLISH":
+                    kw["anti_snipe"] = {"window_ms": 10_000, "extend_ms": 15_000}
+                core().engine.create_rfq(**kw)
+                ui.notify("Request posted — supplier agents have been notified", type="positive")
+            ui.button("Post request", icon="send", on_click=post).props("unelevated color=primary")
+
+
 # ----------------------------------------------------------------------------- auction detail
 
 def auction_page(auction_id: str):
@@ -222,7 +253,8 @@ def auction_page(auction_id: str):
         if not a or not agent:
             empty("Auction not found." if not a else "Create an agent first.")
             return
-        mine = a["seller_agent_id"] == agent["agent_id"]
+        mine = a["poster_agent_id"] == agent["agent_id"]
+        reverse = a["direction"] == "REVERSE"
 
         @ui.refreshable
         def info():
@@ -242,17 +274,22 @@ def auction_page(auction_id: str):
                     bits.append("extended by a late bid")
                 if v["min_next_bid"] is not None:
                     bits.append(f"next valid bid {kes(v['min_next_bid'])}")
+                if v["max_next_bid"] is not None:
+                    bits.append(f"next quote must be at most {kes(v['max_next_bid'])}")
+                if reverse:
+                    ui.label(f"Request for quotes — the buyer will pay at most {kes(v['max_price'])}; the lowest quote wins.").classes("text-sm text-primary")
                 ui.label(" · ".join(bits)).classes("text-sm opacity-70")
                 if mine and "reserve_price" in v:
                     ui.label(f"Reserve {kes(v['reserve_price'])} (hidden from bidders)").classes("text-sm")
                 if v["status"] == "SETTLED":
                     r = v["result"]
                     won = r["winner_agent_id"] == agent["agent_id"]
-                    ui.label(f"Sold for {kes(r['price'])}" + (" — you won! See Matches." if won else "") if r["outcome"] == "SOLD" else "Closed without a sale.").classes("font-medium text-primary")
+                    ui.label((f"{'Awarded' if reverse else 'Sold'} at {kes(r['price'])}" + (" — you won! See Matches." if won else "")) if r["outcome"] == "SOLD"
+                             else ("Closed without any quote." if reverse else "Closed without a sale.")).classes("font-medium text-primary")
             with ui.card().classes("w-full"):
-                ui.label(f"Bids ({v['bid_count']})").classes("font-medium")
+                ui.label(f"{'Quotes' if reverse else 'Bids'} ({v['bid_count']})").classes("font-medium")
                 if v["bids"]:
-                    ui.table(columns=[{"name": "who", "label": "Bidder", "field": "who", "align": "left"}, {"name": "amount", "label": "Amount", "field": "amount", "align": "left"},
+                    ui.table(columns=[{"name": "who", "label": "Supplier" if reverse else "Bidder", "field": "who", "align": "left"}, {"name": "amount", "label": "Amount", "field": "amount", "align": "left"},
                                       {"name": "at", "label": "Time", "field": "at", "align": "left"}],
                              rows=[{"id": i, "who": "You" if b["agent_id"] == agent["agent_id"] else f"agent {b['agent_id'][:6]}", "amount": kes(b["amount"]), "at": fmt_time(b["at"])}
                                    for i, b in enumerate(reversed(v["bids"]))], row_key="id").classes("w-full").props("dense flat")
@@ -262,9 +299,9 @@ def auction_page(auction_id: str):
         v0 = info()
         ui.timer(1.0, info.refresh)
 
-        if not mine and agent["agent_type"] == "BIDDER" and a["status"] in ("ACTIVE", "EXTENDING", "SCHEDULED"):
+        if not mine and agent["agent_type"] == ("SELLER" if reverse else "BIDDER") and a["status"] in ("ACTIVE", "EXTENDING", "SCHEDULED"):
             with ui.card().classes("w-full"):
-                ui.label("Bid").classes("font-medium")
+                ui.label("Quote" if reverse else "Bid").classes("font-medium")
                 strat = agent["config"]["algorithms"].get(a["auction_type"], {}).get("strategy", "heuristic")
 
                 @guard
@@ -273,24 +310,25 @@ def auction_page(auction_id: str):
                     msg = f"Agent ({r.get('strategy', '-')}): {r['reasoning']}" if r["status"] == "PLANNED" else f"Agent: {pretty(r['status'])} — {r.get('reason', '')}"
                     ui.notify(msg, type="positive" if r["status"] == "PLANNED" else "warning", multi_line=True)
                 with ui.row().classes("items-center gap-3"):
-                    ui.button("Let my agent bid for me", icon="smart_toy", on_click=delegate).props("unelevated color=primary")
+                    ui.button("Let my agent quote for me" if reverse else "Let my agent bid for me", icon="smart_toy", on_click=delegate).props("unelevated color=primary")
                     ui.label(f"uses the {strat} algorithm for {pretty(a['auction_type'])} auctions").classes("text-xs opacity-70")
                 ui.separator()
-                amount = ui.number("Manual bid (KES)", value=v0["min_next_bid"] or 0, precision=0).classes("w-48")
+                amount = ui.number("Manual quote (KES)" if reverse else "Manual bid (KES)", value=(v0["max_next_bid"] if reverse else v0["min_next_bid"]) or 0, precision=0).classes("w-48")
 
                 @guard
                 def manual():
                     r = core().manual_bid(agent["agent_id"], auction_id, int(amount.value or 0))
-                    ui.notify("Bid placed" if r["ok"] else f"{r['code']}: {r['message']}", type="positive" if r["ok"] else "negative")
-                ui.button("Bid manually", on_click=manual).props("outline")
-                ui.label(f"Your agent's hard ceiling is {kes(agent['constraints']['budget_ceiling'])}. Manual bids still pass the guardrails.").classes("text-xs opacity-70")
+                    ui.notify(("Quote placed" if reverse else "Bid placed") if r["ok"] else f"{r['code']}: {r['message']}", type="positive" if r["ok"] else "negative")
+                ui.button("Quote manually" if reverse else "Bid manually", on_click=manual).props("outline")
+                ui.label((f"Your agent's price floor is {kes(agent['constraints']['reserve_floor'])} — it will not quote below it." if reverse
+                          else f"Your agent's hard ceiling is {kes(agent['constraints']['budget_ceiling'])}.") + " Manual bids still pass the guardrails.").classes("text-xs opacity-70")
         if mine and not a["bids"] and a["status"] in ("ACTIVE", "SCHEDULED"):
             @guard
             def withdraw():
-                core().engine.withdraw_listing(listing_id=auction_id, seller_agent_id=agent["agent_id"], reason="withdrawn by seller")
+                core().engine.withdraw_listing(listing_id=auction_id, seller_agent_id=agent["agent_id"], reason="withdrawn by poster")
                 ui.notify("Listing withdrawn")
                 ui.navigate.to("/")
-            ui.button("Withdraw listing", icon="delete", on_click=withdraw).props("outline color=negative")
+            ui.button("Withdraw request" if reverse else "Withdraw listing", icon="delete", on_click=withdraw).props("outline color=negative")
 
 
 # ----------------------------------------------------------------------------- inbox

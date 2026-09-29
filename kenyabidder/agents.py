@@ -20,7 +20,7 @@ import os
 import re
 import uuid
 
-from .engine import AUCTION_TYPES
+from .engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .errors import AppError, bad, conflict, forbidden, is_nonneg_int, not_found
 from .phone import normalize_phone
 
@@ -47,7 +47,8 @@ def verify_password(pw: str, stored: str) -> bool:
 def default_config(agent_type: str) -> dict:
     return {
         "llm_id": None,
-        "algorithms": {t: {"strategy": "heuristic", "llm_id": None} for t in AUCTION_TYPES} if agent_type == "BIDDER" else {},
+        # buyers pick a strategy per auction type they bid in; suppliers pick one per RFQ type they quote on
+        "algorithms": {t: {"strategy": "heuristic", "llm_id": None} for t in (FORWARD_TYPES if agent_type == "BIDDER" else REVERSE_TYPES)},
         "advisor": {"strategy": "rules", "llm_id": None} if agent_type == "SELLER" else None,
         "tools": [], "kb_ids": [], "max_tool_steps": 4, "max_tokens_per_day": None,
     }
@@ -238,7 +239,7 @@ class AgentService:
 
     def _constraints(self, type: str, c: dict) -> dict:
         out = {"budget_ceiling": c.get("budget_ceiling", 0), "reserve_floor": c.get("reserve_floor", 0),
-               "authorized_auction_types": c.get("authorized_auction_types", list(AUCTION_TYPES)),
+               "authorized_auction_types": c.get("authorized_auction_types", list(FORWARD_TYPES if type == "BIDDER" else AUCTION_TYPES)),
                "escalation_threshold_pct": c.get("escalation_threshold_pct", 100)}
         if not is_nonneg_int(out["budget_ceiling"]):
             raise bad("INVALID_CONSTRAINT", "budget_ceiling must be a non-negative integer")
@@ -310,19 +311,19 @@ class AgentService:
             return llm_id
 
         out["llm_id"] = check_llm(merged.get("llm_id"), "default LLM")
-        if role == "BIDDER":
-            algos = merged.get("algorithms") or {}
-            for t, spec in algos.items():
-                if t not in AUCTION_TYPES:
-                    raise bad("INVALID_ALGORITHM", f"unknown auction type {t}")
-                s = (spec or {}).get("strategy", "heuristic")
-                if s not in STRATEGIES:
-                    raise bad("INVALID_ALGORITHM", f"strategy for {t} must be one of {', '.join(STRATEGIES)}")
-                lid = check_llm((spec or {}).get("llm_id"), f"{t} LLM")
-                if s == "llm" and not (lid or out["llm_id"]):
-                    raise bad("INVALID_ALGORITHM", f"{t} uses the llm strategy but no LLM is assigned (set a default LLM or a per-algorithm LLM)")
-                out["algorithms"][t] = {"strategy": s, "llm_id": lid}
-        else:
+        valid_types = FORWARD_TYPES if role == "BIDDER" else REVERSE_TYPES
+        algos = merged.get("algorithms") or {}
+        for t, spec in algos.items():
+            if t not in valid_types:
+                raise bad("INVALID_ALGORITHM", f"{t} is not an auction type {role.lower()} agents take part in with a strategy")
+            s = (spec or {}).get("strategy", "heuristic")
+            if s not in STRATEGIES:
+                raise bad("INVALID_ALGORITHM", f"strategy for {t} must be one of {', '.join(STRATEGIES)}")
+            lid = check_llm((spec or {}).get("llm_id"), f"{t} LLM")
+            if s == "llm" and not (lid or out["llm_id"]):
+                raise bad("INVALID_ALGORITHM", f"{t} uses the llm strategy but no LLM is assigned (set a default LLM or a per-algorithm LLM)")
+            out["algorithms"][t] = {"strategy": s, "llm_id": lid}
+        if role == "SELLER":
             adv = merged.get("advisor") or {"strategy": "rules", "llm_id": None}
             if adv.get("strategy", "rules") not in ADVISORS:
                 raise bad("INVALID_ALGORITHM", "advisor strategy must be rules or llm")
@@ -354,9 +355,9 @@ class AgentService:
 
     @staticmethod
     def _uses_llm(role: str, cfg: dict) -> bool:
-        if role == "BIDDER":
-            return any(a["strategy"] == "llm" for a in cfg["algorithms"].values())
-        return (cfg.get("advisor") or {}).get("strategy") == "llm"
+        if any(a["strategy"] == "llm" for a in cfg["algorithms"].values()):
+            return True
+        return role == "SELLER" and (cfg.get("advisor") or {}).get("strategy") == "llm"
 
     def get_agent(self, agent_id: str) -> dict:
         a = self.store.agents.get(agent_id)

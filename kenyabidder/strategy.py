@@ -15,9 +15,9 @@ import logging
 import re
 from typing import Any
 
-from .engine import AUCTION_TYPES
+from .engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE
 from .llm.providers import Completion, ToolCall, ToolSpec
-from .prompts import bidder_prompt, seller_prompt
+from .prompts import bidder_prompt, seller_prompt, supplier_prompt
 from .wallet import AgentRateLimited, AgentTokenCap, InsufficientTokens
 
 log = logging.getLogger("kenyabidder.strategy")
@@ -27,10 +27,42 @@ def _clamp(n: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, round(n)))
 
 
+def _reverse_baseline(ctx: dict) -> dict:
+    floor = max(ctx["agent"]["constraints"].get("reserve_floor", 0), 1)
+    if ctx["auction"]["auction_type"] == "REVERSE_ENGLISH":
+        return {"action": "BID", "kind": "REVERSE_UNDERCUT", "reasoning": f"Baseline: undercut the best quote by the minimum step, never below the floor {floor}.",
+                "params": {"min_price": floor, "decrement_pct": 0, "snipe_window_ms": 0}}
+    return {"action": "BID", "kind": "REVERSE_SEALED_BID", "reasoning": f"Baseline: quote the buyer's maximum price (never below the floor {floor}).",
+            "params": {"amount": max(ctx["auction"]["max_price"], floor)}}
+
+
+def _reverse_heuristic(ctx: dict) -> dict:
+    """Supplier side: price near what comparable lots clear at, never below the agent's own floor, never above the buyer's maximum."""
+    a, agent = ctx["auction"], ctx["agent"]
+    floor = max(agent["constraints"].get("reserve_floor", 0), 1)
+    max_price = a["max_price"]
+    if max_price < floor:
+        return {"action": "SKIP", "reasoning": f"The buyer's maximum ({max_price}) is below your price floor ({floor})."}
+    stats = (ctx.get("intel") or {}).get("stats") or {}
+    qty = max(1, a["product_spec"]["quantity"])
+    est = stats["unit_median"] * qty if stats.get("unit_median") else stats.get("median")
+    basis = f"typical clearing price {round(est)} for {qty} unit(s) (n={stats['count']})" if est else "no price history"
+    if a["auction_type"] == "REVERSE_ENGLISH":
+        lowest = _clamp(max(floor, (est or 0) * 0.85), 1, max_price)  # do not race to the bottom: stop 15% under the typical price
+        snipe = _clamp((a["ends_at"] - a["starts_at"]) * 0.1, 0, 10_000)
+        return {"action": "BID", "kind": "REVERSE_UNDERCUT", "params": {"min_price": lowest, "decrement_pct": 0, "snipe_window_ms": snipe},
+                "reasoning": f"Fair price ≈ {round(est) if est else 'unknown'} ({basis}). Undercut by minimum steps in the final {snipe}ms, down to {lowest}."}
+    quote = _clamp(max(floor, (est or max_price) * 0.95), 1, max_price)
+    return {"action": "BID", "kind": "REVERSE_SEALED_BID", "params": {"amount": quote},
+            "reasoning": f"Sealed quote of {quote}: 5% under the typical price ({basis}), bounded by your floor {floor} and the buyer's maximum {max_price}."}
+
+
 class BaselineStrategy:
     name = "baseline"
 
     async def propose(self, ctx: dict) -> dict:
+        if ctx["auction"]["auction_type"] in REVERSE:
+            return _reverse_baseline(ctx)
         a, ceiling = ctx["auction"], ctx["agent"]["constraints"]["budget_ceiling"]
         t = a["auction_type"]
         if t == "ENGLISH":
@@ -45,6 +77,8 @@ class HeuristicStrategy:
     name = "heuristic"
 
     async def propose(self, ctx: dict) -> dict:
+        if ctx["auction"]["auction_type"] in REVERSE:
+            return _reverse_heuristic(ctx)
         a, ceiling = ctx["auction"], ctx["agent"]["constraints"]["budget_ceiling"]
         stats = (ctx.get("intel") or {}).get("stats") or {}
         floor_price = a["dutch"]["floor_price"] if a["auction_type"] == "DUTCH" else (a["start_price"] if a["start_price"] is not None else a["reserve_price"])
@@ -82,14 +116,16 @@ PROPOSE_ACTION = ToolSpec(
         "increment_pct": {"type": "number", "description": "ENGLISH: percentage raise per step, 0-100"},
         "snipe_window_ms": {"type": "integer", "description": "ENGLISH: only bid within this many ms of close; 0 = bid immediately"},
         "threshold": {"type": "integer", "description": "DUTCH: accept when price <= threshold (KES)"},
-        "amount": {"type": "integer", "description": "SEALED: the sealed bid (KES)"},
+        "amount": {"type": "integer", "description": "SEALED / REVERSE_SEALED: the sealed bid or quote (KES)"},
+        "min_price": {"type": "integer", "description": "REVERSE_ENGLISH (supplier): never quote below this (KES); must be at least your price floor"},
+        "decrement_pct": {"type": "number", "description": "REVERSE_ENGLISH: percentage to undercut the best quote by per step, 0-100"},
         "reasoning": {"type": "string"}},
      "required": ["action", "reasoning"]})
 
 PROPOSE_LISTING = ToolSpec(
     "propose_listing", "Recommend how the seller should list this product. Call exactly once when done.",
     {"type": "object", "properties": {
-        "auction_type": {"type": "string", "enum": AUCTION_TYPES},
+        "auction_type": {"type": "string", "enum": FORWARD_TYPES},
         "reserve_price": {"type": "integer", "description": "KES; hidden minimum acceptable price"},
         "start_price": {"type": "integer", "description": "KES; opening price (ENGLISH) or Dutch start price"},
         "reasoning": {"type": "string"}},
@@ -106,6 +142,8 @@ def proposal_from_tool_input(inp: Any, auction: dict, agent: dict) -> dict | Non
         return None
     ceiling = agent["constraints"]["budget_ceiling"]
     reasoning = str(inp.get("reasoning", ""))[:500]
+    if auction["auction_type"] in REVERSE:
+        return _reverse_proposal(inp, auction, agent, reasoning)
     if inp.get("action") == "SKIP":
         return {"action": "SKIP", "reasoning": reasoning}
     if inp.get("action") != "BID":
@@ -129,6 +167,31 @@ def proposal_from_tool_input(inp: Any, auction: dict, agent: dict) -> dict | Non
         return {"action": "BID", "kind": "DUTCH_ACCEPT", "params": {"threshold": th}, "reasoning": reasoning} if th else None
     amt = money(inp.get("amount"))
     return {"action": "BID", "kind": "SEALED_BID", "params": {"amount": amt}, "reasoning": reasoning} if amt else None
+
+
+def _reverse_proposal(inp: dict, auction: dict, agent: dict, reasoning: str) -> dict | None:
+    if inp.get("action") == "SKIP":
+        return {"action": "SKIP", "reasoning": reasoning}
+    if inp.get("action") != "BID":
+        return None
+    floor, top = max(agent["constraints"].get("reserve_floor", 0), 1), auction["max_price"]
+
+    def money(v):  # clamp into [floor, buyer's max]: an LLM can never quote below the supplier's floor or above the buyer's maximum
+        return _clamp(v, floor, max(top, floor)) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) < 1e15 else None
+
+    if top < floor:
+        return {"action": "SKIP", "reasoning": f"The buyer's maximum ({top}) is below your price floor ({floor}). " + reasoning}
+    if auction["auction_type"] == "REVERSE_ENGLISH":
+        mp = money(inp.get("min_price"))
+        if not mp:
+            return None
+        pct = inp.get("decrement_pct")
+        pct = max(0, min(100, pct)) if isinstance(pct, (int, float)) and not isinstance(pct, bool) else 0
+        sw = inp.get("snipe_window_ms")
+        sw = max(0, round(sw)) if isinstance(sw, (int, float)) and not isinstance(sw, bool) else 0
+        return {"action": "BID", "kind": "REVERSE_UNDERCUT", "params": {"min_price": mp, "decrement_pct": pct, "snipe_window_ms": sw}, "reasoning": reasoning}
+    amt = money(inp.get("amount"))
+    return {"action": "BID", "kind": "REVERSE_SEALED_BID", "params": {"amount": amt}, "reasoning": reasoning} if amt else None
 
 
 def untrusted(tag: str, text: str) -> str:
@@ -237,10 +300,15 @@ class LlmStrategy:
             listing = {"type": auction["auction_type"], "title": spec["title"], "description": spec.get("description", ""),
                        "category": spec["category"], "quantity": spec["quantity"], "start_price": auction["start_price"],
                        "dutch": auction["dutch"], "duration_ms": auction["ends_at"] - auction["starts_at"]}
-            prompt = (f"Decide how to approach this auction.\n\nMarket stats: {json.dumps((ctx.get('intel') or {}).get('stats'))}\n\n"
+            reverse = auction["auction_type"] in REVERSE
+            if reverse:
+                listing.update(buyer_max_price=auction["max_price"], min_decrement=auction["min_increment"])
+            system = (supplier_prompt(user, agent, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names) if reverse
+                      else bidder_prompt(user, agent, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names))
+            prompt = (f"Decide how to approach this {'RFQ (you are the supplier)' if reverse else 'auction'}.\n\nMarket stats: {json.dumps((ctx.get('intel') or {}).get('stats'))}\n\n"
                       + untrusted("listing_data", json.dumps(listing, default=str)))
             args, trace = await run_tool_loop(
-                provider, bidder_prompt(user, agent, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names), prompt, PROPOSE_ACTION, tb,
+                provider, system, prompt, PROPOSE_ACTION, tb,
                 max_steps=agent["config"]["max_tool_steps"] if tb.specs else 0, max_tokens=entry["max_tokens"],
                 temperature=entry.get("temperature"), total_timeout=min(90.0, entry["timeout_s"] * (agent["config"]["max_tool_steps"] + 1)))
             proposal = proposal_from_tool_input(args, auction, agent)
@@ -271,7 +339,7 @@ class SellerAdvisor:
         self.intel, self.llms, self.mcps, self.kb, self.store, self.meter = intel, llms, mcps, kb, store, meter
 
     async def recommend(self, agent: dict, category: str, quantity: int = 1, urgency: str = "normal", scarce: bool = False) -> dict:
-        allowed = agent["constraints"]["authorized_auction_types"]
+        allowed = [t for t in agent["constraints"]["authorized_auction_types"] if t in FORWARD_TYPES] or list(FORWARD_TYPES)  # RFQ types are for buyers
         rules = self.intel.recommend_listing(category, quantity, urgency, scarce, allowed_types=allowed)
         adv = agent["config"].get("advisor") or {}
         llm_id = adv.get("llm_id") or agent["config"].get("llm_id")

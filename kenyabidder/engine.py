@@ -1,7 +1,9 @@
 """Auction Engine (spec §8.1, §9): pure, synchronous, clock-injected.
 
-Supports English, Dutch, First-Price Sealed and Second-Price (Vickrey) Sealed.
-Reverse / Multi-Unit / Combinatorial are architecturally reserved (Milestone 4+).
+Forward auctions (sellers list, buyer agents bid up): English, Dutch, First-Price Sealed, Second-Price (Vickrey) Sealed.
+Reverse auctions / RFQs (a buyer agent posts what it needs and its maximum price; supplier agents bid *down*): REVERSE_ENGLISH
+(open, each bid must undercut the best by the minimum decrement) and REVERSE_SEALED (lowest sealed bid wins).
+Multi-Unit / Combinatorial are architecturally reserved.
 """
 from __future__ import annotations
 
@@ -11,17 +13,29 @@ import uuid
 from .errors import AppError, bad, forbidden, is_nonneg_int, is_pos_int, not_found
 from .events import Events
 
-AUCTION_TYPES = ["ENGLISH", "DUTCH", "FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"]
+FORWARD_TYPES = ["ENGLISH", "DUTCH", "FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"]
+REVERSE_TYPES = ["REVERSE_ENGLISH", "REVERSE_SEALED"]
+AUCTION_TYPES = FORWARD_TYPES + REVERSE_TYPES
 
 # Listing text is shown to other users' LLM agents (which cost them tokens) — it must stay small.
 SPEC_LIMITS = {"category": 60, "title": 120, "description": 1000, "condition": 60, "brand": 60, "unit": 30}
 DEFAULT_LIMITS = {"max_open_listings": 50, "max_new_listings_per_minute": 10}
-SEALED = {"FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"}
+SEALED = {"FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED", "REVERSE_SEALED"}
+REVERSE = set(REVERSE_TYPES)
 OPEN = {"ACTIVE", "EXTENDING"}
 
 
 def is_open(a: dict) -> bool:
     return a["status"] in OPEN
+
+
+def is_reverse(a: dict) -> bool:
+    return a["auction_type"] in REVERSE
+
+
+def poster_of(a: dict) -> str | None:
+    """The agent that created the listing: the seller of a forward auction, the buyer of a reverse one (RFQ)."""
+    return a.get("poster_agent_id") or a.get("seller_agent_id")
 
 
 def is_sealed(a: dict) -> bool:
@@ -56,8 +70,8 @@ class AuctionEngine:
             raise forbidden("AGENT_NOT_ACTIVE", "seller agent is not active")
 
         spec = self._clean_spec(product_spec)
-        if auction_type not in AUCTION_TYPES:
-            raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(AUCTION_TYPES)}")
+        if auction_type not in FORWARD_TYPES:
+            raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(FORWARD_TYPES)} (use create_rfq for reverse auctions)")
         if auction_type not in seller["constraints"]["authorized_auction_types"]:
             raise forbidden("TYPE_NOT_ALLOWED", f"this seller agent is not configured for {auction_type} auctions")
         if not is_nonneg_int(reserve_price):
@@ -75,7 +89,7 @@ class AuctionEngine:
         a = {
             "auction_id": str(uuid.uuid4()), "auction_type": auction_type,
             "status": "SCHEDULED" if starts_at > now else "ACTIVE",
-            "seller_agent_id": seller_agent_id,
+            "seller_agent_id": seller_agent_id, "poster_agent_id": seller_agent_id, "direction": "FORWARD",
             "product_spec": spec,
             "reserve_price": reserve_price, "current_price": None, "min_increment": 1, "start_price": None,
             "dutch": None, "anti_snipe": {"window_ms": 0, "extend_ms": 0}, "bids": [],
@@ -110,6 +124,49 @@ class AuctionEngine:
         self.events.emit("auction.created", auction_id=a["auction_id"])
         return self.view(a, seller_agent_id)
 
+    def create_rfq(self, *, buyer_agent_id, product_spec, auction_type, duration_ms, max_price, min_decrement=1, starts_at=None,
+                   anti_snipe=None, demo=False) -> dict:
+        """Post a request for quotes: suppliers (SELLER agents) bid the price DOWN from ``max_price``; the lowest valid bid wins."""
+        now = self.clock.now()
+        buyer = self.store.agents.get(buyer_agent_id)
+        if not buyer or buyer["agent_type"] != "BIDDER":
+            raise bad("INVALID_BUYER", "buyer_agent_id must reference a BIDDER agent")
+        if buyer["status"] != "ACTIVE":
+            raise forbidden("AGENT_NOT_ACTIVE", "buyer agent is not active")
+        spec = self._clean_spec(product_spec)
+        if auction_type not in REVERSE_TYPES:
+            raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(REVERSE_TYPES)}")
+        if not is_pos_int(max_price):
+            raise bad("INVALID_PRICE", "max_price (the most you will pay in total) must be a positive integer")
+        if max_price > buyer["constraints"]["budget_ceiling"]:
+            raise forbidden("CEILING_EXCEEDED", f"max_price exceeds this agent's budget ceiling ({buyer['constraints']['budget_ceiling']})")
+        if not is_pos_int(duration_ms):
+            raise bad("INVALID_DURATION", "duration_ms must be a positive integer")
+        starts_at = now if starts_at is None else starts_at
+        if not isinstance(starts_at, int):
+            raise bad("INVALID_START", "starts_at must be an epoch-ms integer")
+        self._check_listing_limits(buyer_agent_id, now, relist=False)
+        a = {
+            "auction_id": str(uuid.uuid4()), "auction_type": auction_type,
+            "status": "SCHEDULED" if starts_at > now else "ACTIVE",
+            "seller_agent_id": None, "poster_agent_id": buyer_agent_id, "direction": "REVERSE",
+            "product_spec": spec, "max_price": max_price,
+            "reserve_price": 0, "current_price": max_price, "min_increment": 1, "start_price": max_price,
+            "dutch": None, "anti_snipe": {"window_ms": 0, "extend_ms": 0}, "bids": [],
+            "starts_at": starts_at, "ends_at": starts_at + duration_ms, "extended_until": None,
+            "result": None, "relist_of": None, "relist_count": 0, "created_at": now, "closed_at": None, "demo": bool(demo),
+        }
+        if auction_type == "REVERSE_ENGLISH":
+            if not is_pos_int(min_decrement):
+                raise bad("INVALID_INCREMENT", "min_decrement must be a positive integer")
+            a["min_increment"] = min_decrement  # for a reverse auction: the minimum amount a new bid must undercut the best one by
+            s = anti_snipe or {}
+            if is_pos_int(s.get("window_ms")) and is_pos_int(s.get("extend_ms")):
+                a["anti_snipe"] = {"window_ms": s["window_ms"], "extend_ms": s["extend_ms"]}
+        self.store.auctions[a["auction_id"]] = a
+        self.events.emit("auction.created", auction_id=a["auction_id"])
+        return self.view(a, buyer_agent_id)
+
     @staticmethod
     def _clean_spec(spec) -> dict:
         if not isinstance(spec, dict):
@@ -138,7 +195,7 @@ class AuctionEngine:
         """Stop a seller flooding the marketplace (and, transitively, every watching agent's LLM budget)."""
         open_n = recent = 0
         for a in self.store.auctions.values():
-            if a["seller_agent_id"] != seller_agent_id:
+            if poster_of(a) != seller_agent_id:
                 continue
             self._advance(a)  # judge by the clock, not by a status the tick loop has not refreshed yet
             if a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING"):
@@ -152,8 +209,8 @@ class AuctionEngine:
 
     def withdraw_listing(self, *, listing_id, seller_agent_id, reason="") -> dict:
         a = self._get(listing_id)
-        if a["seller_agent_id"] != seller_agent_id:
-            raise forbidden("NOT_LISTING_OWNER", "only the listing seller may withdraw")
+        if poster_of(a) != seller_agent_id:
+            raise forbidden("NOT_LISTING_OWNER", "only the agent that posted the listing may withdraw it")
         self._advance(a)
         if a["status"] != "SCHEDULED" and not is_open(a):
             raise AppError("NOT_WITHDRAWABLE", f"auction is {a['status']}", 409)
@@ -187,9 +244,17 @@ class AuctionEngine:
             return max(d["floor_price"], d["start_price"] - steps * d["decrement"])
         return a["current_price"]
 
+    def max_next_bid(self, a: dict) -> int:
+        """Reverse auctions: the HIGHEST amount a new bid may be (everything above is refused)."""
+        if a["auction_type"] == "REVERSE_ENGLISH" and a["bids"]:
+            return a["current_price"] - a["min_increment"]
+        return a["max_price"]
+
     def min_next_bid(self, a: dict, now: int | None = None) -> int:
         now = self.clock.now() if now is None else now
         t = a["auction_type"]
+        if t in REVERSE:
+            return 1
         if t == "ENGLISH":
             return a["current_price"] + a["min_increment"] if a["bids"] else a["start_price"]
         if t == "DUTCH":
@@ -199,13 +264,15 @@ class AuctionEngine:
     def view(self, a: dict, viewer_agent_id: str | None = None) -> dict:
         """Client/LLM-safe view: hides the reserve from non-sellers and sealed bids until settlement."""
         now = self.clock.now()
-        is_seller = bool(viewer_agent_id) and viewer_agent_id == a["seller_agent_id"]
+        is_seller = bool(viewer_agent_id) and viewer_agent_id == poster_of(a)  # the poster sees the private side of their own listing
         sealed_open = is_sealed(a) and a["status"] != "SETTLED"
         v = {
             "auction_id": a["auction_id"], "auction_type": a["auction_type"], "status": a["status"],
-            "seller_agent_id": a["seller_agent_id"], "product_spec": copy.deepcopy(a["product_spec"]),
+            "seller_agent_id": a["seller_agent_id"], "poster_agent_id": poster_of(a), "direction": a.get("direction", "FORWARD"),
+            "product_spec": copy.deepcopy(a["product_spec"]),
             "current_price": None if sealed_open else self.current_price(a, now),
-            "min_next_bid": self.min_next_bid(a, now) if is_open(a) else None,
+            "min_next_bid": self.min_next_bid(a, now) if is_open(a) and not is_reverse(a) else None,
+            "max_next_bid": self.max_next_bid(a) if is_open(a) and is_reverse(a) else None, "max_price": a.get("max_price"),
             "min_increment": a["min_increment"], "start_price": a["start_price"],
             "dutch": copy.deepcopy(a["dutch"]), "anti_snipe": dict(a["anti_snipe"]),
             "starts_at": a["starts_at"], "ends_at": a["ends_at"], "extended_until": a["extended_until"],
@@ -214,7 +281,7 @@ class AuctionEngine:
             if a["auction_type"] == "ENGLISH" else None,
             "result": copy.deepcopy(a["result"]) if a["result"] and (is_seller or a["status"] == "SETTLED") else None,
         }
-        if is_seller:
+        if is_seller and not is_reverse(a):
             v["reserve_price"] = a["reserve_price"]
         bids = [b for b in a["bids"] if b["agent_id"] == viewer_agent_id] if sealed_open else a["bids"]
         v["bids"] = [_pub_bid(b) for b in bids]
@@ -224,7 +291,7 @@ class AuctionEngine:
         return self.view(self.get_auction(auction_id), viewer_agent_id)
 
     def list_active_auctions(self, *, category=None, auction_types=None, min_quantity=None, ends_before=None,
-                             max_price=None, q=None, include_scheduled=False, viewer_agent_id=None) -> list[dict]:
+                             max_price=None, q=None, include_scheduled=False, viewer_agent_id=None, direction="FORWARD") -> list[dict]:
         """Deterministic pre-filter (spec §11.3) — no LLM involved."""
         self.tick()
         statuses = {"ACTIVE", "EXTENDING"} | ({"SCHEDULED"} if include_scheduled else set())
@@ -234,6 +301,8 @@ class AuctionEngine:
         for a in self.store.auctions.values():
             if a["status"] not in statuses:
                 continue
+            if direction and a.get("direction", "FORWARD") != direction:
+                continue  # bidder agents browse listings; supplier agents browse RFQs
             spec = a["product_spec"]
             if category and spec["category"].lower() != category.lower():
                 continue
@@ -243,7 +312,7 @@ class AuctionEngine:
                 continue
             if ends_before and effective_end(a) > ends_before:
                 continue
-            if max_price is not None and self.min_next_bid(a, now) > max_price:
+            if max_price is not None and not is_reverse(a) and self.min_next_bid(a, now) > max_price:
                 continue
             if ql and ql not in f"{spec['title']} {spec.get('description', '')}".lower():
                 continue
@@ -278,7 +347,15 @@ class AuctionEngine:
         reserve = a["reserve_price"]
         result = {"outcome": "NO_SALE", "winner_agent_id": None, "price": None}
         t = a["auction_type"]
-        if t == "ENGLISH":
+        if t == "REVERSE_ENGLISH":
+            top = a["bids"][-1] if a["bids"] else None  # each bid undercuts the last, so the newest is the lowest
+            if top:
+                result = {"outcome": "SOLD", "winner_agent_id": top["agent_id"], "price": top["amount"]}
+        elif t == "REVERSE_SEALED":
+            ranked = sorted(a["bids"], key=lambda b: (b["amount"], b["at"]))  # lowest wins; ties go to whoever bid first
+            if ranked:
+                result = {"outcome": "SOLD", "winner_agent_id": ranked[0]["agent_id"], "price": ranked[0]["amount"]}
+        elif t == "ENGLISH":
             top = a["bids"][-1] if a["bids"] else None
             if top and top["amount"] >= reserve:
                 result = {"outcome": "SOLD", "winner_agent_id": top["agent_id"], "price": top["amount"]}
@@ -301,7 +378,8 @@ class AuctionEngine:
         if result["outcome"] == "SOLD":
             self.store.market_history.append({
                 "category": a["product_spec"]["category"].lower(), "auction_type": t,
-                "price": result["price"], "quantity": a["product_spec"]["quantity"], "at": now, **({"demo": True} if a.get("demo") else {})})
+                "price": result["price"], "quantity": a["product_spec"]["quantity"], "at": now,
+                **({"demo": True} if a.get("demo") else {}), **({"reverse": True} if t in REVERSE else {})})
         self.events.emit("auction.settled", auction_id=a["auction_id"], result=result)
 
     # ---------- bidding ----------
@@ -324,15 +402,16 @@ class AuctionEngine:
         if not a:
             return fail("AUCTION_NOT_FOUND", "auction not found")
         agent = self.store.agents.get(agent_id)
-        if not agent or agent["agent_type"] != "BIDDER":
-            return fail("INVALID_BIDDER", "agent is not a bidder")
+        want = "SELLER" if is_reverse(a) else "BIDDER"
+        if not agent or agent["agent_type"] != want:
+            return fail("INVALID_BIDDER", "only supplier (seller) agents may quote on an RFQ" if want == "SELLER" else "agent is not a bidder")
         if agent["status"] != "ACTIVE":
             return fail("AGENT_NOT_ACTIVE", "agent is not active")
         self._advance(a)
         if not is_open(a):
             return fail("AUCTION_NOT_OPEN", f"auction is {a['status']}")
-        seller = self.store.agents.get(a["seller_agent_id"])
-        if seller and seller["principal_user_id"] == agent["principal_user_id"]:
+        poster = self.store.agents.get(poster_of(a))
+        if poster and poster["principal_user_id"] == agent["principal_user_id"]:
             return fail("SELF_BID", "principal cannot bid on their own listing")
         if not is_pos_int(amount):
             return fail("INVALID_AMOUNT", "amount must be a positive integer")
@@ -341,7 +420,27 @@ class AuctionEngine:
         bid = {"bid_id": str(uuid.uuid4()), "agent_id": agent_id, "amount": amount, "at": now,
                "bid_type": bid_type, "idempotency_key": idempotency_key}
         t = a["auction_type"]
-        if t == "ENGLISH":
+        if t == "REVERSE_ENGLISH":
+            hi = self.max_next_bid(a)
+            if amount > hi:
+                return fail("BID_TOO_HIGH", f"a quote must be at most {hi}", max_allowed=hi)
+            if a["bids"] and a["bids"][-1]["agent_id"] == agent_id:
+                return fail("ALREADY_LOWEST", "agent already holds the lowest quote")
+            a["bids"].append(bid)
+            a["current_price"] = amount
+            end = effective_end(a)
+            if a["anti_snipe"]["window_ms"] > 0 and end - now <= a["anti_snipe"]["window_ms"]:
+                a["extended_until"] = end + a["anti_snipe"]["extend_ms"]
+                a["status"] = "EXTENDING"
+                self.events.emit("auction.extended", auction_id=auction_id, extended_until=a["extended_until"])
+            self.events.emit("auction.bid", auction_id=auction_id, agent_id=agent_id, amount=amount)
+        elif t == "REVERSE_SEALED":
+            if amount > a["max_price"]:
+                return fail("BID_TOO_HIGH", f"a quote must be at most {a['max_price']}", max_allowed=a["max_price"])
+            a["bids"] = [b for b in a["bids"] if b["agent_id"] != agent_id]  # revisable until close
+            a["bids"].append(bid)
+            self.events.emit("auction.bid", auction_id=auction_id, agent_id=agent_id, sealed=True)
+        elif t == "ENGLISH":
             lo = self.min_next_bid(a, now)
             if amount < lo:
                 return fail("BID_TOO_LOW", f"minimum bid is {lo}", min_required=lo)

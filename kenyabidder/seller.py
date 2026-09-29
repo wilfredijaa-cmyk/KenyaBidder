@@ -15,7 +15,11 @@ class SellerService:
         engine.events.on("auction.settled", self._on_settled)
 
     def _on_settled(self, auction_id, result, **_):
-        if result["outcome"] == "NO_SALE":
+        a = self.store.auctions.get(auction_id) or {}
+        if result["outcome"] == "NO_SALE" and a.get("direction") == "REVERSE":
+            if a.get("poster_agent_id"):
+                self.notify(a["poster_agent_id"], "rfq", f"Your RFQ \"{a['product_spec']['title']}\" closed without any supplier quote. Raise the maximum price or widen the specification and repost.", auction_id=auction_id)
+        elif result["outcome"] == "NO_SALE":
             self.maybe_relist(auction_id)
 
     def maybe_relist(self, auction_id: str):

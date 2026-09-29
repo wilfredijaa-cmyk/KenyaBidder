@@ -9,7 +9,7 @@ import asyncio
 import logging
 import uuid
 
-from .engine import effective_end, is_open
+from .engine import effective_end, is_open, is_reverse, poster_of
 
 log = logging.getLogger("kenyabidder.orchestrator")
 
@@ -58,7 +58,8 @@ class Orchestrator:
     async def on_auction_created(self, auction_id: str) -> None:
         for agent in list(self.store.agents.values()):
             mem = agent["durable_memory"]
-            if agent["agent_type"] != "BIDDER" or agent["status"] != "ACTIVE" or not mem.get("auto_bid") or not mem.get("watch"):
+            a = self.store.auctions.get(auction_id)
+            if not a or agent["agent_type"] != ("SELLER" if is_reverse(a) else "BIDDER") or agent["status"] != "ACTIVE" or not mem.get("auto_bid") or not mem.get("watch"):
                 continue
             try:
                 await self.consider(agent["agent_id"], auction_id)
@@ -102,8 +103,10 @@ class Orchestrator:
             return "agent not active"
         if not is_open(a) and a["status"] != "SCHEDULED":
             return f"auction is {a['status']}"
-        seller = self.store.agents.get(a["seller_agent_id"])
-        if seller and seller["principal_user_id"] == agent["principal_user_id"]:
+        if agent["agent_type"] != ("SELLER" if is_reverse(a) else "BIDDER"):
+            return "this agent's type cannot take part in this kind of auction"
+        poster = self.store.agents.get(poster_of(a))
+        if poster and poster["principal_user_id"] == agent["principal_user_id"]:
             return "own listing"
         if w:
             s = a["product_spec"]
@@ -117,6 +120,10 @@ class Orchestrator:
                 text = f"{s['title']} {s.get('description', '')}".lower()
                 if not any(k.lower() in text for k in w["keywords"]):
                     return "keywords do not match"
+        if is_reverse(a):
+            if self.engine.max_next_bid(a) < max(agent["constraints"].get("reserve_floor", 0), 1):
+                return "the buyer's price is already below this agent's floor"
+            return None
         opening = a["dutch"]["floor_price"] if a["auction_type"] == "DUTCH" else self.engine.min_next_bid(a, now)
         if opening > agent["constraints"]["budget_ceiling"]:
             return "cheapest possible price is above the budget ceiling"
@@ -149,6 +156,9 @@ class Orchestrator:
             return self._request_participation(agent, a)
 
         stats = self.intel.historical_clearing_prices(a["product_spec"]["category"])
+        if is_reverse(a):  # what comparable RFQs cleared at, else the wider market
+            rev = self.intel.historical_clearing_prices(a["product_spec"]["category"], direction="REVERSE")
+            stats = rev if rev["count"] >= 3 else stats
         strat = self.strategy_for(agent, a["auction_type"])
         proposal = await strat.propose({"agent": agent, "auction": a, "intel": {"stats": stats}})
 
