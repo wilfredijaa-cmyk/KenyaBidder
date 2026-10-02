@@ -5,3 +5,7 @@ data/
 *.log
 .pytest_cache/
 .nicegui/
+deploy/.env
+.env
+*.key
+.encryption_key

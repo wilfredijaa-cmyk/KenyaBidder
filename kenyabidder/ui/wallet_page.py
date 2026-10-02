@@ -4,7 +4,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from ..terms import get_terms
-from .common import (active_agent, badge, core, empty, fmt_datetime, frame, guard, kes, login_user, my_agents, pretty, require_user, theme)
+from .common import (active_agent, badge, core, empty, fmt_datetime, frame, guard, kes, my_agents, pretty, refresh_session, require_user, theme)
 
 STATUS_COLOR = {"PAID": "positive", "PENDING": "warning", "AWAITING_REVIEW": "warning", "FAILED": "negative", "REJECTED": "negative",
                 "CANCELLED": "grey", "EXPIRED": "grey", "REFUNDED": "grey"}
@@ -291,13 +291,15 @@ def security_card(user: dict) -> None:
                 def confirm():
                     state["codes"] = c.agents.totp_confirm(user["id"], code.value)
                     state["seed"] = None
-                    login_user(c.store.users[user["id"]])  # enrolling ends other sessions; keep this one
+                    refresh_session(c.store.users[user["id"]])  # enrolling ends other sessions; keep this one
                     card.refresh()
                 ui.button("Turn on", icon="verified_user", on_click=confirm).props("unelevated color=primary no-caps")
             elif not enabled:
+                bpw = ui.input("Confirm your password to begin", password=True).classes("w-64")
+
                 @guard
                 def begin():
-                    state["seed"] = c.agents.totp_begin(user["id"])
+                    state["seed"] = c.agents.totp_begin(user["id"], bpw.value)
                     card.refresh()
                 ui.button("Set up", icon="qr_code", on_click=begin).props("unelevated color=primary no-caps")
             else:
@@ -314,7 +316,7 @@ def security_card(user: dict) -> None:
             @guard
             def everywhere():
                 c.agents.set_password_epoch(user["id"])
-                login_user(c.store.users[user["id"]])
+                refresh_session(c.store.users[user["id"]])
                 ui.notify("Every other session was signed out", type="positive")
             ui.button("Sign out everywhere else", icon="devices", on_click=everywhere).props("flat no-caps dense")
     card()
@@ -426,7 +428,7 @@ def profile_page():
             @guard
             def change():
                 c.agents.change_password(user["id"], old.value, new.value)
-                login_user(user)  # the change ended every session — keep this browser signed in
+                refresh_session(c.store.users[user["id"]])  # the change ended every session — keep this browser signed in
                 old.set_value("")
                 new.set_value("")
                 ui.notify("Password changed", type="positive")

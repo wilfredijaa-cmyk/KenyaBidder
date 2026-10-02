@@ -88,6 +88,8 @@ class McpManager:
                 continue
             if k == "bearer_token" and v == "":
                 continue  # blank = keep
+            if k == "url" and m.get("transport") == "http":
+                check_outbound_url(str(v).strip(), "url")  # the guard applies to edits too, not only to registration
             m[k] = v
         return m
 
@@ -133,6 +135,7 @@ class McpManager:
         if t == "builtin":
             return Client(self._builtin_server())
         if t == "http":
+            check_outbound_url(m["url"], "url")  # re-checked at connect time (DNS answers change)
             token = m.get("bearer_token") or (os.environ.get(m["bearer_env"]) if m.get("bearer_env") else None)
             headers = {"authorization": f"Bearer {token}"} if token else None
             return Client(StreamableHttpTransport(m["url"], headers=headers))

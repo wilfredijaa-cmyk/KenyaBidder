@@ -90,13 +90,39 @@ def build(runtime: runtime_mod.Runtime) -> None:
             raise HTTPException(e.status, e.message) from None
 
 
+def _recover(args) -> None:
+    """Offline account recovery for an administrator who lost their phone AND recovery codes (run on the server, app stopped)."""
+    import secrets
+    if len(args.command) != 2:
+        sys.exit(f"usage: python -m kenyabidder {args.command[0]} <user name>")
+    rt = runtime_mod.Runtime(data_file=args.data or None)  # takes the writer lease: refuses to run if the app is up
+    try:
+        agents = rt.app.agents
+        u = agents._find(args.command[1])
+        if not u:
+            sys.exit(f"no such user: {args.command[1]!r}")
+        if args.command[0] == "reset-2fa":
+            agents.admin_reset_2fa(u["id"])
+            print(f"two-factor authentication removed for {u['name']}; they must enrol again at next sign-in")
+        else:
+            pw = "-".join(secrets.token_hex(2) for _ in range(5))
+            agents.set_password(u["id"], pw)
+            print(f"temporary password for {u['name']}: {pw}\nGive it to them over a trusted channel; they should change it immediately.")
+        rt.app.billing.log_admin(None, "cli_" + args.command[0].replace("-", "_"), user=u["name"])
+        rt.persistence.flush_all(rt.store)
+        rt.persistence.release_lease()
+    finally:
+        rt.app.wallet.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="kenyabidder", description="KenyaBidder — AI auction matchmaking")
     p.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)))
     p.add_argument("--data", default=os.environ.get("KENYABIDDER_DATA", "data/state.json"), help="data file location; state lives in kenyabidder.duckdb beside it ('' = in-memory only; set KENYABIDDER_DATABASE_URL for PostgreSQL)")
     p.add_argument("--mcp-port", type=int, default=int(os.environ.get("KENYABIDDER_MCP_PORT", 0)), help="serve KenyaBidder's FastMCP endpoint on this port (0 = off)")
-    p.add_argument("command", nargs="*", help="'restore <backup file>' — replace the database with a backup (app must be stopped)")
+    p.add_argument("command", nargs="*", help="'restore <backup file>' (replace the database with a backup), 'reset-2fa <name>' or 'reset-password <name>' "
+                   "(account recovery) — all need the app stopped")
     args = p.parse_args(argv)
     if args.command[:1] == ["restore"]:
         from .backups import restore_backup
@@ -105,6 +131,9 @@ def main(argv: list[str] | None = None) -> None:
         dest = os.path.join(os.path.dirname(args.data or "data/state.json") or ".", "kenyabidder.duckdb")
         restore_backup(args.command[1], dest)
         print(f"Restored {args.command[1]} to {dest} (previous database kept as .before-restore-<time>). Start the app again.")
+        return
+    if args.command[:1] in (["reset-2fa"], ["reset-password"]):
+        _recover(args)
         return
     metrics_mod.configure_logging()
     for h in logging.getLogger().handlers:

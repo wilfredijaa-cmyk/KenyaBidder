@@ -59,11 +59,26 @@ class ClientIP:
 
     def from_scope(self, scope: dict) -> str:
         client = scope.get("client")
-        xff = next((v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"x-forwarded-for"), None)
+        # a proxy may append a SEPARATE X-Forwarded-For line instead of extending one: join them all, in order
+        xff = ", ".join(v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"x-forwarded-for") or None
         return self.resolve(client[0] if client else None, xff)
 
     def from_request(self, request) -> str:
-        return self.resolve(request.client.host if request.client else None, request.headers.get("x-forwarded-for"))
+        xff = ", ".join(request.headers.getlist("x-forwarded-for")) or None
+        return self.resolve(request.client.host if request.client else None, xff)
+
+    @staticmethod
+    def key(ip: str) -> str:
+        """Bucket key: an IPv6 /64 is one subscriber (a client can mint 2^64 addresses), IPv4-mapped IPv6 collapses to IPv4."""
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return ip
+        if a.version == 6:
+            if a.ipv4_mapped:
+                return str(a.ipv4_mapped)
+            return str(ipaddress.ip_network(f"{a}/64", strict=False).network_address) + "/64"
+        return str(a)
 
 
 # ------------------------------------------------------------------ sliding-window throttles
@@ -111,6 +126,12 @@ class Throttle:
         if self.count(bucket, key, window_s) >= limit:
             raise AppError("RATE_LIMITED", message, 429)
 
+    def forgive(self, bucket: str, key: str) -> None:
+        """Take back the most recent hit (a provisional failure that turned out to be a success)."""
+        d = self._hits.get((bucket, key))
+        if d:
+            d.pop()
+
     def record(self, bucket: str, key: str) -> None:
         self._sweep(self._now())
         self._hits[(bucket, key)].append(self._now())
@@ -154,7 +175,7 @@ class HardeningMiddleware:
     async def __call__(self, scope, receive, send):
         t = scope["type"]
         if t == "websocket":
-            ip = self.ip.from_scope(scope)
+            ip = self.ip.key(self.ip.from_scope(scope))
             if self._ws[ip] >= self.ws_per_ip:
                 await send({"type": "websocket.close", "code": 1013})
                 return
@@ -169,10 +190,10 @@ class HardeningMiddleware:
         if t != "http":
             await self.app(scope, receive, send)
             return
-        path, ip = scope.get("path", ""), self.ip.from_scope(scope)
+        path, ip = scope.get("path", ""), self.ip.key(self.ip.from_scope(scope))
         scope["kb_client_ip"] = ip
         # the UI's own transport (static assets, socket.io long-polling) is not a request budget item: connection counts cap it instead
-        static = path.startswith(("/_nicegui/", "/_nicegui_ws/", "/static/")) and scope["method"] in ("GET", "POST")
+        static = (path.startswith(("/_nicegui/", "/static/")) and scope["method"] == "GET") or path.startswith("/_nicegui_ws/")
         if not static:
             bucket, limit = ("webhook", self.webhook_per_minute) if path.startswith("/webhooks/") else ("http", self.http_per_minute)
             try:
@@ -290,15 +311,27 @@ def check_password(password: str, *, name: str = "", phone: str = "", email: str
 
 # ------------------------------------------------------------------ log redaction
 
-_REDACT = [(re.compile(r"(/webhooks/mpesa/)[^\s/?\"']+"), r"\1***"), (re.compile(r"(?i)\b(bearer|authorization:?)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
-           (re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passkey)(\"?\s*[:=]\s*\"?)[^\s\"',}&]{4,}"), r"\1\2***"),
-           (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-***"), (re.compile(r"\+?254[17]\d{8}"), "+254*******")]
+_REDACT = [
+    (re.compile(r"(/webhooks/mpesa/)[^\s/?\"']+"), r"\1***"),
+    (re.compile(r"(?i)\b(bearer|authorization:?)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
+    # NAME=value, NAME: value, "NAME": "value", 'NAME': 'value' — where NAME merely CONTAINS key/secret/token/password/passkey (SMTP_PASSWORD, access_token…)
+    (re.compile(r"(?i)([A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd|passkey|credential)[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?)[^\s\"',})&]{3,}"), r"\1***"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-***"),
+    (re.compile(r"(?<!\d)(?:\+?254|0)[\s-]?[17](?:[\s-]?\d){8}(?!\d)"), "+254*******"),
+]
 
 
 def redact(text: str) -> str:
     for rx, rep in _REDACT:
         text = rx.sub(rep, text)
     return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """Redacts the FINAL line — including tracebacks and exception text, which a record filter never sees."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
 
 class RedactingFilter(logging.Filter):

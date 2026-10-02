@@ -35,6 +35,7 @@ def test_scorecard_reflects_deals_response_time_and_verification(env):
     card = env.insights.scorecard(buyer["agent_id"])
     assert card["deals"] == 1 and card["completed"] == 1 and card["completion_rate"] == 1.0 and card["win_rate"] == 1.0 and card["first_quote_s"] == 0
     env.store.users[ub["id"]]["verified_business"] = {"name": "Acme"}
+    env.clock.advance(16_000)  # scorecards are memoised for 15s (the auction page asks every second)
     assert "✓ verified" in env.insights.badge_text(env.insights.scorecard(buyer["agent_id"]))
     assert "100% completed" in env.insights.badge_text(card)
 
@@ -180,3 +181,55 @@ def test_ban_poster_suspends_the_account_and_takes_the_listing_down(env):
     env.moderation.report(r["id"], aid, "FRAUD")
     env.moderation.resolve(ADMIN, env.moderation.open_reports()[0]["id"], "BAN_POSTER", "repeat scammer")
     assert env.store.users[us["id"]]["suspended"] and env.engine.get_auction(aid)["status"] == "CANCELLED"
+
+
+def test_scorecards_are_computed_in_one_pass_and_memoised(env):
+    us, seller = env.seller()
+    ub, buyer = env.bidder()
+    deal(env, seller, buyer)
+    calls = {"n": 0}
+    real = env.store.matches
+
+    class Counting(dict):
+        def values(self):
+            calls["n"] += 1
+            return super().values()
+    env.store.matches = Counting(real)
+    env.insights.scorecards({buyer["agent_id"], seller["agent_id"], "ghost-agent"})
+    assert calls["n"] == 1  # one scan for any number of agents
+    env.insights.scorecards({buyer["agent_id"], seller["agent_id"]})
+    assert calls["n"] == 1  # memoised
+    assert env.insights.scorecard("ghost-agent")["tier"] == "NEW"  # unknown agents don't crash the page
+
+
+def test_prohibited_check_is_normalised_scans_all_fields_and_spares_legitimate_trade(env):
+    _, seller = env.seller()
+
+    def post(**spec):
+        return env.english(seller["agent_id"], product_spec={"category": "misc", "title": "Parcel", "quantity": 1, **spec})
+    for evasion in ({"title": "fake  id cards"}, {"title": "fake\nid"}, {"description": "fire\u200barm parts"}, {"title": "\uff26\uff29\uff32\uff25\uff21\uff32\uff2d"},
+                    {"condition": "stolen"}):
+        with pytest.raises(AppError) as e:
+            post(**evasion)
+        assert e.value.code == "PROHIBITED_ITEM", evasion
+    for ok in ("Ivory Coast cocoa 50kg", "Forged steel bolts M10", "Counterfeit-proof ink pens", "Glue gun set"):
+        post(title=ok)
+    env.store.settings["prohibited_terms"] = "gun, knife"  # a mis-stored string is tolerated, not split into letters
+    with pytest.raises(AppError):
+        post(title="Kitchen knife")
+
+
+def test_repost_keeps_the_opening_price_and_refuses_moderator_removals(env):
+    us, seller = env.seller()
+    aid = env.english(seller["agent_id"], reserve_price=0, start_price=500, duration_ms=1_000)["auction_id"]
+    env.clock.advance(2_000)
+    env.engine.tick()
+    v = env.engine.repost(auction_id=aid, agent_id=seller["agent_id"])
+    assert v["start_price"] == 500  # a zero reserve no longer wipes the opening price
+    bad_id = env.english(seller["agent_id"], duration_ms=600_000)["auction_id"]
+    r = env.bidder(name="Rep", phone="+254711888888")[0]
+    env.moderation.report(r["id"], bad_id, "FRAUD")
+    env.moderation.resolve(ADMIN, env.moderation.open_reports()[0]["id"], "TAKEDOWN", "scam")
+    with pytest.raises(AppError) as e:
+        env.engine.repost(auction_id=bad_id, agent_id=seller["agent_id"])
+    assert e.value.code == "REMOVED"

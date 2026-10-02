@@ -25,6 +25,7 @@ def public_https(env=os.environ) -> bool:
 
 
 def validate(env=os.environ, *, host: str = "127.0.0.1", durable: bool = True) -> Report:
+    env = {k: v.strip() for k, v in dict(env).items() if isinstance(v, str) and v.strip()}  # blank values (an empty .env line) count as unset
     r = Report()
     prod = is_production(env)
     bad = r.errors if prod else r.warnings

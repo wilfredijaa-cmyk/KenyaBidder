@@ -208,6 +208,8 @@ class AuctionEngine:
             raise forbidden("NOT_LISTING_OWNER", "only the agent that posted it can run it again")
         if a["status"] not in ("SETTLED", "CANCELLED"):
             raise AppError("STILL_RUNNING", "this one is still running", 409)
+        if str((a.get("result") or {}).get("reason", "")).startswith("removed by moderators"):
+            raise forbidden("REMOVED", "this listing was removed by moderators and can't be re-posted — post a new, compliant one")
         if not (-90 <= price_change_pct <= 500):
             raise bad("INVALID_PRICE", "price change must be between -90% and +500%")
         k = 1 + price_change_pct / 100
@@ -219,7 +221,7 @@ class AuctionEngine:
         kw = dict(seller_agent_id=agent_id, product_spec=spec, auction_type=a["auction_type"], duration_ms=dur, reserve_price=round(a["reserve_price"] * k),
                   verified_only=a.get("verified_only", False))
         if a["auction_type"] == "ENGLISH":
-            kw.update(start_price=min(kw["reserve_price"], round((a["start_price"] or 0) * k)), min_increment=a["min_increment"], anti_snipe=a["anti_snipe"] if a["anti_snipe"]["window_ms"] else None)
+            kw.update(start_price=round((a["start_price"] or 0) * k), min_increment=a["min_increment"], anti_snipe=a["anti_snipe"] if a["anti_snipe"]["window_ms"] else None)
         elif a["auction_type"] == "DUTCH":
             d = a["dutch"]
             floor = max(kw["reserve_price"], round(d["floor_price"] * k))

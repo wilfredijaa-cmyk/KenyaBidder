@@ -92,7 +92,7 @@ ADMIN_IDLE_MS = 30 * 60_000             # …and a much shorter one for administ
 def client_ip() -> str:
     """The caller's real address (X-Forwarded-For honoured only from configured trusted proxies)."""
     try:
-        return core().client_ip.from_request(context.client.request)
+        return core().client_ip.key(core().client_ip.from_request(context.client.request))
     except Exception:  # noqa: BLE001  no request context (tests, background work)
         return "unknown"
 
@@ -104,7 +104,7 @@ def current_user() -> dict | None:
     if u:
         now = core().clock.now()
         idle = ADMIN_IDLE_MS if u["role"] == "admin" else SESSION_IDLE_MS
-        if now - st.get("at", now) > SESSION_MAX_MS or now - st.get("seen", now) > idle:
+        if "at" not in st or now - st["at"] > SESSION_MAX_MS or now - st.get("seen", now) > idle:  # (no stamp = older release: sign in again)
             st.clear()  # expired: a stolen cookie or an unattended screen stops working
             return None
         if now - st.get("seen", 0) > 60_000:
@@ -121,6 +121,12 @@ def login_user(user: dict) -> None:
     ng_app.storage.user.update(uid=user["id"], sv=user.get("session_version", 0), at=now, seen=now)
     if lang:
         ng_app.storage.user["lang"] = lang
+
+
+def refresh_session(user: dict) -> None:
+    """Keep THIS browser signed in after a credential change (which ended every other session) WITHOUT extending its absolute lifetime."""
+    st = ng_app.storage.user
+    st["sv"], st["seen"] = user.get("session_version", 0), core().clock.now()
 
 
 def logout() -> None:

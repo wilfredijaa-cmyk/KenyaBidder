@@ -446,3 +446,34 @@ async def test_whatsapp_replays_are_ignored_by_message_id(env):
     b["constraints"]["budget_ceiling"] = 1_000  # someone changes it back…
     again = await handle_whatsapp_webhook(env.router, body, None, secret="", allow_unsigned=True)  # …and the captured request is replayed
     assert again.get("duplicate") and b["constraints"]["budget_ceiling"] == 1_000
+
+
+async def test_whatsapp_commands_are_marked_seen_only_after_they_ran_and_stale_deliveries_are_dropped(env, monkeypatch):
+    import json
+    from kenyabidder.channels import handle_whatsapp_webhook
+    _, b = env.bidder(ceiling=50_000, phone="+254711000654")
+    env.link_whatsapp(b, "254711000654")
+
+    def payload(mid, text, ts=None):
+        m = {"id": mid, "from": "254711000654", "text": {"body": text}}
+        if ts is not None:
+            m["timestamp"] = str(int(ts))
+        return json.dumps({"entry": [{"changes": [{"value": {"messages": [m]}}]}]}).encode()
+    real = env.router.handle_inbound
+    calls = {"n": 0}
+
+    async def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient failure")
+        return await real(*a, **k)
+    monkeypatch.setattr(env.router, "handle_inbound", flaky)
+    with pytest.raises(RuntimeError):
+        await handle_whatsapp_webhook(env.router, payload("wamid.1", "ceiling 70000"), None, secret="", allow_unsigned=True)
+    assert "wamid.1" not in env.store.settings.get("wa_seen", [])  # it did not run, so Meta's retry must still be able to deliver it
+    ok = await handle_whatsapp_webhook(env.router, payload("wamid.1", "ceiling 70000"), None, secret="", allow_unsigned=True)
+    assert ok["handled"] == 1 and b["constraints"]["budget_ceiling"] == 70_000
+    old = env.clock.now() / 1000 - 7200
+    stale = await handle_whatsapp_webhook(env.router, payload("wamid.2", "ceiling 1"), None, secret="", allow_unsigned=True) if False else \
+        await handle_whatsapp_webhook(env.router, payload("wamid.9", "ceiling 1", ts=old), None, secret="", allow_unsigned=True)
+    assert stale.get("duplicate") and b["constraints"]["budget_ceiling"] == 70_000  # a captured request replayed hours later does nothing

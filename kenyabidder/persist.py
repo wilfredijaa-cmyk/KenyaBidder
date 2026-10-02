@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 from .db import Database, DatabaseError, IntegrityError
-from .secretbox import SecretBox, seal, seal_settings, unseal, unseal_settings
+from .secretbox import SecretBox, needs_sealing, seal, seal_settings, settings_need_sealing, unseal, unseal_settings
 from .store import LIST_KEYS, MAP_KEYS, Log, Store
 
 log = logging.getLogger("kenyabidder.persist")
@@ -99,9 +99,12 @@ class StatePersistence:
         for name in MAP_KEYS:
             target = getattr(s, name)
             for r in self.db.query("SELECT id, body FROM docs WHERE collection = ?", (name,)):
-                ent = unseal(self.box, name, json.loads(r["body"]))
+                raw = json.loads(r["body"])
+                legacy = needs_sealing(name, raw)
+                ent = unseal(self.box, name, raw)
                 target[r["id"]] = ent
-                self._seen[name][r["id"]] = _digest(_dump(ent))
+                # a row still holding clear-text secrets is left "unseen" so the very next flush rewrites it encrypted
+                self._seen[name][r["id"]] = b"" if legacy else _digest(_dump(ent))
                 self._maybe_freeze(name, r["id"], ent)
         for name in LIST_KEYS:
             lst: Log = getattr(s, name)
@@ -123,9 +126,11 @@ class StatePersistence:
         for key, attr in (("considered", "considered"), ("settings", "settings")):
             body = self._kv_get(key)
             if body is not None:
+                legacy = key == "settings" and settings_need_sealing(body)
                 body = unseal_settings(self.box, body) if key == "settings" else body
                 setattr(s, attr, set(body) if key == "considered" else body)
-                self._kv_seen[key] = _digest(_dump(sorted(body) if key == "considered" else body))
+                if not legacy:
+                    self._kv_seen[key] = _digest(_dump(sorted(body) if key == "considered" else body))
         return s.upgrade()
 
     def _kv_get(self, key: str):

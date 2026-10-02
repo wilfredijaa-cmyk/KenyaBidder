@@ -28,6 +28,8 @@ class SecretBox:
             p = Path(key_file)
             if p.exists():
                 key = p.read_text().strip()
+                if not key:  # a crash/touch left an empty file: silently using a throwaway key would make everything we encrypt unreadable later
+                    raise ValueError(f"encryption key file {p} is empty — restore it from your backup, or delete it only if nothing was ever encrypted with it")
             else:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 key = Fernet.generate_key().decode()
@@ -45,7 +47,8 @@ class SecretBox:
             raise ValueError("KENYABIDDER_ENCRYPTION_KEY must be 32 url-safe base64-encoded bytes (generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')") from e
 
     def encrypt(self, value: str) -> str:
-        if not isinstance(value, str) or value.startswith(PREFIX) or value == "":
+        """Always encrypts (the in-memory working copy is always plaintext, so a value that merely LOOKS sealed is still just a value)."""
+        if not isinstance(value, str) or value == "":
             return value
         return PREFIX + self._f.encrypt(value.encode()).decode()
 
@@ -96,6 +99,28 @@ def _copy_paths(ent: dict, paths: list[str]) -> dict:
             if isinstance(cur_src.get(last), dict):
                 cur_out[last] = dict(cur_src[last])
     return out
+
+
+def needs_sealing(collection: str, raw: dict) -> bool:
+    """True if a stored document still holds any sensitive value in the clear (written before encryption existed)."""
+    paths = SENSITIVE.get(collection)
+    if not paths or not isinstance(raw, dict):
+        return False
+    found = []
+
+    def probe(v: str) -> str:
+        if v and not v.startswith(PREFIX):
+            found.append(v)
+        return v
+    import copy
+    tmp = copy.deepcopy(raw)
+    for p in paths:
+        _walk(tmp, p.split("."), probe)
+    return bool(found)
+
+
+def settings_need_sealing(raw: dict) -> bool:
+    return any(isinstance(raw.get(k), str) and raw[k] and not raw[k].startswith(PREFIX) for k in SENSITIVE_SETTINGS)
 
 
 def seal(box: SecretBox, collection: str, ent):

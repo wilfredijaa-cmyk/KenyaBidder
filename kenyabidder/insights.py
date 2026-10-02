@@ -44,32 +44,61 @@ class Insights:
 
     # ---------------- scorecards ----------------
 
-    def _matches(self, agent_id: str) -> list[dict]:
-        return [m for m in self.store.matches.values() if agent_id in (m["seller_agent_id"], m["buyer_agent_id"])]
+    MEMO_MS = 15_000
 
-    def first_quote_seconds(self, agent_id: str) -> int | None:
-        """Mean time from an auction opening to this agent's first bid on it — the 'response time' competitors care about."""
-        lags = []
-        for a in self.store.auctions.values():
-            mine = [b["at"] for b in a["bids"] if b["agent_id"] == agent_id]
-            if mine:
-                lags.append(max(0, min(mine) - a["starts_at"]) / 1000)
-        return round(sum(lags) / len(lags)) if lags else None
+    def scorecards(self, agent_ids) -> dict[str, dict]:
+        """Scorecards for several agents in ONE pass over matches, disputes and auctions (the auction page asks for every bidder every second)."""
+        now = self.clock.now()
+        memo = self.__dict__.setdefault("_memo", {})
+        out, todo = {}, set()
+        for aid in set(agent_ids):
+            hit = memo.get(aid)
+            if hit and now - hit[0] < self.MEMO_MS:
+                out[aid] = hit[1]
+            else:
+                todo.add(aid)
+        if todo:
+            finals = {a: [] for a in todo}
+            for m in self.store.matches.values():
+                if m["status"] in FINAL:
+                    for aid in (m["seller_agent_id"], m["buyer_agent_id"]):
+                        if aid in finals:
+                            finals[aid].append(m)
+            disputes = dict.fromkeys(todo, 0)
+            for d in self.store.disputes.values():
+                for aid in (d["opened_by"], d["against"]):
+                    if aid in disputes:
+                        disputes[aid] += 1
+            entered, wins, lags = dict.fromkeys(todo, 0), dict.fromkeys(todo, 0), {a: [] for a in todo}
+            for a in self.store.auctions.values():
+                first: dict[str, int] = {}
+                for b in a["bids"]:
+                    if b["agent_id"] in todo and b["agent_id"] not in first:
+                        first[b["agent_id"]] = b["at"]
+                for aid, at in first.items():
+                    lags[aid].append(max(0, at - a["starts_at"]) / 1000)
+                    if a["status"] == "SETTLED":
+                        entered[aid] += 1
+                        wins[aid] += (a["result"] or {}).get("winner_agent_id") == aid
+            for aid in todo:
+                agent = self.store.agents.get(aid) or {}
+                rep = agent.get("reputation") or {}
+                user = self.store.users.get(agent.get("principal_user_id") or "") or {}
+                fm = finals[aid]
+                done = sum(1 for m in fm if m["status"] == "COMPLETED")
+                card = {"agent_id": aid, "tier": rep.get("tier", "NEW"), "score": rep.get("score"), "deals": len(fm), "completed": done,
+                        "completion_rate": round(done / len(fm), 2) if fm else None, "at_fault": sum(1 for m in fm if aid in m["fault_agent_ids"]),
+                        "disputes": disputes[aid], "win_rate": round(wins[aid] / entered[aid], 2) if entered[aid] else None,
+                        "first_quote_s": round(sum(lags[aid]) / len(lags[aid])) if lags[aid] else None,
+                        "verified": bool(user.get("verified_business")), "verified_name": (user.get("verified_business") or {}).get("name")}
+                memo[aid] = (now, card)
+                out[aid] = card
+            if len(memo) > 5_000:
+                memo.clear()
+        return out
 
     def scorecard(self, agent_id: str) -> dict:
-        agent = self.store.agents.get(agent_id) or {}
-        rep = agent.get("reputation") or {}
-        user = self.store.users.get(agent.get("principal_user_id") or "") or {}
-        finals = [m for m in self._matches(agent_id) if m["status"] in FINAL]
-        done = sum(1 for m in finals if m["status"] == "COMPLETED")
-        faults = sum(1 for m in finals if agent_id in m["fault_agent_ids"])
-        disputes = sum(1 for d in self.store.disputes.values() if agent_id in (d["opened_by"], d["against"]))
-        entered = [a for a in self.store.auctions.values() if any(b["agent_id"] == agent_id for b in a["bids"]) and a["status"] == "SETTLED"]
-        wins = sum(1 for a in entered if (a["result"] or {}).get("winner_agent_id") == agent_id)
-        return {"agent_id": agent_id, "tier": rep.get("tier", "NEW"), "score": rep.get("score"), "deals": len(finals), "completed": done,
-                "completion_rate": round(done / len(finals), 2) if finals else None, "at_fault": faults, "disputes": disputes,
-                "win_rate": round(wins / len(entered), 2) if entered else None, "first_quote_s": self.first_quote_seconds(agent_id),
-                "verified": bool(user.get("verified_business")), "verified_name": (user.get("verified_business") or {}).get("name")}
+        return self.scorecards([agent_id])[agent_id]
 
     @staticmethod
     def badge_text(card: dict) -> str:
@@ -89,8 +118,9 @@ class Insights:
     def comparison(self, view: dict, reverse: bool) -> list[dict]:
         """Rows for the bids a viewer is allowed to see (the engine's view already hides sealed bids), best price first, with who they are."""
         rows = []
+        cards = self.scorecards({b["agent_id"] for b in view["bids"]})
         for b in view["bids"]:
-            card = self.scorecard(b["agent_id"])
+            card = cards[b["agent_id"]]
             rows.append({"agent_id": b["agent_id"], "amount": b["amount"], "at": b["at"], "after_s": max(0, round((b["at"] - view["starts_at"]) / 1000)),
                          "card": card, "summary": self.badge_text(card)})
         rows.sort(key=lambda r: (r["amount"] if reverse else -r["amount"], r["at"]))

@@ -88,7 +88,11 @@ def configure_logging(json_logs: bool | None = None) -> None:
     if json_logs is None:
         json_logs = os.environ.get("KENYABIDDER_LOG_JSON") == "1"
     h = logging.StreamHandler()
-    h.setFormatter(JsonFormatter() if json_logs else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    from .security import redact
+    fmt = JsonFormatter() if json_logs else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    plain = fmt.format
+    fmt.format = lambda record: redact(plain(record))  # redact the FINAL text (tracebacks and exception messages included)
+    h.setFormatter(fmt)
     root = logging.getLogger()
     root.handlers[:] = [h]
     root.setLevel(logging.INFO)

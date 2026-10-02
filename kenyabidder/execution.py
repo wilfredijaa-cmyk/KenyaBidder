@@ -260,7 +260,7 @@ class ExecutionEngine:
         elif res.get("code") in ("VERIFIED_ONLY", "VERIFICATION_REQUIRED"):
             t["status"], t["last_error"] = "BLOCKED", res["code"]
             self.notify(t["agent_id"], "verification", f"Your agent could not act on \"{title}\": {res.get('message')}", auction_id=a["auction_id"])
-        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST", "ALREADY_LOWEST") and not (res.get("code") == "BID_TOO_HIGH" and t["kind"] in REPEATING):
+        elif res.get("code") not in ("BID_TOO_LOW", "ALREADY_HIGHEST", "ALREADY_LOWEST", "PLATFORM_PAUSED", "AUCTION_UNDER_REVIEW") and not (res.get("code") == "BID_TOO_HIGH" and t["kind"] in REPEATING):
             # (a sealed quote above the buyer's maximum can never become valid: block it instead of refiring every tick)
             t["status"], t["last_error"] = "BLOCKED", res.get("code")
         return False

@@ -50,7 +50,7 @@ def test_totp_rfc6238_vector_and_replay_protection():
 
 def test_two_factor_enrolment_login_step_recovery_and_lockout(env):
     u = env.agents.create_user(name="Admin Boss", password="password123")
-    seed = env.agents.totp_begin(u["id"])
+    seed = env.agents.totp_begin(u["id"], "password123")
     assert seed["uri"].startswith("otpauth://totp/KenyaBidder")
     with pytest.raises(AppError):
         env.agents.totp_confirm(u["id"], "000000")
@@ -74,7 +74,7 @@ def test_admins_are_locked_out_of_the_console_until_two_factor_is_on_when_requir
     assert admin["role"] == "admin" and env.agents.admin_2fa_ok(admin)  # optional by default in dev
     env.store.settings["require_admin_2fa"] = True
     assert not env.agents.admin_2fa_ok(admin)
-    seed = env.agents.totp_begin(admin["id"])
+    seed = env.agents.totp_begin(admin["id"], "password123")
     env.agents.totp_confirm(admin["id"], totp._code(seed["secret"], int(env.clock.now() / 1000 // 30)))
     assert env.agents.admin_2fa_ok(admin)
     with pytest.raises(AppError) as e:
@@ -268,3 +268,135 @@ def test_pause_all_cancels_live_plans_of_every_agent_of_the_user(env):
         env.execution.register_trigger(agent_id=a["agent_id"], auction_id=aid, kind="ENGLISH_INCREMENTAL", params={"max_bid": 3000})
     assert env.agents.pause_all(ub["id"]) == 2
     assert all(a["status"] == "PAUSED" for a in (b1, b2)) and not [t for t in env.store.triggers.values() if t["status"] == "ACTIVE"]
+
+
+def test_enrolling_two_factor_needs_the_password_and_admins_can_reset_a_lost_factor(env):
+    u = env.agents.create_user(name="Someone", password="password123")
+    with pytest.raises(AppError) as e:
+        env.agents.totp_begin(u["id"], "wrong-password")  # a hijacked/unattended session cannot bind its own phone
+    assert e.value.code == "WRONG_PASSWORD"
+    seed = env.agents.totp_begin(u["id"], "password123")
+    env.agents.totp_confirm(u["id"], totp._code(seed["secret"], int(env.clock.now() / 1000 // 30)))
+    before = env.store.users[u["id"]]["session_version"]
+    env.agents.admin_reset_2fa(u["id"])
+    assert not env.agents.totp_enabled(env.store.users[u["id"]]) and env.store.users[u["id"]]["session_version"] == before + 1
+
+
+def test_cli_recovery_resets_two_factor_and_password_offline(tmp_path):
+    from kenyabidder.__main__ import main
+    from kenyabidder.runtime import Runtime
+    f = str(tmp_path / "state.json")
+
+    async def prep():
+        rt = Runtime(data_file=f)
+        a = rt.app.agents.create_user(name="Boss", password="password123")
+        seed = rt.app.agents.totp_begin(a["id"], "password123")
+        rt.app.agents.totp_confirm(a["id"], totp._code(seed["secret"], int(rt.app.clock.now() / 1000 // 30)))
+        await rt.stop()
+    asyncio.run(prep())
+    main(["--data", f, "reset-2fa", "Boss"])
+    main(["--data", f, "reset-password", "Boss"])
+
+    async def check():
+        rt = Runtime(data_file=f)
+        u = rt.app.agents._find("Boss")
+        assert not rt.app.agents.totp_enabled(u) and rt.app.agents.authenticate("Boss", "password123") is None
+        await rt.stop()
+    asyncio.run(check())
+    with pytest.raises(SystemExit):
+        main(["--data", f, "reset-2fa", "Nobody"])
+
+
+# ------------------------------------------------------------------ fixes from the third security review
+
+async def test_a_pause_or_moderation_hold_does_not_kill_autonomous_plans(env):
+    _, seller = env.seller()
+    _, buyer = env.bidder()
+    aid = env.english(seller["agent_id"], duration_ms=600_000)["auction_id"]
+    t = env.execution.register_trigger(agent_id=buyer["agent_id"], auction_id=aid, kind="ENGLISH_INCREMENTAL", params={"max_bid": 3000, "snipe_window_ms": 599_000})
+    env.store.settings["platform_paused"] = True
+    env.clock.advance(5_000)
+    env.execution.evaluate_all()
+    assert t["status"] == "ACTIVE"  # transient: not BLOCKED
+    env.store.settings["platform_paused"] = False
+    env.execution.evaluate_all()
+    assert env.engine.get_auction(aid)["bids"]  # and it bids once the pause lifts
+
+
+def test_ipv6_clients_share_one_budget_per_64_and_xff_lines_are_joined():
+    assert ClientIP.key("2001:db8:1:2:aaaa::1") == ClientIP.key("2001:db8:1:2:bbbb::9")
+    assert ClientIP.key("2001:db8:1:3::1") != ClientIP.key("2001:db8:1:2::1")
+    assert ClientIP.key("::ffff:203.0.113.7") == "203.0.113.7" and ClientIP.key("203.0.113.7") == "203.0.113.7"
+    p = ClientIP("10.0.0.0/8")
+    scope = {"client": ("10.1.1.1", 1), "headers": [(b"x-forwarded-for", b"6.6.6.6"), (b"x-forwarded-for", b"203.0.113.5")]}  # proxy APPENDED a second line
+    assert p.from_scope(scope) == "203.0.113.5"
+
+
+def test_login_throttle_counts_before_the_await_and_forgives_success():
+    from kenyabidder.clock import FakeClock
+    t = Throttle(FakeClock())
+    for _ in range(25):
+        t.hit("login_fail_ip", "1.1.1.1", 25, 600)  # 25 concurrent attempts all counted up front
+    with pytest.raises(AppError):
+        t.hit("login_fail_ip", "1.1.1.1", 25, 600)
+    t.forgive("login_fail_ip", "1.1.1.1")  # one of them succeeded
+    t.hit("login_fail_ip", "1.1.1.1", 25, 600)
+
+
+def test_legacy_plaintext_secrets_are_resealed_on_the_first_flush_after_upgrade(tmp_path):
+    import json
+    from cryptography.fernet import Fernet
+    from kenyabidder.db import open_database
+    from kenyabidder.persist import StatePersistence
+    from kenyabidder.secretbox import SecretBox
+    db = open_database(f"duckdb://{tmp_path}/x.duckdb")
+    db.execute("INSERT INTO docs(collection, id, body, updated_at) VALUES ('llms','l1',?,0)", (json.dumps({"id": "l1", "api_key": "sk-LEGACY-plaintext-key"}),))
+    db.execute("INSERT INTO kv(key, body) VALUES ('settings', ?)", (json.dumps({"otp_secret": "legacy-otp", "mcp_key": "legacy-mcp"}),))
+    p = StatePersistence(db, box=SecretBox(key=Fernet.generate_key()))
+    s = p.load()
+    assert s.llms["l1"]["api_key"] == "sk-LEGACY-plaintext-key"
+    p.flush_all(s)  # NOTHING was edited, yet the secrets must now be encrypted
+    raw = db.query_one("SELECT body FROM docs")["body"] + db.query_one("SELECT body FROM kv WHERE key='settings'")["body"]
+    assert "sk-LEGACY" not in raw and "legacy-otp" not in raw and "legacy-mcp" not in raw
+
+
+def test_the_secret_box_refuses_an_empty_key_file_and_encrypts_values_that_look_sealed(tmp_path):
+    from kenyabidder.secretbox import SecretBox
+    kf = tmp_path / "key"
+    kf.write_text("")
+    with pytest.raises(ValueError):
+        SecretBox(key_file=kf)  # never silently fall back to a throwaway key
+    box = SecretBox(key_file=tmp_path / "key2")
+    tricky = "enc:v1:not-really-ciphertext"  # an admin pastes an API key that happens to start with our prefix
+    assert box.decrypt(box.encrypt(tricky)) == tricky
+
+
+def test_session_and_redaction_edge_cases():
+    for line in ("SMTP_PASSWORD=hunter2xx", "MPESA_PASSKEY=abcdefgh1234", "WHATSAPP_TOKEN=EAAGxyz123456", "access_token=abcd1234efgh", "{'password': 'hunter2xx'}",
+                 'bearer_token: "tok-123456"', "call 0712345678 or 07 12 345 678 or +254 712 345 678"):
+        out = redact(line)
+        assert not any(x in out for x in ("hunter2xx", "abcdefgh1234", "EAAGxyz123456", "abcd1234efgh", "tok-123456", "712345678", "12 345 678")), (line, out)
+    from kenyabidder.metrics import configure_logging
+    configure_logging(json_logs=False)
+    import io
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(logging.getLogger().handlers[0].formatter)
+    lg = logging.getLogger("redaction-test")
+    lg.addHandler(h)
+    try:
+        raise RuntimeError("upstream said token=supersecrettoken1234")
+    except RuntimeError:
+        lg.exception("failed")
+    assert "supersecrettoken1234" not in buf.getvalue() and "failed" in buf.getvalue()  # tracebacks are redacted too
+
+
+def test_admin_2fa_requirement_is_case_insensitive(env, monkeypatch):
+    monkeypatch.setenv("KENYABIDDER_ENV", "Production")
+    assert env.agents.admin_2fa_required()
+
+
+def test_blank_env_values_count_as_unset_in_config_validation():
+    from kenyabidder import config
+    r = config.validate({"KENYABIDDER_ENV": "production", "KENYABIDDER_PUBLIC_URL": "https://x.co.ke", "KENYABIDDER_SECRET": "   ", "KENYABIDDER_ENCRYPTION_KEY": ""})
+    assert any("KENYABIDDER_SECRET" in w for w in r.warnings) and any("ENCRYPTION_KEY" in w for w in r.warnings)

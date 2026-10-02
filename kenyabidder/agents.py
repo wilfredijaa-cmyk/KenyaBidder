@@ -212,7 +212,7 @@ class AgentService:
 
     def admin_2fa_required(self) -> bool:
         v = self.store.settings.get("require_admin_2fa")
-        return (os.environ.get("KENYABIDDER_ENV") == "production") if v is None else bool(v)
+        return (os.environ.get("KENYABIDDER_ENV", "").strip().lower() == "production") if v is None else bool(v)
 
     def totp_enabled(self, user: dict) -> bool:
         return bool((user.get("totp") or {}).get("enabled"))
@@ -221,8 +221,13 @@ class AgentService:
         """May this admin use the console? (A required-but-missing second factor locks the admin pages until it is set up.)"""
         return user["role"] != "admin" or not self.admin_2fa_required() or self.totp_enabled(user)
 
-    def totp_begin(self, user_id: str) -> dict:
+    def totp_begin(self, user_id: str, password: str) -> dict:
+        """Start enrolment. Needs the account password again: an unattended or hijacked session must not be able to bind its own phone."""
         u = self._user(user_id)
+        self._lockout_check(f"pw:{u['id']}", self.clock.now())
+        if not verify_password(password or "", u["password_hash"]):
+            self._record_attempt(f"pw:{u['id']}", self.clock.now())
+            raise forbidden("WRONG_PASSWORD", "password is incorrect")
         if self.totp_enabled(u):
             raise conflict("ALREADY_ENABLED", "two-factor authentication is already on")
         secret = totp.new_secret()
@@ -274,6 +279,12 @@ class AgentService:
         if not verify_password(password or "", u["password_hash"]) or not self.totp_check(u, code):
             raise forbidden("BAD_CREDENTIALS", "password or code is not right")
         u.pop("totp", None)
+
+    def admin_reset_2fa(self, user_id: str, *, by: str | None = None) -> None:
+        """Support recovery for someone who lost their phone AND recovery codes (identity must be checked out-of-band first)."""
+        u = self._user(user_id)
+        u.pop("totp", None)
+        u["session_version"] = u.get("session_version", 0) + 1
 
     def _user(self, user_id: str) -> dict:
         u = self.store.users.get(user_id)

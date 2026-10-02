@@ -123,14 +123,15 @@ def trust_panel() -> None:
                 ui.label(f"{a['product_spec']['title']} — {REASONS[r['reason']]}").classes("font-medium")
                 ui.label(f"{r['note'] or 'no details'} · {fmt_datetime(r['at'])} · listing is {a['status'].lower()}{' (hidden)' if a.get('hidden') else ''}").classes("text-xs opacity-70")
 
-                def act(kind, note, r=r):
+                @guard_admin
+                def act(kind, note, r=r, title=a["product_spec"]["title"]):  # (title bound now: a late-bound loop variable would log the LAST listing)
                     c.moderation.resolve(admin_user(), r["id"], kind, note)
-                    c.billing.log_admin(admin_user(), "moderation_" + kind.lower(), listing=a["product_spec"]["title"])
+                    c.billing.log_admin(admin_user(), "moderation_" + kind.lower(), listing=title)
                     body.refresh()
                 with ui.row().classes("gap-1"):
-                    ui.button("Take down", on_click=lambda r=r: _ask("Take down listing", "Reason (the poster sees it)", lambda k, n, r=r: act("TAKEDOWN", n, r), "Take down")).props("unelevated dense no-caps color=negative")
-                    ui.button("Ban poster", on_click=lambda r=r: _ask("Ban poster", "Reason", lambda k, n, r=r: act("BAN_POSTER", n, r), "Ban")).props("outline dense no-caps color=negative")
-                    ui.button("Dismiss", on_click=lambda r=r: act("DISMISS", "", r)).props("flat dense no-caps")
+                    ui.button("Take down", on_click=lambda r=r, act=act: _ask("Take down listing", "Reason (the poster sees it)", lambda k, n: act("TAKEDOWN", n, r), "Take down")).props("unelevated dense no-caps color=negative")
+                    ui.button("Ban poster", on_click=lambda r=r, act=act: _ask("Ban poster", "Reason", lambda k, n: act("BAN_POSTER", n, r), "Ban")).props("outline dense no-caps color=negative")
+                    ui.button("Dismiss", on_click=lambda r=r, act=act: act("DISMISS", "", r)).props("flat dense no-caps")
         from ..moderation import prohibited_terms
         with ui.card().classes("w-full"):
             ui.label("Prohibited terms (one per line) — listings mentioning them are refused").classes("font-medium")

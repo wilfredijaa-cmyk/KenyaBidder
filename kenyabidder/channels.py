@@ -188,38 +188,44 @@ async def handle_whatsapp_webhook(router: ChannelRouter, raw_body: bytes, signat
     if not messages:
         return {"ok": True, "ignored": True}
     seen = router.store.settings.setdefault("wa_seen", [])  # replay protection: Meta retries, and a captured valid request could be resent
-    fresh = []
-    for mid, sender, text in messages:
-        if mid and mid in seen:
+    now_s = router.clock.now() / 1000
+    reply, handled, skipped = None, 0, 0
+    for mid, sender, text, ts in messages:  # Meta batches deliveries: EVERY message must run (an 'approve' may not be the first)
+        if (mid and mid in seen) or (ts is not None and abs(now_s - ts) > WA_MAX_AGE_S):
+            skipped += 1  # duplicate, or too old to be a live delivery (a captured request replayed after its id aged out of the list)
             continue
-        if mid:
-            seen.append(mid)
-        fresh.append((sender, text))
-    del seen[:-2000]
-    if not fresh:
-        return {"ok": True, "duplicate": True}
-    messages = fresh
-    reply = None
-    for sender, text in messages:  # Meta batches deliveries: EVERY message must run (an 'approve' may not be the first)
         out = await router.handle_inbound("WHATSAPP", str(sender), text)
+        if mid:  # only after it ran: a failure leaves it unseen so Meta's retry can still deliver it
+            seen.append(mid)
+            del seen[:-5000]
         reply = out["reply"]
+        handled += 1
         if out["agent_id"]:
             router.whatsapp.send_nowait(str(sender), out["reply"])
-    return {"ok": True, "handled": len(messages), "reply": reply}
+    if not handled and skipped:
+        return {"ok": True, "duplicate": True}
+    return {"ok": True, "handled": handled, "reply": reply}
 
 
-def _whatsapp_messages(body) -> list[tuple[str | None, str, str]]:
-    """(message id, sender, text) from a Cloud API payload (all entries / changes / messages) or the simple {from, text} dev shape."""
-    out: list[tuple[str | None, str, str]] = []
+WA_MAX_AGE_S = 3600
+
+
+def _whatsapp_messages(body) -> list[tuple[str | None, str, str, float | None]]:
+    """(message id, sender, text, unix timestamp) from a Cloud API payload (all entries / changes / messages) or the simple {from, text} dev shape."""
+    out: list[tuple[str | None, str, str, float | None]] = []
     try:
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
                 for m in change.get("value", {}).get("messages", []):
                     text = (m.get("text") or {}).get("body")
                     if m.get("from") and isinstance(text, str):
-                        out.append((str(m["id"])[:128] if m.get("id") else None, m["from"], text))
+                        try:
+                            ts = float(m["timestamp"]) if m.get("timestamp") else None
+                        except (TypeError, ValueError):
+                            ts = None
+                        out.append((str(m["id"])[:128] if m.get("id") else None, m["from"], text, ts))
     except (AttributeError, TypeError):
         return []
     if not out and isinstance(body, dict) and body.get("from") and isinstance(body.get("text"), str):
-        out.append((None, body["from"], body["text"]))
+        out.append((None, body["from"], body["text"], None))
     return out
