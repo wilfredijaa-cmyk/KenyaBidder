@@ -144,9 +144,14 @@ class Throttle:
         except ValueError:
             pass  # already aged out of the window
 
-    def record(self, bucket: str, key: str) -> None:
-        self._sweep(self._now())
-        self._hits[(bucket, key)].append(self._now())
+    def record(self, bucket: str, key: str) -> float:
+        now = self._now()
+        self._sweep(now)
+        d = self._hits[(bucket, key)]
+        if d and now <= d[-1]:
+            now = d[-1] + 1e-6  # keep the window sorted and the stamps unique
+        d.append(now)
+        return now
 
 
 # ------------------------------------------------------------------ ASGI middleware

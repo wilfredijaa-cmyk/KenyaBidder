@@ -20,7 +20,7 @@ class GuardrailInterceptor:
     def __init__(self, store, clock, engine, intel, config: dict | None = None):
         self.store, self.clock, self.engine, self.intel = store, clock, engine, intel
         self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self._stats: dict[str, tuple[int, tuple[int, int], dict]] = {}
+        self._stats: dict[str, tuple[int, tuple[int, int, int], dict]] = {}
 
     def evaluate(self, p: dict) -> dict:
         """p: {agent_id, auction_id, action, amount, source: strategy|user, approved_up_to?}"""
@@ -106,18 +106,22 @@ class GuardrailInterceptor:
             cap = min(cap, self.config["low_stakes_ceiling"])
         return max(min(cap, int(c["budget_ceiling"] * c["escalation_threshold_pct"] / 100)), min(cap, approved_up_to))
 
+    def _history_key(self) -> tuple[int, int, int]:
+        h = self.store.market_history
+        return (len(h), h.dropped, h.version)  # appends, front trims and in-place rewrites all change it
+
     def _is_anomalous(self, a: dict, amount: int) -> bool:
         if a["auction_type"] == "DUTCH":
             return False  # Dutch price follows the seller's own descending schedule
         cat, now = a["product_spec"]["category"].lower(), self.clock.now()
         hit = self._stats.get(cat)
-        if hit and now - hit[0] < 30_000 and hit[1] == (len(self.store.market_history), self.store.market_history.dropped):  # a sort over up to 20k rows per bid is too much in a bidding war
+        if hit and now - hit[0] < 30_000 and hit[1] == self._history_key():  # a sort over up to 20k rows per bid is too much in a bidding war
             s = hit[2]
         else:
             s = self.intel.historical_clearing_prices(cat)
             if len(self._stats) > 200:
                 self._stats.clear()
-            self._stats[cat] = (now, (len(self.store.market_history), self.store.market_history.dropped), s)
+            self._stats[cat] = (now, self._history_key(), s)
         if s["count"] < self.config["anomaly_min_samples"] or not s["unit_median"]:
             return False
         qty = max(1, a["product_spec"]["quantity"])  # compare PER UNIT: a 100-unit lot is not "anomalous" next to single-unit history

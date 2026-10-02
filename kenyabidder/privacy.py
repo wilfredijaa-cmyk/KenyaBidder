@@ -123,11 +123,13 @@ class PrivacyService:
                                u.get("name"), u.get("email")) if x and len(x) >= 3}
         if not needles:
             return
-        rx = re.compile("|".join(r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in sorted(needles, key=len, reverse=True)), re.I)
-        for log, keys in ((self.store.outbox, ("to", "text")), (self.store.admin_log, ("detail",))):  # not the action/actor fields: a user may be called "admin"
+        def loose(n: str) -> str:  # "0712345678" also matches "0712 345 678" / "+254-712-345-678"
+            return r"[\s.-]*".join(re.escape(c) for c in n) if n.lstrip("+").isdigit() else re.escape(n)
+        rx = re.compile("|".join(r"(?<!\w)" + loose(n) + r"(?!\w)" for n in sorted(needles, key=len, reverse=True)), re.I)
+        for log in (self.store.outbox, self.store.admin_log):
             for e in log:
-                for k in keys:
-                    if k in e:
+                for k in e:
+                    if k not in ("action", "at", "channel"):  # structural fields, not personal data
                         _redact_in(e, k, rx)
         for log in (self.store.outbox, self.store.admin_log):
             log._dirty()  # in-place edits far from the end: make the durable copy rewrite the whole log

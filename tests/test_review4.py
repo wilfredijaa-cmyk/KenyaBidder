@@ -160,3 +160,27 @@ def test_a_war_that_climbs_by_itself_pauses_instead_of_blocking_for_good(env):
     assert env.app.manual_bid(rival["agent_id"], a["auction_id"], 90_000)["ok"]  # a human takes the price far above the going rate
     r = env.guardrail.evaluate({"agent_id": b["agent_id"], "auction_id": a["auction_id"], "action": "bid", "amount": 90_100, "source": "strategy"})
     assert r["code"] == "MARKET_ANOMALY" and not r.get("permanent")
+
+
+def test_create_admin_from_the_shell_works_even_when_a_setup_code_is_configured(env, monkeypatch):
+    monkeypatch.setenv("KENYABIDDER_BOOTSTRAP_TOKEN", "abc")
+    with pytest.raises(AppError):
+        env.agents.create_user(name="Scanner", password="password123")
+    assert env.agents.create_user(name="Operator", password="password123", trusted=True)["role"] == "admin"
+
+
+def test_config_warns_about_a_missing_bootstrap_token_in_production():
+    from kenyabidder.config import validate
+    good = {"KENYABIDDER_ENV": "production", "KENYABIDDER_PUBLIC_URL": "https://x.example.com"}
+    assert any("BOOTSTRAP" in w for w in validate(good).warnings)
+    assert not any("BOOTSTRAP" in w for w in validate({**good, "KENYABIDDER_BOOTSTRAP_TOKEN": "abc"}).warnings)
+
+
+def test_spaced_phone_spellings_and_actor_names_are_scrubbed_from_logs(env):
+    env.agents.create_user(name="Boss", password="password123")
+    u = env.agents.create_user(name="Wanjiru", password="password123", phone="0712345678")
+    env.store.admin_log.append({"at": 1, "admin": "Wanjiru", "action": "x", "detail": {"t": "call +254 712 345 678 or 0712-345-678"}})
+    env.privacy.delete_account(u["id"], "password123")
+    text = str(env.store.admin_log)
+    assert "Wanjiru" not in text and "[deleted]" in text
+    assert "345 678" not in text and "345-678" not in text
