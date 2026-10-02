@@ -253,6 +253,9 @@ class HardeningMiddleware:
 _METADATA_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "metadata.azure.com"}
 
 
+_DNS_CACHE: dict[tuple[str, int], tuple[float, list[str]]] = {}
+
+
 def check_outbound_url(url: str, what: str = "URL") -> None:
     """Admins may point at internal services (Ollama on a private host is normal) but never at cloud-metadata or link-local addresses,
     which would let a compromised admin account steal the host's cloud credentials."""
@@ -266,12 +269,21 @@ def check_outbound_url(url: str, what: str = "URL") -> None:
     host = u.hostname.lower().rstrip(".")
     if host in _METADATA_HOSTS or host.endswith(".internal") and "metadata" in host:
         raise bad("URL_BLOCKED", f"{what} points at a cloud metadata service")
-    try:
-        infos = socket.getaddrinfo(host, u.port or (443 if u.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        return  # not resolvable from here (may resolve where it will be used): the connection attempt will fail visibly
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+    port = u.port or (443 if u.scheme == "https" else 80)
+    now = time.monotonic()
+    hit = _DNS_CACHE.get((host, port))
+    if hit and now - hit[0] < 60:  # this runs on every connect: don't stall the event loop on DNS each time
+        addrs = hit[1]
+    else:
+        try:
+            addrs = [i[4][0] for i in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)]
+        except socket.gaierror:
+            return  # not resolvable from here (may resolve where it will be used): the connection attempt will fail visibly
+        if len(_DNS_CACHE) > 512:
+            _DNS_CACHE.clear()
+        _DNS_CACHE[(host, port)] = (now, addrs)
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
         if ip.is_link_local or ip.is_unspecified or ip.is_multicast or str(ip) in ("169.254.169.254", "fd00:ec2::254"):
             raise bad("URL_BLOCKED", f"{what} resolves to a link-local/metadata address")
 

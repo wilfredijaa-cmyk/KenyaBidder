@@ -31,6 +31,11 @@ The first account registered becomes the administrator — register it immediate
 | Ledger integrity warning | Do not sell tokens. Admin → Health shows the mismatch; restore from the last good backup and replay from the orders table (paid orders are authoritative). |
 | SMS budget exhausted | Check for SMS-pumping (messages log); raise the budget only after confirming it is genuine. |
 
+## Account recovery (run on the host, app may be running)
+* Admin lost 2FA: `python -m kenyabidder reset-2fa <name>` then have them re-enrol. Forgotten password: `reset-password <name>`.
+* No administrator left: `python -m kenyabidder create-admin <name>`.
+* PostgreSQL restarts/failovers are survived: the app reconnects on the next query (reads retry once; writes are not blindly repeated).
+
 ## Upgrades
 Migrations are versioned and run at startup (`schema_version`). Take a backup first; roll back by restoring it. One active app process at a time (lease).
 

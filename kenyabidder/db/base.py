@@ -120,7 +120,12 @@ class Database(abc.ABC):
                 self._commit()
 
     def healthy(self) -> bool:
+        """Health probes must never queue behind a long flush: if the connection is busy right now, it is working, not broken."""
+        if not self._lock.acquire(timeout=1.0):
+            return True
         try:
-            return self.scalar("SELECT 1") == 1
+            return next(iter(self._query("SELECT 1", ())[0].values())) == 1
         except Exception:  # noqa: BLE001
             return False
+        finally:
+            self._lock.release()

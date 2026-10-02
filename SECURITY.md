@@ -26,12 +26,18 @@ The platform never holds buyers' or sellers' money. LLM output, listing text, to
 
 ## Operator checklist
 1. Run behind TLS (Caddy config in `deploy/`), set `KENYABIDDER_ENV=production`, `KENYABIDDER_PUBLIC_URL=https://…`; the app refuses to start on insecure combinations.
-2. Set `KENYABIDDER_SECRET`, `KENYABIDDER_ENCRYPTION_KEY`, `KENYABIDDER_METRICS_TOKEN`, `WHATSAPP_APP_SECRET`, `KENYABIDDER_TRUSTED_PROXIES` (so per-IP limits see real clients).
+2. Set `KENYABIDDER_BOOTSTRAP_TOKEN` (the setup code needed to create the first administrator on a fresh install), `KENYABIDDER_SECRET`, `KENYABIDDER_ENCRYPTION_KEY`, `KENYABIDDER_METRICS_TOKEN`, `WHATSAPP_APP_SECRET`, `KENYABIDDER_TRUSTED_PROXIES` (so per-IP limits see real clients).
 3. Never set `KENYABIDDER_DEV_PAYMENTS`, `KENYABIDDER_INSECURE_WEBHOOK`, `KENYABIDDER_PASSWORD_POLICY=basic`, or `KENYABIDDER_ALLOW_STDIO` unless you accept the consequences.
 4. Enrol every administrator in 2FA before the first public day; keep recovery codes offline.
 5. Copy backups off the host; restore-test them; keep the encryption key separate from backups.
 6. Put the host behind a WAF/CDN for volumetric DDoS; the in-app limits are a last line, not the first.
 7. Subscribe to dependency advisories (`pip-audit` runs in CI) and redeploy promptly.
+
+## Sessions, recovery and admin-configured endpoints
+* Sessions have idle and absolute timeouts (shorter for admins); suspending a user, changing a password or 2FA bumps a session version that ends open sessions at the next click. Login does not reuse a pre-login session: its storage is cleared.
+* Lost 2FA / password / no admin left: on the host, `python -m kenyabidder reset-2fa <name>`, `reset-password <name>`, `create-admin <name>`.
+* LLM/MCP base URLs may not point at cloud-metadata/link-local addresses (checked on save and at connect). API keys may be referenced by environment-variable *name* only from a provider-key allowlist; platform secrets can never be referenced (extend with `KENYABIDDER_ALLOWED_KEY_ENVS`).
+* Listings under moderator review or taken down are visible only to the poster and administrators.
 
 ## Known limitations
 * Rate limiting and lockout counters are in-process (single active engine process by design); a shared store (Redis) is needed before running multiple app replicas.
