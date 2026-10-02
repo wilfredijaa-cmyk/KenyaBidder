@@ -100,7 +100,7 @@ def _recover(args) -> None:
         agents = rt.app.agents
         if args.command[0] == "create-admin":
             pw = "-".join(secrets.token_hex(2) for _ in range(5))
-            u = agents.create_user(name=args.command[1], password=pw, setup_code=agents.bootstrap_token() or None)
+            u = agents.create_user(name=args.command[1], password=pw, trusted=True)  # the operator at the host's shell
             if u["role"] != "admin":
                 agents.set_role(u["id"], "admin")
             print(f"administrator {u['name']} created. Temporary password: {pw}\nSign in, change it, and enrol two-factor authentication.")

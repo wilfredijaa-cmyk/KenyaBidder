@@ -29,6 +29,8 @@ class SellerService:
         if not cfg or seller["status"] != "ACTIVE":
             return None
         if a.get("hidden") or a["status"] == "CANCELLED":
+            if a.get("hidden"):
+                self.notify(seller["agent_id"], "relist", f"\"{a['product_spec']['title']}\" is under review, so it was not relisted automatically. Relist it yourself once it is cleared.", auction_id=auction_id)
             return None  # under moderator review or taken down: not for the agent to quietly re-run
         title = a["product_spec"]["title"]
         if a["relist_count"] >= cfg.get("max_relists", 3):

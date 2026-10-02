@@ -187,7 +187,7 @@ class VerificationService:
         rec = self._check(u["id"], "RESET", code)
         try:
             self.agents.set_password(u["id"], new_password)
-        except AppError:
-            rec["status"] = "PENDING"  # a weak password must not burn a valid code: let them pick a better one
+        except Exception:
+            rec["status"], rec["attempts"] = "PENDING", rec["attempts"] - 1  # a weak password must not burn a valid code: let them pick a better one
             raise
         return u

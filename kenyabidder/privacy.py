@@ -105,23 +105,35 @@ class PrivacyService:
             raise bad("TOKENS_HELD", f"you still hold {sum(held.values()):,} tokens; deleting forfeits them (no refund) — confirm to proceed")
         now = self.clock.now()
         alias = f"deleted-{user_id[:6]}"
-        needles = [x for x in {u.get("phone"), re.sub(r"\D", "", u.get("phone") or ""), u.get("name"), u.get("email")} if x and len(x) >= 3]
+        self._scrub_logs(u)  # first, while the identifiers are still known (nothing personal is kept to finish it later)
         # 1. Lock the account FIRST: whatever happens next, it can never sign in again and nothing personal is left on the profile.
         u.update(name=alias, phone=None, email=None, phone_verified=False, email_verified=False, suspended=True, deleted_at=now,
-                 deletion_pending={"needles": needles}, password_hash="deleted$" + secrets.token_hex(16), role="user", session_version=u.get("session_version", 0) + 1)
+                 deletion_pending=True, password_hash="deleted$" + secrets.token_hex(16), role="user", session_version=u.get("session_version", 0) + 1)
         u.pop("verified_business", None)
         # 2. Scrub everything else (idempotent: if it is interrupted, resume_pending() finishes it from the maintenance loop).
         self._scrub(user_id)
         self.store.admin_log.append({"at": now, "admin_id": None, "admin": "system", "action": "account_deleted", "detail": {"user": alias}})
         return {"deleted": True, "kept": "payment and token-ledger records (legal retention; they can carry the phone number used to pay or claim the signup grant), under an anonymous id"}
 
+    def _scrub_logs(self, u: dict) -> None:
+        """Delivery and ops logs outlive the account: the number, name and address must not stay readable in them."""
+        phone = u.get("phone") or ""
+        digits = re.sub(r"\D", "", phone)
+        needles = {x for x in (phone, digits, "0" + digits[3:] if digits.startswith("254") else "", digits[3:] if digits.startswith("254") else "",
+                               u.get("name"), u.get("email")) if x and len(x) >= 3}
+        if not needles:
+            return
+        rx = re.compile("|".join(r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in sorted(needles, key=len, reverse=True)), re.I)
+        for log, keys in ((self.store.outbox, ("to", "text")), (self.store.admin_log, ("detail",))):  # not the action/actor fields: a user may be called "admin"
+            for e in log:
+                for k in keys:
+                    if k in e:
+                        _redact_in(e, k, rx)
+        for log in (self.store.outbox, self.store.admin_log):
+            log._dirty()  # in-place edits far from the end: make the durable copy rewrite the whole log
+
     def _scrub(self, user_id: str) -> None:
         u = self.store.users[user_id]
-        needles = (u.get("deletion_pending") or {}).get("needles", []) if isinstance(u.get("deletion_pending"), dict) else []
-        if needles:  # delivery/ops logs outlive the account: the number, name and address must not stay readable in them
-            for log in (self.store.outbox, self.store.admin_log):
-                for e in log:
-                    _redact_in(e, needles)
         mine = [a for a in self.store.agents.values() if a["principal_user_id"] == user_id]
         ids = {a["agent_id"] for a in mine}
         for a in mine:
@@ -161,14 +173,13 @@ class PrivacyService:
         return n
 
 
-def _redact_in(obj, needles: list[str], _rx=None) -> None:
-    """Replace each personal identifier wherever it appears in a log entry's text (in place; entries are small dicts of strings/numbers)."""
-    rx = _rx or re.compile("|".join(r"(?<!\w)" + re.escape(n) + r"(?!\w)" for n in needles))  # whole words only: "Ann" must not eat "Anna"
-    items = obj.items() if isinstance(obj, dict) else enumerate(obj) if isinstance(obj, list) else ()
-    for k, v in list(items):
-        if isinstance(v, str):
-            nv = rx.sub("[deleted]", v)
-            if nv != v:
-                obj[k] = nv
-        elif isinstance(v, (dict, list)):
-            _redact_in(v, needles, rx)
+def _redact_in(container, key, rx) -> None:
+    """Replace identifiers inside container[key] (text, or nested dicts/lists of text) in place."""
+    v = container[key]
+    if isinstance(v, str):
+        nv = rx.sub("[deleted]", v)
+        if nv != v:
+            container[key] = nv
+    elif isinstance(v, (dict, list)):
+        for k in (v.keys() if isinstance(v, dict) else range(len(v))):
+            _redact_in(v, k, rx)

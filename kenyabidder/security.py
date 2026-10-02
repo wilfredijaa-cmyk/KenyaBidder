@@ -119,7 +119,10 @@ class Throttle:
         self._sweep(now)
         if self.count(bucket, key, window_s) >= limit:
             raise AppError("RATE_LIMITED", message, 429)
-        self._hits[(bucket, key)].append(now)
+        d = self._hits[(bucket, key)]
+        if d and now <= d[-1]:
+            now = d[-1] + 1e-6  # stamps are unique, so forgive() can never take back someone else's hit
+        d.append(now)
         return now  # hand back to forgive() so a success takes back ITS OWN hit, not another request's
 
     def check(self, bucket: str, key: str, limit: int, window_s: float, *, message: str = "too many attempts — try again later") -> None:

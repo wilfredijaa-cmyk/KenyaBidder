@@ -20,7 +20,7 @@ class GuardrailInterceptor:
     def __init__(self, store, clock, engine, intel, config: dict | None = None):
         self.store, self.clock, self.engine, self.intel = store, clock, engine, intel
         self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self._stats: dict[str, tuple[int, int, dict]] = {}
+        self._stats: dict[str, tuple[int, tuple[int, int], dict]] = {}
 
     def evaluate(self, p: dict) -> dict:
         """p: {agent_id, auction_id, action, amount, source: strategy|user, approved_up_to?}"""
@@ -61,7 +61,7 @@ class GuardrailInterceptor:
             if self._breaker_active(cat, now):
                 return reject("MARKET_ANOMALY", "autonomous bidding halted for this category (circuit breaker)", notify=True)
             if self._is_anomalous(a, amount):
-                if amount <= self.engine.min_next_bid(a, now):
+                if not a["bids"] and amount <= self.engine.min_next_bid(a, now):
                     # The agent is only matching the seller's own ask. That is one odd listing, not a market-wide event: refuse this lot
                     # and leave every other agent's bidding alone (otherwise a single absurd listing could freeze a whole category).
                     return reject("PRICE_ANOMALOUS", "the asking price is far above recent clearing prices for this category — not bidding on this lot", permanent=True)
@@ -111,11 +111,13 @@ class GuardrailInterceptor:
             return False  # Dutch price follows the seller's own descending schedule
         cat, now = a["product_spec"]["category"].lower(), self.clock.now()
         hit = self._stats.get(cat)
-        if hit and now - hit[0] < 30_000 and hit[1] == len(self.store.market_history):  # a sort over up to 20k rows per bid is too much in a bidding war
+        if hit and now - hit[0] < 30_000 and hit[1] == (len(self.store.market_history), self.store.market_history.dropped):  # a sort over up to 20k rows per bid is too much in a bidding war
             s = hit[2]
         else:
             s = self.intel.historical_clearing_prices(cat)
-            self._stats[cat] = (now, len(self.store.market_history), s)
+            if len(self._stats) > 200:
+                self._stats.clear()
+            self._stats[cat] = (now, (len(self.store.market_history), self.store.market_history.dropped), s)
         if s["count"] < self.config["anomaly_min_samples"] or not s["unit_median"]:
             return False
         qty = max(1, a["product_spec"]["quantity"])  # compare PER UNIT: a 100-unit lot is not "anomalous" next to single-unit history

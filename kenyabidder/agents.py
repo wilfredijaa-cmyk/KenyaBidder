@@ -24,6 +24,7 @@ from .engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .errors import AppError, bad, conflict, forbidden, is_nonneg_int, not_found
 from . import totp
 from .phone import normalize_phone
+from .config import is_production
 from .security import check_password
 
 TERMS_VERSION = "2026-09"
@@ -69,7 +70,7 @@ class AgentService:
         return os.environ.get("KENYABIDDER_BOOTSTRAP_TOKEN", "").strip()
 
     def create_user(self, *, name: str, password: str, phone: str | None = None, email: str | None = None,
-                    role: str | None = None, accepted_terms: bool = True, setup_code: str | None = None) -> dict:
+                    role: str | None = None, accepted_terms: bool = True, setup_code: str | None = None, trusted: bool = False) -> dict:
         """Register an account. Programmatic callers consent implicitly (default); the sign-up form passes the checkbox."""
         if not accepted_terms:
             raise bad("TERMS_REQUIRED", "you must accept the Terms and Privacy Notice to create an account")
@@ -84,6 +85,8 @@ class AgentService:
             raise bad("INVALID_EMAIL", "that email address does not look right")
         check_password(password, name=name, phone=phone_n or "", email=email or "", policy=self.password_policy())
         first = not self.store.users
+        if first and not trusted and is_production() and not self.bootstrap_token():
+            raise forbidden("SETUP_CODE_REQUIRED", "this production site has no administrator yet and no KENYABIDDER_BOOTSTRAP_TOKEN is set: the operator must set it (or run `python -m kenyabidder create-admin <name>`)")
         if first and self.bootstrap_token() and not hmac.compare_digest(str(setup_code or "").encode(), self.bootstrap_token().encode()):
             # Whoever registers first becomes the administrator: on a public deployment that must be the operator, not a scanner that
             # noticed the new TLS certificate. The operator proves it with the setup code from the server's environment.

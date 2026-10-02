@@ -375,7 +375,7 @@ class AuctionEngine:
 
     def current_price(self, a: dict, now: int | None = None):
         now = self.clock.now() if now is None else now
-        if a["auction_type"] == "DUTCH" and a["status"] not in TERMINAL:  # once finished the record holds the price it sold at
+        if a["auction_type"] == "DUTCH" and not (a["status"] in TERMINAL and (a.get("result") or {}).get("price") is not None):  # a sold lot keeps its sale price
             d = a["dutch"]
             at = min(max(now, a["starts_at"]), a["ends_at"])
             steps = (at - a["starts_at"]) // d["interval_ms"]
