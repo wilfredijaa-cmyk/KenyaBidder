@@ -98,6 +98,16 @@ def _recover(args) -> None:
     rt = runtime_mod.Runtime(data_file=args.data or None)  # takes the writer lease: refuses to run if the app is up
     try:
         agents = rt.app.agents
+        if args.command[0] == "create-admin":
+            pw = "-".join(secrets.token_hex(2) for _ in range(5))
+            u = agents.create_user(name=args.command[1], password=pw, setup_code=agents.bootstrap_token() or None)
+            if u["role"] != "admin":
+                agents.set_role(u["id"], "admin")
+            print(f"administrator {u['name']} created. Temporary password: {pw}\nSign in, change it, and enrol two-factor authentication.")
+            rt.app.billing.log_admin(None, "cli_create_admin", user=u["name"])
+            rt.persistence.flush_all(rt.store)
+            rt.persistence.release_lease()
+            return
         u = agents._find(args.command[1])
         if not u:
             sys.exit(f"no such user: {args.command[1]!r}")
@@ -121,8 +131,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)))
     p.add_argument("--data", default=os.environ.get("KENYABIDDER_DATA", "data/state.json"), help="data file location; state lives in kenyabidder.duckdb beside it ('' = in-memory only; set KENYABIDDER_DATABASE_URL for PostgreSQL)")
     p.add_argument("--mcp-port", type=int, default=int(os.environ.get("KENYABIDDER_MCP_PORT", 0)), help="serve KenyaBidder's FastMCP endpoint on this port (0 = off)")
-    p.add_argument("command", nargs="*", help="'restore <backup file>' (replace the database with a backup), 'reset-2fa <name>' or 'reset-password <name>' "
-                   "(account recovery) — all need the app stopped")
+    p.add_argument("command", nargs="*", help="'restore <backup file>' (replace the database with a backup), 'create-admin <name>', 'reset-2fa <name>' or "
+                   "'reset-password <name>' (account recovery) — all need the app stopped")
     args = p.parse_args(argv)
     if args.command[:1] == ["restore"]:
         from .backups import restore_backup
@@ -132,7 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         restore_backup(args.command[1], dest)
         print(f"Restored {args.command[1]} to {dest} (previous database kept as .before-restore-<time>). Start the app again.")
         return
-    if args.command[:1] in (["reset-2fa"], ["reset-password"]):
+    if args.command[:1] in (["reset-2fa"], ["reset-password"], ["create-admin"]):
         _recover(args)
         return
     metrics_mod.configure_logging()

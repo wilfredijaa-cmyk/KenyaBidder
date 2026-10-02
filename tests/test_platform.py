@@ -477,3 +477,22 @@ async def test_whatsapp_commands_are_marked_seen_only_after_they_ran_and_stale_d
     stale = await handle_whatsapp_webhook(env.router, payload("wamid.2", "ceiling 1"), None, secret="", allow_unsigned=True) if False else \
         await handle_whatsapp_webhook(env.router, payload("wamid.9", "ceiling 1", ts=old), None, secret="", allow_unsigned=True)
     assert stale.get("duplicate") and b["constraints"]["budget_ceiling"] == 70_000  # a captured request replayed hours later does nothing
+
+
+async def test_slow_agent_decisions_run_concurrently_not_one_after_another(env, monkeypatch):
+    import asyncio, time
+    _, s = env.seller()
+    for _ in range(6):
+        env.bidder(memory={"watch": WATCH, "auto_bid": True})
+    started = []
+
+    async def slow_consider(agent_id, auction_id, **kw):
+        started.append(time.perf_counter())
+        await asyncio.sleep(0.2)
+        return {"status": "SKIPPED"}
+    monkeypatch.setattr(env.orchestrator, "consider", slow_consider)
+    t0 = time.perf_counter()
+    env.english(s["agent_id"])  # the created-event spawns the fan-out
+    await env.orchestrator.idle()
+    assert len(started) == 6 and time.perf_counter() - t0 < 0.6  # 6 × 0.2s sequentially would take 1.2s
+    assert max(started) - min(started) < 0.15  # (a semaphore of 8 lets them all start together)

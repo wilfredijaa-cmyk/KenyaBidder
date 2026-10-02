@@ -448,3 +448,13 @@ async def test_a_timeout_after_the_push_leaves_the_order_recoverable_by_receipt(
     assert env.billing.get_order(o["id"])["status"] == "AWAITING_REVIEW"
     env.billing.admin_review(admin, o["id"], True)
     assert env.wallet.balance(u["id"], llm["id"]) == 100_000
+
+
+async def test_an_order_marked_failed_is_healed_by_a_late_successful_callback(mpesa_shop):
+    """Regression: a query made while Safaricom was still processing used to leave the order FAILED forever (customer charged, never credited)."""
+    s, b = mpesa_shop, mpesa_shop.env.billing
+    o = await b.checkout(s.user, s.pack["id"], "mpesa", "0712 345 678")
+    assert b._set_status(o["id"], ("PENDING",), "FAILED", note="read as failed")
+    s.fake.query_result = {"code": "0", "desc": "ok"}
+    await b.handle_mpesa_callback(s.cfg.callback_secret, cb(checkout=o["external_ref"]))
+    assert b.get_order(o["id"])["status"] == "PAID" and s.env.wallet.balance(s.user["id"], s.llm["id"]) == 100_000

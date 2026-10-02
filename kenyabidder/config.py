@@ -40,6 +40,9 @@ def validate(env=os.environ, *, host: str = "127.0.0.1", durable: bool = True) -
         r.errors.append("set KENYABIDDER_PUBLIC_URL=https://your.domain (the site must be served over TLS; cookies and HSTS depend on it)")
     if not durable:
         bad.append("running with an in-memory database: everything is lost on restart (set --data or KENYABIDDER_DATABASE_URL)")
+    if prod and not env.get("KENYABIDDER_BOOTSTRAP_TOKEN"):
+        r.warnings.append("KENYABIDDER_BOOTSTRAP_TOKEN is not set: the first visitor to a fresh installation becomes the administrator. Set it (and enter it at "
+                          "first sign-up) or create the admin with `python -m kenyabidder create-admin <name>` before exposing the site")
     if prod and not env.get("KENYABIDDER_SECRET"):
         r.warnings.append("KENYABIDDER_SECRET is not set: a session secret is generated and stored in the database — set it from your secret manager so a leaked database alone cannot forge sessions")
     if prod and not env.get("KENYABIDDER_ENCRYPTION_KEY"):

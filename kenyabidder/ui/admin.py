@@ -210,6 +210,7 @@ def mcp_panel():
                 if m["tools"]:
                     with ui.expansion(f"Tools ({len(m['tools'])}) — untick to hide a tool from every agent").classes("w-full border rounded"):
                         for t in m["tools"]:
+                            @guard_admin
                             def toggle(e, i=m["id"], name=t["name"], srv=m):
                                 dis = set(srv["disabled_tools"])
                                 dis.discard(name) if e.value else dis.add(name)

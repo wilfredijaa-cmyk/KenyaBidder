@@ -65,8 +65,11 @@ class AgentService:
 
     # ---------- users ----------
 
+    def bootstrap_token(self) -> str:
+        return os.environ.get("KENYABIDDER_BOOTSTRAP_TOKEN", "").strip()
+
     def create_user(self, *, name: str, password: str, phone: str | None = None, email: str | None = None,
-                    role: str | None = None, accepted_terms: bool = True) -> dict:
+                    role: str | None = None, accepted_terms: bool = True, setup_code: str | None = None) -> dict:
         """Register an account. Programmatic callers consent implicitly (default); the sign-up form passes the checkbox."""
         if not accepted_terms:
             raise bad("TERMS_REQUIRED", "you must accept the Terms and Privacy Notice to create an account")
@@ -81,6 +84,10 @@ class AgentService:
             raise bad("INVALID_EMAIL", "that email address does not look right")
         check_password(password, name=name, phone=phone_n or "", email=email or "", policy=self.password_policy())
         first = not self.store.users
+        if first and self.bootstrap_token() and not hmac.compare_digest(str(setup_code or "").encode(), self.bootstrap_token().encode()):
+            # Whoever registers first becomes the administrator: on a public deployment that must be the operator, not a scanner that
+            # noticed the new TLS certificate. The operator proves it with the setup code from the server's environment.
+            raise forbidden("SETUP_CODE_REQUIRED", "this is a fresh installation: enter the setup code (KENYABIDDER_BOOTSTRAP_TOKEN) to create the administrator account")
         u = {"id": str(uuid.uuid4()), "name": name, "password_hash": hash_password(password), "phone": phone_n, "email": email,
              "role": "admin" if first else (role if role in ("admin", "user") else "user"), "suspended": False,
              "terms_accepted_at": self.clock.now(), "terms_version": TERMS_VERSION, "created_at": self.clock.now()}
@@ -179,10 +186,30 @@ class AgentService:
         ok = await asyncio.to_thread(verify_password, password or "", u["password_hash"] if u else self._DUMMY_HASH)
         return self._login_result(key, fails, now, u, ok)
 
+    def reauth(self, user_id: str, password: str) -> dict:
+        """Re-check the password for a sensitive action. Shares one lockout counter per account (5 wrong tries → 5 minutes), so a stolen
+        session cannot brute-force the password through 'change password' / 'delete account' / '2FA' forms and cannot burn CPU doing so."""
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        key, now = f"pw:{u['id']}", self.clock.now()
+        self._lockout_check(key, now)
+        if not verify_password(password or "", u["password_hash"]):
+            self._record_attempt(key, now)
+            raise forbidden("WRONG_PASSWORD", "password is incorrect")
+        self.store.settings.setdefault("login_failures", {}).pop(key, None)
+        return u
+
     def change_password(self, user_id: str, old: str, new: str) -> None:
         u = self.store.users.get(user_id)
-        if not u or not verify_password(old or "", u["password_hash"]):
-            raise forbidden("WRONG_PASSWORD", "current password is incorrect")
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        try:
+            self.reauth(user_id, old)
+        except AppError as e:
+            if e.code == "WRONG_PASSWORD":
+                raise forbidden("WRONG_PASSWORD", "current password is incorrect") from None
+            raise
         self.set_password(user_id, new)
 
     def set_password_epoch(self, user_id: str) -> None:
@@ -224,10 +251,7 @@ class AgentService:
     def totp_begin(self, user_id: str, password: str) -> dict:
         """Start enrolment. Needs the account password again: an unattended or hijacked session must not be able to bind its own phone."""
         u = self._user(user_id)
-        self._lockout_check(f"pw:{u['id']}", self.clock.now())
-        if not verify_password(password or "", u["password_hash"]):
-            self._record_attempt(f"pw:{u['id']}", self.clock.now())
-            raise forbidden("WRONG_PASSWORD", "password is incorrect")
+        self.reauth(user_id, password)
         if self.totp_enabled(u):
             raise conflict("ALREADY_ENABLED", "two-factor authentication is already on")
         secret = totp.new_secret()
@@ -276,7 +300,8 @@ class AgentService:
         u = self._user(user_id)
         if u["role"] == "admin" and self.admin_2fa_required():
             raise forbidden("2FA_REQUIRED", "administrators must keep two-factor authentication on")
-        if not verify_password(password or "", u["password_hash"]) or not self.totp_check(u, code):
+        self.reauth(user_id, password)
+        if not self.totp_check(u, code):
             raise forbidden("BAD_CREDENTIALS", "password or code is not right")
         u.pop("totp", None)
 

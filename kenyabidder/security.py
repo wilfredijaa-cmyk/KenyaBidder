@@ -276,6 +276,31 @@ def check_outbound_url(url: str, what: str = "URL") -> None:
             raise bad("URL_BLOCKED", f"{what} resolves to a link-local/metadata address")
 
 
+# ------------------------------------------------------------------ admin-named environment variables
+
+_ENV_DENY = ("KENYABIDDER_", "MPESA_", "WHATSAPP_", "SMTP_", "AT_", "POSTGRES", "PG", "DATABASE", "DB_", "AWS_", "AZURE_", "GCP_", "GOOGLE_APPLICATION", "SSH_",
+             "SECRET", "PRIVATE", "ENCRYPTION", "SESSION", "COOKIE", "STORAGE", "NICEGUI", "HOME", "PATH", "PWD", "USER")
+
+
+def check_env_name(name: str, what: str = "environment variable") -> str:
+    """Admins may reference a provider key by env-var NAME (so it stays out of the database) but never the platform's own secrets: otherwise
+    'api_key_env=KENYABIDDER_ENCRYPTION_KEY' plus an attacker-controlled base URL would send that secret out as a bearer token.
+    Extra names can be allowed with KENYABIDDER_ALLOWED_KEY_ENVS (comma separated)."""
+    n = (name or "").strip()
+    if not n:
+        return ""
+    allowed = {x.strip() for x in os.environ.get("KENYABIDDER_ALLOWED_KEY_ENVS", "").split(",") if x.strip()}
+    if n in allowed:
+        return n
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", n):
+        raise bad("INVALID_ENV_NAME", f"{what} must look like PROVIDER_API_KEY (capital letters, digits, underscores)")
+    if any(n.startswith(p) or n == p for p in _ENV_DENY) or n.endswith(("_SECRET", "_PASSWORD", "_PASSKEY", "_ENCRYPTION_KEY")) and not n.endswith("_API_SECRET"):
+        raise bad("ENV_NAME_BLOCKED", f"{what} {n!r} is reserved for the platform's own configuration — use a provider key variable (e.g. ANTHROPIC_API_KEY)")
+    if not (n.endswith(("_KEY", "_TOKEN", "_API_KEY", "_API_TOKEN")) or "API" in n):
+        raise bad("ENV_NAME_BLOCKED", f"{what} {n!r} does not look like an API key variable (expected …_API_KEY or …_TOKEN); ask the operator to allow it via KENYABIDDER_ALLOWED_KEY_ENVS")
+    return n
+
+
 # ------------------------------------------------------------------ passwords
 
 _COMMON = frozenset("""password password1 password12 password123 password1234 passw0rd p@ssw0rd p@ssword 12345678 123456789 1234567890 12345678910

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from nicegui import app as ng_app
-from nicegui import context, ui
+from nicegui import Client, context, ui
 
 from .. import i18n
 from ..errors import AppError
@@ -206,20 +206,35 @@ def set_active_agent(agent_id: str) -> None:
     ng_app.storage.user["agent_id"] = agent_id
 
 
+def public(fn):
+    """Mark a UI action as usable without a session (sign-in, sign-up, password reset)."""
+    fn._public = True
+    return fn
+
+
 def guard(fn):
-    """Run a UI action; show domain errors as toasts instead of crashing the handler."""
+    """Run a UI action: re-check that the session is still valid AT CLICK TIME (a page left open keeps its websocket after the cookie was
+    revoked, expired or the account was suspended), show domain errors as toasts, and never show internals."""
     import functools
     import inspect
+    import logging
+    import uuid
 
     @functools.wraps(fn)
     async def wrapper(*a, **kw):
+        if not getattr(fn, "_public", False) and not current_user():
+            ui.notify("Your session has ended — please sign in again", type="warning")
+            ui.navigate.to("/login")
+            return None
         try:
             r = fn(*a, **kw)
             return await r if inspect.isawaitable(r) else r
         except AppError as e:
             ui.notify(e.message, type="negative", multi_line=True)
-        except Exception as e:  # noqa: BLE001
-            ui.notify(f"Unexpected error: {e}", type="negative", multi_line=True)
+        except Exception:  # noqa: BLE001
+            ref = uuid.uuid4().hex[:8]
+            logging.getLogger("kenyabidder.ui").exception("unexpected error in a UI action (ref %s)", ref)
+            ui.notify(f"Something went wrong on our side (reference {ref}). Please try again; if it keeps happening, quote the reference to support.", type="negative", multi_line=True)
     return wrapper
 
 
@@ -245,15 +260,22 @@ def frame(user: dict, active: str):
         except Exception:  # noqa: BLE001  client may be mid-disconnect
             pass
 
-    core().router.listeners.append(on_notify)
+    def alive(n: dict) -> None:
+        if client.id not in Client.instances:  # a page that never connected (aborted tab, bot) is dropped instead of leaking forever
+            cleanup()
+            return
+        on_notify(n)
+
+    core().router.listeners.append(alive)
     pending = ng_app.storage.user.pop("flash", None)
     if pending:
         ui.notify(pending["message"], type=pending["type"])
 
     def cleanup() -> None:
-        if on_notify in core().router.listeners:
-            core().router.listeners.remove(on_notify)
+        if alive in core().router.listeners:
+            core().router.listeners.remove(alive)
     client.on_disconnect(cleanup)
+    client.on_delete(cleanup)  # disconnect handlers never run for a client that never connected; delete handlers always do
 
     with ui.header().classes("items-center gap-2 px-4 py-2 bg-white text-slate-900 dark:bg-slate-900 dark:text-slate-100 border-b"):
         ui.label("Kenya").classes("text-xl font-semibold")

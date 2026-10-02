@@ -37,7 +37,12 @@ class Completion:
 
 
 class LlmError(Exception):
-    pass
+    """A provider failure. ``public`` is the part safe to show users (kind + HTTP status); the message itself may echo provider response
+    bodies (which can contain key fragments) and goes only to the redacted server log."""
+
+    def __init__(self, message: str, public: str | None = None, status_code: int | None = None):
+        super().__init__(message)
+        self.public, self.status_code = public, status_code
 
 
 class Provider(Protocol):
@@ -158,7 +163,7 @@ class OpenAICompatProvider:
         try:
             r = await client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
             if r.status_code >= 400:
-                raise LlmError(f"HTTP {r.status_code}: {r.text[:200]}")
+                raise LlmError(f"HTTP {r.status_code}: {r.text[:200]}", f"provider returned HTTP {r.status_code}", r.status_code)
             data = r.json()
         except LlmError:
             raise

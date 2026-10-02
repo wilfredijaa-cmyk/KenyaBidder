@@ -6,7 +6,7 @@ import uuid
 from typing import Callable
 
 from ..errors import bad, conflict, not_found
-from ..security import check_outbound_url
+from ..security import check_env_name, check_outbound_url
 from .providers import AnthropicProvider, OpenAICompatProvider, Provider
 
 PROVIDERS = {
@@ -96,6 +96,7 @@ class LlmRegistry:
             raise bad("INVALID_LLM", "base_url must be http(s)")
         if e.get("base_url"):
             check_outbound_url(e["base_url"], "base_url")
+        e["api_key_env"] = check_env_name(e.get("api_key_env", ""), "api_key_env")
         if not (isinstance(e["max_tokens"], int) and 16 <= e["max_tokens"] <= 64_000):
             raise bad("INVALID_LLM", "max_tokens must be between 16 and 64000")
         if e.get("temperature") is not None and not (0 <= e["temperature"] <= 2):

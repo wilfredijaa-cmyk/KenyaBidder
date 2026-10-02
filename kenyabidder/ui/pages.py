@@ -7,9 +7,10 @@ import os
 from nicegui import ui
 
 from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
+from ..errors import AppError
 from ..i18n import Verbatim
 from .common import (active_agent, agent_picker, badge, core, current_user, empty, fmt_time, frame, guard, kes, left,
-                     client_ip, lang_toggle, login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
+                     client_ip, lang_toggle, login_user, my_agents, pretty, public, require_user, rt, set_active_agent, theme)
 
 
 def register() -> None:
@@ -47,6 +48,7 @@ def login_page():
                     pw = ui.input("Password", password=True, password_toggle_button=True).classes("w-full")
 
                     @guard
+                    @public
                     async def sign_in():
                         ip = client_ip()
                         # counted BEFORE the awaited password check, so a burst of concurrent guesses cannot all slip under the cap
@@ -65,8 +67,11 @@ def login_page():
                     ui.button("Sign in", on_click=sign_in).props("unelevated color=primary").classes("w-full")
                     ui.button("Forgot password?", on_click=lambda: forgot_dialog(name.value)).props("flat dense no-caps").classes("w-full")
                 with ui.tab_panel(t_up):
+                    setup = None
                     if first:
                         ui.label("You are the first user, so this account becomes the administrator.").classes("text-sm text-primary")
+                        if core().agents.bootstrap_token():
+                            setup = ui.input("Setup code (from the server's KENYABIDDER_BOOTSTRAP_TOKEN)", password=True).classes("w-full")
                     n2 = ui.input("Name").classes("w-full")
                     p2 = ui.input("Password (8+ characters)" if core().agents.password_policy() == "basic" else "Password (10+ characters)",
                                   password=True, password_toggle_button=True).classes("w-full")
@@ -77,9 +82,11 @@ def login_page():
                         ui.link("Terms & Privacy Notice", "/terms", new_tab=True).classes("-ml-3 text-sm")
 
                     @guard
+                    @public
                     def sign_up():
                         core().throttle.hit("signup_ip", client_ip(), int(os.environ.get("KENYABIDDER_SIGNUPS_PER_IP_HOUR", 6)), 3600, message="too many accounts created from your network — try again later")
-                        u = core().agents.create_user(name=n2.value, password=p2.value, phone=ph.value, email=em.value, accepted_terms=bool(agree.value))
+                        u = core().agents.create_user(name=n2.value, password=p2.value, phone=ph.value, email=em.value, accepted_terms=bool(agree.value),
+                                                      setup_code=setup.value if setup else None)
                         login_user(u)
                         ui.navigate.to("/agents")
                     ui.button("Create account", on_click=sign_up).props("unelevated color=primary").classes("w-full")
@@ -93,6 +100,7 @@ def two_factor_dialog(user: dict, ip: str) -> None:
         code = ui.input("Code").props("autofocus inputmode=numeric autocomplete=one-time-code").classes("w-full")
 
         @guard
+        @public
         def verify():
             core().throttle.hit("login_fail_ip", ip, 25, 600)
             if not core().agents.totp_check(user, code.value):
@@ -119,12 +127,14 @@ def forgot_dialog(prefill: str = "") -> None:
         newpw = ui.input("New password (8+ characters)", password=True, password_toggle_button=True).classes("w-full")
 
         @guard
+        @public
         async def send():
             core().throttle.hit("reset_ip", client_ip(), 10, 3600)
             r = await core().verification.request_password_reset(nm.value)
             ui.notify(r["message"], type="info", multi_line=True)
 
         @guard
+        @public
         def finish():
             core().verification.reset_password(nm.value, code.value, newpw.value)
             ui.notify("Password changed — sign in with your new password", type="positive")
@@ -160,8 +170,7 @@ def auctions_page():
 
         @ui.refreshable
         def grid():
-            core().engine.tick()
-            rows = sorted(core().store.auctions.values(), key=lambda a: -a["created_at"])
+            rows = core().engine.browse(agent["agent_id"], admin=user["role"] == "admin")
             if not rows:
                 empty("No listings yet — create one above." if agent["agent_type"] == "SELLER" else "No auctions yet. Sellers will appear here as they list.")
                 return
@@ -199,7 +208,7 @@ def checklist(user: dict, agent: dict) -> None:
     if agent["agent_type"] == "BIDDER":
         steps.append(("Tell your agent what to hunt for (category & budget)", bool((agent["durable_memory"].get("watch") or {}).get("category")), f"/agent/{agent['agent_id']}"))
     else:
-        steps.append(("Create your first listing", any(a["poster_agent_id"] == agent["agent_id"] for a in c.store.auctions.values()), "/"))
+        steps.append(("Create your first listing", c.engine.has_posted(agent["agent_id"]), "/"))
     if c.meter.llm_ids_for(agent):
         st = c.meter.status_for_agent(agent)
         steps.append(("Top up tokens so your agent's LLM can decide", st["ok"], "/wallet"))
@@ -231,7 +240,7 @@ def listing_form(agent: dict) -> None:
     allowed = [t for t in agent["constraints"]["authorized_auction_types"] if t in FORWARD_TYPES] or list(FORWARD_TYPES)
     f = {"title": "", "category": "", "qty": 1, "type": allowed[0], "reserve": 1000, "start": 1000, "inc": 100, "mins": 5,
          "dstart": 5000, "dfloor": 1000, "ddec": 250, "dstep": 20, "vonly": False}
-    with ui.expansion("New listing", icon="add_circle", value=not any(a["poster_agent_id"] == agent["agent_id"] for a in core().store.auctions.values())).classes("w-full border rounded"):
+    with ui.expansion("New listing", icon="add_circle", value=not core().engine.has_posted(agent["agent_id"])).classes("w-full border rounded"):
         with ui.column().classes("w-full gap-2 p-2"):
             with ui.row().classes("w-full"):
                 ui.input("Product", on_change=lambda e: f.update(title=e.value)).classes("grow")
@@ -326,12 +335,19 @@ def auction_page(auction_id: str):
         if not a or not agent:
             empty("Auction not found." if not a else "Create an agent first.")
             return
+        if not core().engine.visible_to(a, agent["agent_id"], admin=user["role"] == "admin"):
+            empty("Auction not found.")  # under review / taken down: the same answer as for one that never existed
+            return
         mine = a["poster_agent_id"] == agent["agent_id"]
         reverse = a["direction"] == "REVERSE"
 
         @ui.refreshable
         def info():
-            v = core().engine.get_auction_detail(auction_id, agent["agent_id"])
+            try:
+                v = core().engine.get_auction_detail(auction_id, agent["agent_id"], admin=user["role"] == "admin")
+            except AppError:
+                empty("This listing is no longer available.")  # went under review while the page was open
+                return
             with ui.card().classes("w-full"):
                 with ui.row().classes("w-full items-center"):
                     ui.label(Verbatim(v["product_spec"]["title"])).classes("text-xl font-medium")

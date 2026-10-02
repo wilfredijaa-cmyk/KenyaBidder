@@ -7,6 +7,7 @@ Multi-Unit / Combinatorial are architecturally reserved.
 """
 from __future__ import annotations
 
+import collections
 import copy
 import uuid
 
@@ -24,10 +25,16 @@ DEFAULT_LIMITS = {"max_open_listings": 50, "max_new_listings_per_minute": 10}
 SEALED = {"FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED", "REVERSE_SEALED"}
 REVERSE = set(REVERSE_TYPES)
 OPEN = {"ACTIVE", "EXTENDING"}
+TERMINAL = {"SETTLED", "CANCELLED"}
+FINISHED_KEPT = 300  # finished auctions remembered for the browse page; the rest is history, reachable by link and in reports
 
 
 def is_open(a: dict) -> bool:
     return a["status"] in OPEN
+
+
+def is_removed(a: dict) -> bool:
+    return a["status"] == "CANCELLED" and str((a.get("result") or {}).get("reason", "")).startswith("removed by moderators")
 
 
 def is_reverse(a: dict) -> bool:
@@ -79,6 +86,77 @@ class AuctionEngine:
         self.clock = clock
         self.events = events or Events()
         self.limits = {**DEFAULT_LIMITS, **(limits or {})}
+        # Finished auctions stay in memory (the history is the product), so everything that runs per tick or per page-refresh
+        # works from this index of unfinished ones instead of walking the whole history.
+        self._live: set[str] = set()
+        self._live_n = -1
+        self._finished: collections.deque[str] = collections.deque(maxlen=FINISHED_KEPT)  # most recently finished, oldest first
+        self._posters: set[str] = set()  # agents that have ever posted something
+        self._recent: dict[str, list[int]] = {}  # poster agent -> creation times in the last minute (listing rate limit)
+
+    def _sync_live(self) -> None:
+        if self._live_n != len(self.store.auctions):  # loaded from the database, restored, or edited out of band
+            self._live, done = set(), []
+            self._posters = set()
+            for i, a in self.store.auctions.items():
+                self._posters.add(poster_of(a))
+                if a["status"] in TERMINAL:
+                    done.append(a)
+                else:
+                    self._live.add(i)
+            done.sort(key=lambda a: a.get("closed_at") or a["created_at"])
+            self._finished = collections.deque((a["auction_id"] for a in done[-FINISHED_KEPT:]), maxlen=FINISHED_KEPT)
+            self._live_n = len(self.store.auctions)
+
+    def live_auctions(self) -> list[dict]:
+        """Every auction that has not finished (scheduled, running or extending) — O(live), not O(history)."""
+        self._sync_live()
+        out = []
+        for i in list(self._live):
+            a = self.store.auctions.get(i)
+            if a is None:
+                self._live.discard(i)
+            elif a["status"] in TERMINAL:
+                self._live.discard(i)
+                self._finished.append(i)
+            else:
+                out.append(a)
+        return out
+
+    def _register(self, a: dict, now: int) -> None:
+        self._sync_live()  # pick up any out-of-band changes first, so the length check below stays meaningful
+        self.store.auctions[a["auction_id"]] = a
+        self._live.add(a["auction_id"])
+        self._live_n = len(self.store.auctions)
+        self._posters.add(poster_of(a))
+        mine = self._recent.setdefault(poster_of(a), [])
+        mine[:] = [t for t in mine if now - t < 60_000]
+        mine.append(a["created_at"])
+
+    def has_posted(self, agent_id: str) -> bool:
+        self._sync_live()
+        return agent_id in self._posters
+
+    def visible_to(self, a: dict, viewer_agent_id: str | None = None, *, admin: bool = False) -> bool:
+        """Listings under moderator review, and ones the moderators took down, are for the poster and the admins only."""
+        if admin or (viewer_agent_id and viewer_agent_id == poster_of(a)):
+            return True
+        return not a.get("hidden") and not is_removed(a)
+
+    def browse(self, viewer_agent_id: str | None = None, *, admin: bool = False, finished: int = 60) -> list[dict]:
+        """What the main page shows, newest first: everything still running plus the most recently finished — never the whole history."""
+        self.tick()
+        rows = [a for a in self.live_auctions() if self.visible_to(a, viewer_agent_id, admin=admin)]
+        shown = 0
+        for i in reversed(self._finished):
+            a = self.store.auctions.get(i)
+            if a is None or not self.visible_to(a, viewer_agent_id, admin=admin):
+                continue
+            rows.append(a)
+            shown += 1
+            if shown >= finished:
+                break
+        return sorted(rows, key=lambda a: -a["created_at"])
 
     # ---------- listings ----------
 
@@ -149,7 +227,7 @@ class AuctionEngine:
             a["start_price"] = d["start_price"]
             a["current_price"] = d["start_price"]
 
-        self.store.auctions[a["auction_id"]] = a
+        self._register(a, now)
         self.events.emit("auction.created", auction_id=a["auction_id"])
         return self.view(a, seller_agent_id)
 
@@ -195,7 +273,7 @@ class AuctionEngine:
             s = anti_snipe or {}
             if is_pos_int(s.get("window_ms")) and is_pos_int(s.get("extend_ms")):
                 a["anti_snipe"] = {"window_ms": s["window_ms"], "extend_ms": s["extend_ms"]}
-        self.store.auctions[a["auction_id"]] = a
+        self._register(a, now)
         self.events.emit("auction.created", auction_id=a["auction_id"])
         return self.view(a, buyer_agent_id)
 
@@ -208,7 +286,7 @@ class AuctionEngine:
             raise forbidden("NOT_LISTING_OWNER", "only the agent that posted it can run it again")
         if a["status"] not in ("SETTLED", "CANCELLED"):
             raise AppError("STILL_RUNNING", "this one is still running", 409)
-        if str((a.get("result") or {}).get("reason", "")).startswith("removed by moderators"):
+        if is_removed(a):
             raise forbidden("REMOVED", "this listing was removed by moderators and can't be re-posted — post a new, compliant one")
         if not (-90 <= price_change_pct <= 500):
             raise bad("INVALID_PRICE", "price change must be between -90% and +500%")
@@ -254,15 +332,14 @@ class AuctionEngine:
 
     def _check_listing_limits(self, seller_agent_id: str, now: int, relist: bool) -> None:
         """Stop a seller flooding the marketplace (and, transitively, every watching agent's LLM budget)."""
-        open_n = recent = 0
-        for a in self.store.auctions.values():
+        open_n = 0
+        for a in self.live_auctions():
             if poster_of(a) != seller_agent_id:
                 continue
             self._advance(a)  # judge by the clock, not by a status the tick loop has not refreshed yet
             if a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING"):
                 open_n += 1
-            if now - a["created_at"] < 60_000:
-                recent += 1
+        recent = sum(1 for t in self._recent.get(seller_agent_id, ()) if now - t < 60_000)
         if open_n >= self.limits["max_open_listings"]:
             raise AppError("TOO_MANY_LISTINGS", f"this agent already has {open_n} open listings (limit {self.limits['max_open_listings']})", 429)
         if not relist and recent >= self.limits["max_new_listings_per_minute"]:
@@ -349,8 +426,11 @@ class AuctionEngine:
         v["bids"] = [_pub_bid(b) for b in bids]
         return v
 
-    def get_auction_detail(self, auction_id: str, viewer_agent_id: str | None = None) -> dict:
-        return self.view(self.get_auction(auction_id), viewer_agent_id)
+    def get_auction_detail(self, auction_id: str, viewer_agent_id: str | None = None, *, admin: bool = False) -> dict:
+        a = self.get_auction(auction_id)
+        if not self.visible_to(a, viewer_agent_id, admin=admin):
+            raise not_found("AUCTION_NOT_FOUND", f"auction {auction_id} not found")  # indistinguishable from one that never existed
+        return self.view(a, viewer_agent_id)
 
     def list_active_auctions(self, *, category=None, auction_types=None, min_quantity=None, ends_before=None,
                              max_price=None, q=None, include_scheduled=False, viewer_agent_id=None, direction="FORWARD") -> list[dict]:
@@ -360,7 +440,7 @@ class AuctionEngine:
         now = self.clock.now()
         ql = q.lower() if q else None
         out = []
-        for a in self.store.auctions.values():
+        for a in self.live_auctions():
             if a["status"] not in statuses:
                 continue
             if a.get("hidden"):
@@ -386,7 +466,7 @@ class AuctionEngine:
     # ---------- lifecycle ----------
 
     def tick(self) -> None:
-        for a in list(self.store.auctions.values()):
+        for a in self.live_auctions():
             self._advance(a)
 
     def _advance(self, a: dict) -> None:

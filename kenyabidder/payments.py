@@ -130,6 +130,8 @@ class MpesaClient:
                                          "CheckoutRequestID": checkout_request_id})
         if "ResultCode" in data:
             code = str(data["ResultCode"])
+            if code == "4999":  # Daraja: "the transaction is still under processing" — NOT a failure
+                return {"state": "PENDING", "code": code, "desc": data.get("ResultDesc", "still processing")}
             return {"state": "PAID" if code == "0" else "FAILED", "code": code, "desc": data.get("ResultDesc", "")}
         err = str(data.get("errorCode", ""))
         if err.endswith("1001") or "being processed" in str(data.get("errorMessage", "")).lower():

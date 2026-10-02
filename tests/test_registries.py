@@ -184,7 +184,8 @@ async def test_kb_url_fetch_ssrf_guard_and_html_extraction(env, monkeypatch):
 async def test_builtin_mcp_discovery_hides_internal_tools(env):
     tools = await env.mcps.refresh_tools("builtin")
     names = {t["name"] for t in tools}
-    assert {"list_active_auctions", "get_historical_clearing_prices", "search_knowledge_base", "recommend_listing"} <= names
+    assert {"list_active_auctions", "get_historical_clearing_prices", "recommend_listing"} <= names
+    assert "search_knowledge_base" not in names  # no agent context → not assignable (agents get a per-agent, KB-scoped search)
     assert not names & {"submit_bid", "create_match", "create_listing", "reveal_contact", "report_outcome"}
     # even if the *internal* server were registered as the built-in, its state-changing tools stay unassignable
     from kenyabidder.mcpx.manager import McpManager
@@ -364,10 +365,10 @@ async def test_llm_output_is_clamped_and_failures_fall_back(env):
     p = await strat.propose(ctx)
     assert p["params"]["max_bid"] == 5000 and p["kind"] == "ENGLISH_INCREMENTAL"  # LLM output is never trusted past the ceiling
 
-    for script, why in [([Completion(text="bid everything!")] * 4, "invalid or missing"), ([LlmError("HTTP 500")], "HTTP 500"), ([], "script exhausted")]:
+    for script, why in [([Completion(text="bid everything!")] * 4, "invalid or missing"), ([LlmError("HTTP 500: {\"error\": \"bad key sk-ant-SECRETFRAGMENT\"}", "provider returned HTTP 500", 500)], "provider returned HTTP 500"), ([], "LlmError")]:
         env.llms.set_provider_override(e["id"], ScriptedProvider(script))
         p = await strat.propose(ctx)
-        assert p.get("fallback") and why in p["reasoning"] and "heuristic fallback" in p["reasoning"]
+        assert p.get("fallback") and why in p["reasoning"] and "heuristic fallback" in p["reasoning"] and "SECRETFRAGMENT" not in p["reasoning"]
 
     class Slow:
         async def complete(self, *a, **k):

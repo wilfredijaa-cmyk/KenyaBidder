@@ -55,7 +55,23 @@ class Orchestrator:
         while self.pending:
             await asyncio.gather(*list(self.pending), return_exceptions=True)
 
+    CONCURRENCY = 8  # agents deciding at once (each LLM decision can take many seconds; they must not queue behind one another)
+
+    async def _gather(self, jobs: list) -> list:
+        """Run decisions concurrently but bounded; one agent's failure never affects another's."""
+        sem = asyncio.Semaphore(self.CONCURRENCY)
+
+        async def run(job):
+            async with sem:
+                try:
+                    return await job()
+                except Exception:  # noqa: BLE001
+                    log.exception("agent decision failed")
+                    return None
+        return await asyncio.gather(*(run(j) for j in jobs))
+
     async def on_auction_created(self, auction_id: str) -> None:
+        jobs = []
         for agent in list(self.store.agents.values()):
             mem = agent["durable_memory"]
             a = self.store.auctions.get(auction_id)
@@ -66,14 +82,12 @@ class Orchestrator:
                     self.notify(agent["agent_id"], "watch", f"New {'request for quotes' if is_reverse(a) else 'listing'} matching your watch: \"{a['product_spec']['title']}\" "
                                 f"({a['product_spec']['quantity']} × {a['product_spec']['category']}).", auction_id=auction_id)
                 continue
-            try:
-                await self.consider(agent["agent_id"], auction_id)
-            except Exception:  # noqa: BLE001  one agent's failure must not starve the others
-                log.exception("consider failed for agent %s", agent["agent_id"])
+            jobs.append(lambda aid=agent["agent_id"]: self.consider(aid, auction_id))
+        await self._gather(jobs)
 
     async def retry_blocked(self, user_id: str | None = None) -> int:
         """Re-run agents that were held back (no tokens / daily cap). Called after a top-up and periodically."""
-        n = 0
+        jobs = []
         for (agent_id, auction_id), _code in list(self.blocked.items()):
             agent, a = self.store.agents.get(agent_id), self.store.auctions.get(auction_id)
             if not agent or not a or a["status"] not in ("ACTIVE", "EXTENDING", "SCHEDULED"):
@@ -81,12 +95,9 @@ class Orchestrator:
                 continue
             if user_id and agent["principal_user_id"] != user_id:
                 continue
-            try:
-                r = await self.consider(agent_id, auction_id)
-                n += r["status"] == "PLANNED"
-            except Exception:  # noqa: BLE001
-                log.exception("retry_blocked failed")
-        return n
+            jobs.append(lambda ag=agent_id, au=auction_id: self.consider(ag, au))
+        results = await self._gather(jobs)
+        return sum(1 for r in results if r and r.get("status") == "PLANNED")
 
     async def reconsider_user(self, user_id: str) -> int:
         return await self.retry_blocked(user_id)

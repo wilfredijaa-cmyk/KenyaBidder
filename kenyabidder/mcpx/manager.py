@@ -17,7 +17,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from ..errors import bad, conflict, not_found
-from ..security import check_outbound_url
+from ..security import check_env_name, check_outbound_url
 
 BUILTIN_ID = "builtin"
 ROLES = ["BIDDER", "SELLER"]
@@ -59,6 +59,7 @@ class McpManager:
             raise bad("INVALID_MCP", "url (http/https) is required for HTTP MCP servers")
         if transport == "http":
             check_outbound_url(url.strip(), "url")
+            bearer_env = check_env_name(bearer_env, "bearer_env")
         if transport == "stdio":
             if not self.allow_stdio:
                 raise bad("STDIO_DISABLED", "stdio MCP servers run local commands and are disabled — start the app with KENYABIDDER_ALLOW_STDIO=1 to enable")
@@ -88,6 +89,8 @@ class McpManager:
                 continue
             if k == "bearer_token" and v == "":
                 continue  # blank = keep
+            if k == "bearer_env":
+                v = check_env_name(v, "bearer_env")
             if k == "url" and m.get("transport") == "http":
                 check_outbound_url(str(v).strip(), "url")  # the guard applies to edits too, not only to registration
             m[k] = v
@@ -157,8 +160,8 @@ class McpManager:
         out = []
         for t in tools:
             tags = ((t.meta or {}).get("fastmcp", {}) or {}).get("tags") or []
-            if m["builtin"] and "internal" in tags:
-                continue  # state-changing tools are never assignable
+            if m["builtin"] and ("internal" in tags or "knowledge" in tags):
+                continue  # state-changing tools are never assignable; the KB search tool is not either (it has no agent context — agents get a per-agent, KB-scoped search instead)
             out.append({"name": t.name, "description": (t.description or "")[:600],
                         "input_schema": t.input_schema or {"type": "object", "properties": {}}, "tags": list(tags)})
         m["tools"], m["tools_refreshed_at"], m["last_error"] = out, self.clock.now(), None

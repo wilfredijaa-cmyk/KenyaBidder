@@ -127,9 +127,9 @@ class ChannelRouter:
             reply = await self.command(agent, str(text).strip())
         except AppError as e:
             reply = f"Sorry, that failed: {e.message}"
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             log.exception("command failed")
-            reply = f"Sorry, that failed: {e}"
+            reply = "Sorry, something went wrong on our side. Please try again."
         conv.append({"role": "agent", "channel": channel, "text": reply, "at": self.clock.now()})
         del conv[:-100]
         return reply

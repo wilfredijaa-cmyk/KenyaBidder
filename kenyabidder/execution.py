@@ -52,10 +52,40 @@ class ExecutionEngine:
         self.transport = transport or DirectTransport(engine)
         self.max_retries = max_retries
         self._evaluating: set[str] = set()
+        # auction_id -> ids of its unfinished plans. Finished plans are kept for a week for the UI, so the hot path (every bid,
+        # every tick) must not walk them: a plan never comes back from a finished state, so this index only ever shrinks per auction.
+        self._by_auction: dict[str, set[str]] = {}
+        self._by_n = -1
         # Event-driven: re-evaluate an auction's triggers whenever it changes.
         for ev in ("auction.bid", "auction.price", "auction.extended", "auction.started",
                    "auction.settled", "auction.cancelled"):
             engine.events.on(ev, lambda auction_id, **_: self.evaluate_auction(auction_id))
+
+    # ---------- trigger index ----------
+
+    def _sync_index(self) -> None:
+        if self._by_n != len(self.store.triggers):  # loaded, pruned, or edited out of band
+            idx: dict[str, set[str]] = {}
+            for t in self.store.triggers.values():
+                if t["status"] in LIVE:
+                    idx.setdefault(t["auction_id"], set()).add(t["id"])
+            self._by_auction, self._by_n = idx, len(self.store.triggers)
+
+    def _live_for(self, auction_id: str) -> list[dict]:
+        self._sync_index()
+        ids = self._by_auction.get(auction_id)
+        if not ids:
+            return []
+        out = []
+        for i in list(ids):
+            t = self.store.triggers.get(i)
+            if t is None or t["status"] not in LIVE:
+                ids.discard(i)
+            else:
+                out.append(t)
+        if not ids:
+            self._by_auction.pop(auction_id, None)
+        return out
 
     # ---------- trigger management ----------
 
@@ -72,14 +102,17 @@ class ExecutionEngine:
         if KIND_FOR_TYPE[a["auction_type"]] != kind:
             raise bad("KIND_MISMATCH", f"{kind} cannot be used on a {a['auction_type']} auction")
         _validate_params(kind, params)
-        for t in self.store.triggers.values():
-            if t["agent_id"] == agent_id and t["auction_id"] == auction_id and t["status"] in LIVE:
+        for t in self._live_for(auction_id):
+            if t["agent_id"] == agent_id:
                 self._cancel(t, "superseded by a newer plan")
         t = {"id": str(uuid.uuid4()), "agent_id": agent_id, "auction_id": auction_id, "kind": kind,
              "params": dict(params), "status": "ACTIVE", "reasoning": reasoning, "source": source,
              "fired_count": 0, "approval_id": None, "approved_up_to": 0, "last_rejection": None,
              "last_error": None, "outcome": None, "created_at": self.clock.now()}
+        self._sync_index()  # before adding, so the length check stays meaningful
         self.store.triggers[t["id"]] = t
+        self._by_auction.setdefault(auction_id, set()).add(t["id"])
+        self._by_n = len(self.store.triggers)
         self.evaluate_auction(auction_id)
         return t
 
@@ -104,7 +137,8 @@ class ExecutionEngine:
     # ---------- evaluation loop ----------
 
     def evaluate_all(self) -> None:
-        for auction_id in {t["auction_id"] for t in list(self.store.triggers.values()) if t["status"] in LIVE}:
+        self._sync_index()
+        for auction_id in [i for i in list(self._by_auction) if self._live_for(i)]:
             try:
                 self.evaluate_auction(auction_id)
             except Exception:  # noqa: BLE001
@@ -115,8 +149,8 @@ class ExecutionEngine:
         a = self.store.auctions.get(auction_id)
         if a and a["status"] not in ("SETTLED", "CANCELLED"):
             return
-        for t in self.store.triggers.values():
-            if t["auction_id"] == auction_id and t["status"] == "AWAITING_APPROVAL":
+        for t in self._live_for(auction_id):
+            if t["status"] == "AWAITING_APPROVAL":
                 t["status"], t["last_error"] = "CANCELLED", "auction closed while waiting for approval"
                 ap = self.store.approvals.get(t.get("approval_id") or "")
                 if ap and ap["status"] == "PENDING":
@@ -131,8 +165,8 @@ class ExecutionEngine:
             self._retire_dangling(auction_id)
             for _ in range(10_000):
                 fired = False
-                for t in list(self.store.triggers.values()):
-                    if t["auction_id"] == auction_id and t["status"] == "ACTIVE":
+                for t in self._live_for(auction_id):
+                    if t["status"] == "ACTIVE":
                         try:
                             fired = self._evaluate(t) or fired
                         except Exception:  # noqa: BLE001  one poisoned record must not starve every other trigger on every tick

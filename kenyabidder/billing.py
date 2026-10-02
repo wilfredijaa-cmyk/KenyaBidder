@@ -382,7 +382,7 @@ class BillingService:
                 if self.on_paid and o["data"].get("plan"):
                     self.on_paid(o)  # idempotent: also heals a plan whose first activation was interrupted
                 return {**o, "already_paid": True}
-            recoverable = ("PENDING", "AWAITING_REVIEW") + (("EXPIRED", "CANCELLED") if o["provider"] == "mpesa" else ())  # a late STK approval still counts
+            recoverable = ("PENDING", "AWAITING_REVIEW") + (("EXPIRED", "CANCELLED", "FAILED") if o["provider"] == "mpesa" else ())  # a late STK approval still counts
             if o["status"] not in recoverable:
                 raise conflict("INVALID_STATE", f"order is {o['status']} and cannot be marked paid")
             final_receipt = receipt or o["receipt"]
@@ -475,6 +475,8 @@ class BillingService:
         now = self.clock.now()
         rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE provider='mpesa' AND external_ref IS NOT NULL AND status IN ('PENDING','EXPIRED') "  # nosec B608
                               "AND created_at<? AND created_at>? ORDER BY created_at LIMIT ?", (now - 20_000, now - 3 * 3600_000, limit))
+        # (a Daraja "still processing" answer maps to PENDING, so every FAILED order here is a definitive failure and is not polled again;
+        #  a late successful callback can still heal one through mark_paid)
         settled = 0
         for r in rows:
             try:

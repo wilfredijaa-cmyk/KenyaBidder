@@ -16,6 +16,7 @@ import re
 from typing import Any
 
 from .engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE
+from .errors import AppError
 from .llm.providers import Completion, ToolCall, ToolSpec
 from .prompts import bidder_prompt, seller_prompt, supplier_prompt
 from .wallet import AgentRateLimited, AgentTokenCap, InsufficientTokens
@@ -194,9 +195,29 @@ def _reverse_proposal(inp: dict, auction: dict, agent: dict, reasoning: str) -> 
     return {"action": "BID", "kind": "REVERSE_SEALED_BID", "params": {"amount": amt}, "reasoning": reasoning} if amt else None
 
 
+_TAG = re.compile(r"<\s*/?\s*untrusted_[a-z_]*\s*>", re.I)
+
+
 def untrusted(tag: str, text: str) -> str:
-    # neutralise anything that tries to close our delimiter early
-    return f"<untrusted_{tag}>\n{re.sub(r'</?untrusted_[a-z_]*>', '', text)}\n</untrusted_{tag}>"
+    """Wrap data for the LLM. Delimiter look-alikes are removed to a FIXED POINT (a single pass lets '</untrusted_</untrusted_x>y>' re-form a
+    closing tag), and any '<' left near 'untrusted_' is defused."""
+    prev = None
+    while prev != text:
+        prev, text = text, _TAG.sub("", text)
+    text = re.sub(r"<(\s*/?\s*untrusted_)", r"‹\1", text, flags=re.I)
+    return f"<untrusted_{tag}>\n{text}\n</untrusted_{tag}>"
+
+
+def safe_error(e: BaseException) -> str:
+    """A reason fit for users: the kind of failure and an HTTP status — never the provider's response body (which can echo keys)."""
+    if isinstance(e, AppError):
+        return e.message[:160]  # our own domain errors are written for users
+    if getattr(e, "public", None):
+        return e.public
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    if isinstance(e, TimeoutError):
+        return "timeout"
+    return f"{type(e).__name__}" + (f" (HTTP {status})" if status else "")
 
 
 class Toolbox:
@@ -306,7 +327,7 @@ class LlmStrategy:
             system = (supplier_prompt(user, agent, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names) if reverse
                       else bidder_prompt(user, agent, [s.name for s in tb.specs if s is not KB_TOOL], tb.kb_names))
             prompt = (f"Decide how to approach this {'RFQ (you are the supplier)' if reverse else 'auction'}.\n\nMarket stats: {json.dumps((ctx.get('intel') or {}).get('stats'))}\n\n"
-                      + untrusted("listing_data", json.dumps(listing, default=str)))
+                      + untrusted("listing_data", json.dumps(listing, default=str).replace("<", "\\u003c").replace(">", "\\u003e")))
             args, trace = await run_tool_loop(
                 provider, system, prompt, PROPOSE_ACTION, tb,
                 max_steps=agent["config"]["max_tool_steps"] if tb.specs else 0, max_tokens=entry["max_tokens"],
@@ -322,7 +343,8 @@ class LlmStrategy:
                 return await self._fallback(ctx, e.message)
             return {"action": "BLOCKED", "code": e.code, "reasoning": e.message}  # policy 'block': the agent waits for tokens
         except Exception as e:  # noqa: BLE001  (timeouts, HTTP errors, missing key, disabled LLM…)
-            return await self._fallback(ctx, "timeout" if isinstance(e, TimeoutError) else str(e)[:160])
+            log.warning("LLM strategy failed: %s: %s", type(e).__name__, str(e)[:300])  # details go to the (redacted) log, not to users
+            return await self._fallback(ctx, safe_error(e))
         finally:
             if decision:
                 decision.finish()

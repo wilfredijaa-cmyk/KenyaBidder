@@ -95,9 +95,7 @@ class PrivacyService:
         u = self.store.users.get(user_id)
         if not u or u.get("deleted_at"):
             raise not_found("USER_NOT_FOUND", "user not found")
-        from .agents import verify_password
-        if not verify_password(password or "", u["password_hash"]):
-            raise forbidden("WRONG_PASSWORD", "password is incorrect")
+        self.agents.reauth(user_id, password)  # shared lockout: no brute-forcing the password through this form
         blockers = self.blockers(user_id)
         if blockers:
             raise AppError("DELETION_BLOCKED", "we cannot delete the account yet: " + "; ".join(blockers), 409)
