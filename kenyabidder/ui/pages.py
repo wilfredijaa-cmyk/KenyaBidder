@@ -52,12 +52,12 @@ def login_page():
                     async def sign_in():
                         ip = client_ip()
                         # counted BEFORE the awaited password check, so a burst of concurrent guesses cannot all slip under the cap
-                        core().throttle.hit("login_fail_ip", ip, 25, 600, message="too many failed sign-in attempts from your network — try again in a few minutes")
+                        stamp = core().throttle.hit("login_fail_ip", ip, 25, 600, message="too many failed sign-in attempts from your network — try again in a few minutes")
                         u = await core().agents.authenticate_async(name.value, pw.value)
                         if not u:
                             ui.notify("Wrong name or password", type="negative")
                             return
-                        core().throttle.forgive("login_fail_ip", ip)
+                        core().throttle.forgive("login_fail_ip", ip, stamp)
                         if core().agents.totp_enabled(u):
                             two_factor_dialog(u, ip)
                             return
@@ -102,11 +102,11 @@ def two_factor_dialog(user: dict, ip: str) -> None:
         @guard
         @public
         def verify():
-            core().throttle.hit("login_fail_ip", ip, 25, 600)
+            stamp = core().throttle.hit("login_fail_ip", ip, 25, 600)
             if not core().agents.totp_check(user, code.value):
                 ui.notify("That code is not right", type="negative")
                 return
-            core().throttle.forgive("login_fail_ip", ip)
+            core().throttle.forgive("login_fail_ip", ip, stamp)
             d.close()
             login_user(user)
             ui.navigate.to("/")

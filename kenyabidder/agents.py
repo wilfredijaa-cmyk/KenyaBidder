@@ -122,9 +122,9 @@ class AgentService:
         u = self.store.users.get(user_id)
         if not u:
             raise not_found("USER_NOT_FOUND", "user not found")
-        if any(o["id"] != user_id and o["phone"] and o["phone"] == self._phone(phone) for o in self.store.users.values()):
-            raise conflict("PHONE_TAKEN", "that phone number is already registered to another account")
         new = self._phone(phone)
+        if new and new != u.get("phone") and any(o["id"] != user_id and o["phone"] == new for o in self.store.users.values()):
+            raise conflict("PHONE_TAKEN", "that phone number is already registered to another account")  # re-saving your own, unchanged number is fine
         if new != u.get("phone"):
             u["phone_verified"] = False  # a new number must prove itself again
             for a in self.agents_for(user_id):  # …and the old number must stop commanding this account's agents

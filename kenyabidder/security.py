@@ -113,24 +113,33 @@ class Throttle:
             d.popleft()
         return len(d)
 
-    def hit(self, bucket: str, key: str, limit: int, window_s: float, *, message: str = "too many requests — slow down") -> None:
+    def hit(self, bucket: str, key: str, limit: int, window_s: float, *, message: str = "too many requests — slow down") -> float:
         """Record one event; raise 429 when the window already holds ``limit`` of them."""
         now = self._now()
         self._sweep(now)
         if self.count(bucket, key, window_s) >= limit:
             raise AppError("RATE_LIMITED", message, 429)
         self._hits[(bucket, key)].append(now)
+        return now  # hand back to forgive() so a success takes back ITS OWN hit, not another request's
 
     def check(self, bucket: str, key: str, limit: int, window_s: float, *, message: str = "too many attempts — try again later") -> None:
         """Raise if the window is full, WITHOUT recording (pair with :meth:`record` on failure)."""
         if self.count(bucket, key, window_s) >= limit:
             raise AppError("RATE_LIMITED", message, 429)
 
-    def forgive(self, bucket: str, key: str) -> None:
-        """Take back the most recent hit (a provisional failure that turned out to be a success)."""
+    def forgive(self, bucket: str, key: str, stamp: float | None = None) -> None:
+        """Take back a provisional hit that turned out to be a success: the one returned by :meth:`hit` (concurrent requests from the same
+        address must not erase each other's failures), or the most recent when no stamp is given."""
         d = self._hits.get((bucket, key))
-        if d:
+        if not d:
+            return
+        if stamp is None:
             d.pop()
+            return
+        try:
+            d.remove(stamp)
+        except ValueError:
+            pass  # already aged out of the window
 
     def record(self, bucket: str, key: str) -> None:
         self._sweep(self._now())
@@ -157,11 +166,12 @@ class HardeningMiddleware:
     and no server banner."""
 
     def __init__(self, app, *, https: bool = False, client_ip: ClientIP | None = None, throttle: Throttle | None = None,
-                 http_per_minute: int | None = None, webhook_per_minute: int = 120, ws_per_ip: int | None = None,
+                 http_per_minute: int | None = None, webhook_per_minute: int | None = None, ws_per_ip: int | None = None,
                  max_body: int = 1_000_000, max_upload: int = 10_000_000, max_webhook: int = 262_144):
         self.app, self.https, self.ip, self.throttle = app, https, client_ip or ClientIP(), throttle or Throttle()
         self.http_per_minute = http_per_minute or int(os.environ.get("KENYABIDDER_HTTP_PER_MINUTE", 600))
-        self.webhook_per_minute = webhook_per_minute
+        # payment/WhatsApp providers deliver from a handful of addresses, in bursts; the signature check is what authenticates them
+        self.webhook_per_minute = webhook_per_minute or int(os.environ.get("KENYABIDDER_WEBHOOK_PER_MINUTE", 1200))
         self.ws_per_ip = ws_per_ip or int(os.environ.get("KENYABIDDER_WS_PER_IP", 40))
         self.max_body, self.max_upload, self.max_webhook = max_body, max_upload, max_webhook
         self.headers = security_headers(https)

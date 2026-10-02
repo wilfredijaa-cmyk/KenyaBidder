@@ -121,7 +121,7 @@ class Database(abc.ABC):
 
     def healthy(self) -> bool:
         """Health probes must never queue behind a long flush: if the connection is busy right now, it is working, not broken."""
-        if not self._lock.acquire(timeout=1.0):
+        if not self._lock.acquire(blocking=False):  # called on the event loop: never wait
             return True
         try:
             return next(iter(self._query("SELECT 1", ())[0].values())) == 1

@@ -240,7 +240,7 @@ def data_card(user: dict) -> None:
     with ui.card().classes("w-full max-w-xl"):
         ui.label("Your data").classes("font-medium")
         ui.label("You can download everything we hold about you, or delete your account. Payment and token-ledger records must be kept "
-                 "by law and stay under an anonymous ID.").classes("text-xs opacity-70")
+                 "by law (they can include the phone number used for M-Pesa) and stay under an anonymous ID.").classes("text-xs opacity-70")
         ui.button("Download my data (JSON)", icon="download",
                   on_click=lambda: ui.download.content(c.privacy.export_json(user["id"]).encode(), "kenyabidder-my-data.json")).props("outline no-caps")
         with ui.expansion("Delete my account", icon="delete_forever").classes("w-full border rounded"):

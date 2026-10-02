@@ -17,7 +17,7 @@ def normalize_phone(raw: str | None) -> str | None:
     s = re.sub(r"[\s\-().]", "", raw.strip())
     plus = s.startswith("+")
     digits = s[1:] if plus else s
-    if not digits.isdigit():
+    if not (digits.isascii() and digits.isdigit()):  # str.isdigit() also accepts Arabic-Indic etc.: one number must have one spelling
         return None
     if digits.startswith("254") and _KE.match(digits):
         return "+" + digits

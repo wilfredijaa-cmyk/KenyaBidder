@@ -175,20 +175,34 @@ def test_kind_and_params_validation(env):
         assert e.value.code == code
 
 
-def test_market_anomaly_pauses_autonomous_bidding_and_resumes_after_the_cooldown(env):
+def test_one_absurd_listing_is_refused_without_halting_the_whole_category(env):
+    """Matching a seller's own absurd ask is that listing's problem: refuse the lot, leave every other agent's bidding alone."""
     _, s = env.seller()
     for _ in range(5):
         env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": 1000, "quantity": 1, "at": 1})   # ~1,000 per unit
     _, b = env.bidder(ceiling=1_000_000)
     a = env.english(s["agent_id"], start_price=50_000, reserve_price=50_000, duration_ms=3600_000, product_spec={"category": "electronics", "title": "T", "quantity": 10})  # 5,000/unit
     t = trig(env, b, a["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 900_000})
-    assert t["status"] == "ACTIVE" and t["last_rejection"] == "MARKET_ANOMALY"          # paused, NOT permanently blocked
-    assert "electronics" in env.store.breakers and any(n["kind"] == "anomaly" for n in env.router.notifications_for(b["agent_id"]))
-    assert not env.engine.get_auction(a["auction_id"])["bids"]
-    env.clock.advance(11 * 60_000)                                                       # cooldown over
-    env.guardrail.config["anomaly_multiple"] = 10**6                                     # (the price itself is still 5x — disarm the check)
-    env.app.tick()
-    assert env.engine.get_auction(a["auction_id"])["bids"][-1]["agent_id"] == b["agent_id"]   # the same plan resumed by itself
+    assert t["status"] == "BLOCKED" and t["last_error"] == "PRICE_ANOMALOUS"
+    assert "electronics" not in env.store.breakers and not env.engine.get_auction(a["auction_id"])["bids"]
+    normal = env.english(s["agent_id"], start_price=1000, reserve_price=1000, duration_ms=3600_000, product_spec={"category": "electronics", "title": "N", "quantity": 1})
+    trig(env, b, normal["auction_id"], "ENGLISH_INCREMENTAL", {"max_bid": 5000})
+    assert env.engine.get_auction(normal["auction_id"])["bids"]  # an ordinary lot in the same category is still bid on
+
+
+def test_market_anomaly_pauses_autonomous_bidding_and_resumes_after_the_cooldown(env):
+    """A bid that overpays the going rate by choice (above the minimum the lot requires) trips the category breaker."""
+    _, s = env.seller()
+    for _ in range(5):
+        env.store.market_history.append({"category": "electronics", "auction_type": "ENGLISH", "price": 1000, "quantity": 1, "at": 1})
+    _, b = env.bidder(ceiling=1_000_000)
+    a = env.english(s["agent_id"], start_price=1000, reserve_price=1000, duration_ms=3600_000, product_spec={"category": "electronics", "title": "T", "quantity": 1})
+    r = env.guardrail.evaluate({"agent_id": b["agent_id"], "auction_id": a["auction_id"], "action": "bid", "amount": 90_000, "source": "strategy"})
+    assert r["code"] == "MARKET_ANOMALY" and "electronics" in env.store.breakers
+    r2 = env.guardrail.evaluate({"agent_id": b["agent_id"], "auction_id": a["auction_id"], "action": "bid", "amount": 1000, "source": "strategy"})
+    assert r2["code"] == "MARKET_ANOMALY"                                                # everyone's autonomous bidding is paused…
+    env.clock.advance(11 * 60_000)                                                       # …until the cooldown is over
+    assert env.guardrail.evaluate({"agent_id": b["agent_id"], "auction_id": a["auction_id"], "action": "bid", "amount": 1000, "source": "strategy"})["decision"] == "APPROVED"
 
 
 def test_a_manual_bid_can_neither_trip_nor_be_stopped_by_the_breaker(env):

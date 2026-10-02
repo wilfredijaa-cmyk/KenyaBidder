@@ -15,6 +15,7 @@ import hmac
 import secrets
 import uuid
 
+from .config import is_production
 from .errors import AppError, bad, not_found
 from .i18n import template
 from .messaging import mask
@@ -93,7 +94,7 @@ class VerificationService:
             await deliver()
         out = {"id": vid, "channel": channel, "sent_to": mask(dest), "expires_in_s": TTL_MS // 1000}
         provider = self.messenger.sms if channel == "SMS" else self.messenger.email
-        if not getattr(provider, "real", False):
+        if not getattr(provider, "real", False) and not is_production():  # never on a production site: the code IS the proof of ownership
             out["dev_code"] = code  # no real gateway configured: show the code on screen so the flow can be tried end to end
         return out
 
@@ -183,6 +184,10 @@ class VerificationService:
             raise AppError("CODE_INVALID", "that code is wrong or has expired — request a new one", 400)
         if len(new_password or "") < 8:
             raise bad("INVALID_USER", "password must be at least 8 characters")
-        self._check(u["id"], "RESET", code)
-        self.agents.set_password(u["id"], new_password)
+        rec = self._check(u["id"], "RESET", code)
+        try:
+            self.agents.set_password(u["id"], new_password)
+        except AppError:
+            rec["status"] = "PENDING"  # a weak password must not burn a valid code: let them pick a better one
+            raise
         return u

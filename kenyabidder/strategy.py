@@ -399,7 +399,7 @@ class SellerAdvisor:
                 return {**rules, "reasoning": f"[{e.message}; rule-based fallback] " + rules["reasoning"], "source": "rules"}
             raise  # policy 'block': the seller must top up to use the LLM advisor (the UI explains and links to Wallet)
         except Exception as e:  # noqa: BLE001
-            return {**rules, "reasoning": f"[LLM unavailable: {str(e)[:120]}; rule-based fallback] " + rules["reasoning"]}
+            return {**rules, "reasoning": f"[LLM unavailable: {safe_error(e)}; rule-based fallback] " + rules["reasoning"]}
         finally:
             if decision:
                 decision.finish()

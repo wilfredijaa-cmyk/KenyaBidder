@@ -98,6 +98,7 @@ class ModerationService:
         if action in ("TAKEDOWN", "BAN_POSTER") and a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING"):
             a["status"], a["result"] = "CANCELLED", {"outcome": "CANCELLED", "reason": "removed by moderators: " + (note or "")[:200]}
             a["hidden"] = False
+        self.store.thaw("auctions", a["auction_id"])  # may be a finished, frozen record: make sure the change reaches the database
         if action == "BAN_POSTER" and poster and self.agents:
             self.agents.set_suspended(poster["principal_user_id"], True, by=admin.get("id"))
         status = "ACTIONED" if action != "DISMISS" else "DISMISSED"

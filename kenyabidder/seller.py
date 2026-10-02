@@ -28,6 +28,8 @@ class SellerService:
         cfg = (seller or {}).get("durable_memory", {}).get("auto_relist")
         if not cfg or seller["status"] != "ACTIVE":
             return None
+        if a.get("hidden") or a["status"] == "CANCELLED":
+            return None  # under moderator review or taken down: not for the agent to quietly re-run
         title = a["product_spec"]["title"]
         if a["relist_count"] >= cfg.get("max_relists", 3):
             self.notify(seller["agent_id"], "relist", f"\"{title}\" stayed unsold after {a['relist_count']} relists; the agent stopped relisting.", auction_id=auction_id)
