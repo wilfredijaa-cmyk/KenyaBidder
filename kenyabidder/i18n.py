@@ -18,7 +18,7 @@ SW: dict[str, str] = {
     "Platform": "Jukwaa", "Admin": "Msimamizi", "Sign out": "Toka",
     # sign in / up
     "Sign in": "Ingia", "Create account": "Fungua akaunti", "Name": "Jina", "Password": "Nenosiri", "Forgot password?": "Umesahau nenosiri?",
-    "Password (8+ characters)": "Nenosiri (herufi 8+)", "Email": "Barua pepe", "Phone": "Simu",
+    "Password (8+ characters)": "Nenosiri (herufi 8+)", "Password (10+ characters)": "Nenosiri (herufi 10+)", "Email": "Barua pepe", "Phone": "Simu",
     "Wrong name or password": "Jina au nenosiri si sahihi",
     "AI agents that buy and sell for you. The platform finds the match — payment and delivery stay between the two of you.":
         "Mawakala wa AI wanaonunua na kuuza kwa niaba yako. Jukwaa linatafuta mechi — malipo na uwasilishaji ni kati yenu wawili.",

@@ -5,14 +5,23 @@ import argparse
 import hmac
 import logging
 import os
+import sys
+from pathlib import Path
+
+# NiceGUI keeps per-browser session data on disk: put it beside our data (and keep it private) instead of ./.nicegui
+_data_arg = os.environ.get("KENYABIDDER_DATA", "data/state.json")
+if _data_arg:
+    os.environ.setdefault("NICEGUI_STORAGE_PATH", str(Path(_data_arg).parent / ".nicegui"))
 
 from fastapi import HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from nicegui import app as ng_app
 from nicegui import ui
 
+from . import config as config_mod
 from . import metrics as metrics_mod
 from . import runtime as runtime_mod
+from .security import HardeningMiddleware, RedactingFilter
 from .channels import handle_whatsapp_webhook
 from .errors import AppError
 from .ui import admin, agents_page, common, pages, wallet_page
@@ -28,6 +37,7 @@ def build(runtime: runtime_mod.Runtime) -> None:
     ng_app.on_startup(runtime.start)
     ng_app.on_shutdown(runtime.stop)
     core = runtime.app
+    ng_app.add_middleware(HardeningMiddleware, https=config_mod.public_https() or config_mod.is_production(), client_ip=core.client_ip, throttle=core.throttle)
 
     @ng_app.get("/healthz")
     def healthz():
@@ -47,7 +57,8 @@ def build(runtime: runtime_mod.Runtime) -> None:
         if token:
             if not hmac.compare_digest(auth.encode(), f"Bearer {token}".encode()):
                 raise HTTPException(401, "metrics token required")
-        elif (request.client.host if request.client else "") not in ("127.0.0.1", "::1"):
+        elif (request.client.host if request.client else "") not in ("127.0.0.1", "::1") or any(
+                h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip")):  # a local reverse proxy must not expose it to the world
             raise HTTPException(403, "set KENYABIDDER_METRICS_TOKEN to scrape metrics remotely")
         return PlainTextResponse(metrics_mod.render(runtime), media_type="text/plain; version=0.0.4")
 
@@ -96,9 +107,25 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Restored {args.command[1]} to {dest} (previous database kept as .before-restore-<time>). Start the app again.")
         return
     metrics_mod.configure_logging()
+    for h in logging.getLogger().handlers:
+        h.addFilter(RedactingFilter())
+    report = config_mod.validate(host=args.host, durable=bool(args.data or os.environ.get("KENYABIDDER_DATABASE_URL")))
+    log = logging.getLogger("kenyabidder.config")
+    for w in report.warnings:
+        log.warning("config: %s", w)
+    if report.errors:
+        for e in report.errors:
+            log.error("config: %s", e)
+        if os.environ.get("KENYABIDDER_ALLOW_INSECURE") != "1":
+            log.error("refusing to start in production with an insecure configuration (fix the above, or set KENYABIDDER_ALLOW_INSECURE=1 to override)")
+            sys.exit(2)
+        log.critical("KENYABIDDER_ALLOW_INSECURE=1: starting despite the configuration errors above")
     rt = runtime_mod.Runtime(data_file=args.data or None, mcp_port=args.mcp_port or None)
     build(rt)
-    ui.run(host=args.host, port=args.port, title="KenyaBidder", storage_secret=rt.storage_secret, reload=False, show=False, dark=None, favicon="🔨", uvicorn_logging_level="warning", access_log=False)  # no access log: the M-Pesa callback secret is in the URL path
+    https = config_mod.public_https() or config_mod.is_production()
+    ui.run(host=args.host, port=args.port, title="KenyaBidder", storage_secret=rt.storage_secret, reload=False, show=False, dark=None, favicon="🔨",
+           uvicorn_logging_level="warning", access_log=False, server_header=False,  # no access log: the M-Pesa callback secret is in the URL path
+           session_middleware_kwargs={"https_only": https, "same_site": "lax", "max_age": 12 * 3600})
 
 
 if __name__ in {"__main__", "__mp_main__"}:

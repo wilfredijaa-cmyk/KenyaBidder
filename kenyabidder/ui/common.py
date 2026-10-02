@@ -84,17 +84,43 @@ def pretty(s: str) -> str:
 
 # ---------- auth ----------
 
+SESSION_MAX_MS = 12 * 3600_000          # absolute: sign in again after 12 hours
+SESSION_IDLE_MS = 2 * 3600_000          # idle timeout for users…
+ADMIN_IDLE_MS = 30 * 60_000             # …and a much shorter one for administrators
+
+
+def client_ip() -> str:
+    """The caller's real address (X-Forwarded-For honoured only from configured trusted proxies)."""
+    try:
+        return core().client_ip.from_request(context.client.request)
+    except Exception:  # noqa: BLE001  no request context (tests, background work)
+        return "unknown"
+
+
 def current_user() -> dict | None:
-    uid = ng_app.storage.user.get("uid")
+    st = ng_app.storage.user
+    uid = st.get("uid")
     u = core().store.users.get(uid) if uid else None
+    if u:
+        now = core().clock.now()
+        idle = ADMIN_IDLE_MS if u["role"] == "admin" else SESSION_IDLE_MS
+        if now - st.get("at", now) > SESSION_MAX_MS or now - st.get("seen", now) > idle:
+            st.clear()  # expired: a stolen cookie or an unattended screen stops working
+            return None
+        if now - st.get("seen", 0) > 60_000:
+            st["seen"] = now
     if u and ng_app.storage.user.get("sv", 0) != u.get("session_version", 0):
         return None  # the password was changed/reset since this browser signed in: every other session ends
     return None if (u and u.get("suspended")) else u  # a suspended account is signed out on its next page load
 
 
 def login_user(user: dict) -> None:
-    ng_app.storage.user["uid"] = user["id"]
-    ng_app.storage.user["sv"] = user.get("session_version", 0)
+    lang = ng_app.storage.user.get("lang")
+    ng_app.storage.user.clear()  # never carry state from an anonymous (or someone else's) session into the new one
+    now = core().clock.now()
+    ng_app.storage.user.update(uid=user["id"], sv=user.get("session_version", 0), at=now, seen=now)
+    if lang:
+        ng_app.storage.user["lang"] = lang
 
 
 def logout() -> None:
@@ -116,7 +142,7 @@ def guard_admin(fn):
     @functools.wraps(fn)
     async def wrapper(*a, **kw):
         u = current_user()
-        if not u or u["role"] != "admin":
+        if not u or u["role"] != "admin" or not core().agents.admin_2fa_ok(u):
             ui.notify("Administrators only", type="negative")
             return None
         return await guard(fn)(*a, **kw)
@@ -152,6 +178,10 @@ def require_admin() -> dict | None:
     if u and u["role"] != "admin":
         flash("Administrators only", "negative")
         ui.navigate.to("/")
+        return None
+    if u and not core().agents.admin_2fa_ok(u):
+        flash("Set up two-factor authentication (Profile) to use the admin console", "warning")
+        ui.navigate.to("/profile")
         return None
     return u
 

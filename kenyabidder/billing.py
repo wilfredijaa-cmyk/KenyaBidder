@@ -242,7 +242,7 @@ class BillingService:
     # ------------------------------------------------------------------ orders
 
     def get_order(self, order_id: str) -> dict | None:
-        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))
+        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))  # nosec B608
         return _row(r) if r else None
 
     def owned_order(self, user_id: str, order_id: str) -> dict:
@@ -254,7 +254,7 @@ class BillingService:
         return o
 
     def paid_plan_orders(self, since_ms: int) -> list[dict]:
-        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE status='PAID' AND updated_at>=? AND data LIKE ?", (since_ms, '%"plan"%'))
+        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE status='PAID' AND updated_at>=? AND data LIKE ?", (since_ms, '%"plan"%'))  # nosec B608
         return [_row(r) for r in rows]
 
     def list_orders(self, *, user_id: str | None = None, status: str | None = None, limit: int = 100) -> list[dict]:
@@ -263,7 +263,7 @@ class BillingService:
             where.append("user_id=?"); args.append(user_id)
         if status:
             where.append("status=?"); args.append(status)
-        sql = f"SELECT {ORDER_COLS} FROM orders" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"
+        sql = f"SELECT {ORDER_COLS} FROM orders" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"  # nosec B608
         return [_row(r) for r in self.sql.query(sql, (*args, limit))]
 
     def _insert_order(self, user: dict, pack: dict, provider: str, phone: str | None, status: str = "PENDING") -> dict:
@@ -283,7 +283,7 @@ class BillingService:
         """Compare-and-swap on the order status; True if this call performed the transition."""
         sets = ", ".join(f"{k}=?" for k in fields)
         with self.db.tx() as c:
-            n = c.execute(f"UPDATE orders SET status=?, updated_at=?{', ' + sets if sets else ''} WHERE id=? AND status IN ({','.join('?' * len(frm))})",
+            n = c.execute(f"UPDATE orders SET status=?, updated_at=?{', ' + sets if sets else ''} WHERE id=? AND status IN ({','.join('?' * len(frm))})",  # nosec B608
                           (to, self.clock.now(), *fields.values(), order_id, *frm))
             if n == 1 and to in ("REJECTED", "FAILED", "CANCELLED", "EXPIRED", "REFUNDED"):
                 c.execute("DELETE FROM receipt_claims WHERE order_id=?", (order_id,))  # a dead order frees its M-Pesa code
@@ -374,7 +374,7 @@ class BillingService:
     def mark_paid(self, order_id: str, *, receipt: str | None, method: str) -> dict:
         """Atomically: PENDING/AWAITING_REVIEW → PAID **and** credit the tokens. Safe to call any number of times."""
         with self.db.tx() as c:
-            row = c.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))
+            row = c.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,))  # nosec B608
             if not row:
                 raise not_found("ORDER_NOT_FOUND", "order not found")
             o = _row(row)
@@ -437,7 +437,7 @@ class BillingService:
             checkout_id = payload["Body"]["stkCallback"]["CheckoutRequestID"]
         except (KeyError, TypeError):
             return ack
-        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE external_ref=? AND provider='mpesa'", (checkout_id,))
+        r = self.sql.query_one(f"SELECT {ORDER_COLS} FROM orders WHERE external_ref=? AND provider='mpesa'", (checkout_id,))  # nosec B608
         if r:
             try:
                 await self._confirm(_row(r), callback_receipt(payload))
@@ -473,7 +473,7 @@ class BillingService:
         if not self.mpesa:
             return 0
         now = self.clock.now()
-        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE provider='mpesa' AND external_ref IS NOT NULL AND status IN ('PENDING','EXPIRED') "
+        rows = self.sql.query(f"SELECT {ORDER_COLS} FROM orders WHERE provider='mpesa' AND external_ref IS NOT NULL AND status IN ('PENDING','EXPIRED') "  # nosec B608
                               "AND created_at<? AND created_at>? ORDER BY created_at LIMIT ?", (now - 20_000, now - 3 * 3600_000, limit))
         settled = 0
         for r in rows:

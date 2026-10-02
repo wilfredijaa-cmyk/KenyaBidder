@@ -12,6 +12,7 @@ import uuid
 
 from .errors import AppError, bad, forbidden, is_nonneg_int, is_pos_int, not_found
 from .events import Events
+from .moderation import check_prohibited
 
 FORWARD_TYPES = ["ENGLISH", "DUTCH", "FIRST_PRICE_SEALED", "SECOND_PRICE_SEALED"]
 REVERSE_TYPES = ["REVERSE_ENGLISH", "REVERSE_SEALED"]
@@ -36,6 +37,23 @@ def is_reverse(a: dict) -> bool:
 def _verified(store, agent: dict | None) -> bool:
     u = store.users.get((agent or {}).get("principal_user_id") or "")
     return bool(u and u.get("verified_business"))
+
+
+def same_party(store, agent_a: dict | None, agent_b: dict | None) -> bool:
+    """Shill-bid guard: two agents belong to the same party if they share an account — or the same phone number or email, which is what
+    someone running a second account to bid up their own listing would reuse."""
+    if not agent_a or not agent_b:
+        return False
+    ua, ub = store.users.get(agent_a["principal_user_id"]), store.users.get(agent_b["principal_user_id"])
+    if agent_a["principal_user_id"] == agent_b["principal_user_id"]:
+        return True
+    if not ua or not ub:
+        return False
+    for k, norm in (("phone", lambda v: v), ("email", lambda v: v.strip().lower())):
+        va, vb = ua.get(k), ub.get(k)
+        if va and vb and norm(va) == norm(vb):
+            return True
+    return False
 
 
 def poster_of(a: dict) -> str | None:
@@ -64,9 +82,14 @@ class AuctionEngine:
 
     # ---------- listings ----------
 
+    def _check_running(self) -> None:
+        if self.store.settings.get("platform_paused"):
+            raise AppError("PLATFORM_PAUSED", "the marketplace is temporarily paused by the administrators — please try again shortly", 503)
+
     def create_listing(self, *, seller_agent_id, product_spec, auction_type, duration_ms, reserve_price=0,
                        start_price=None, min_increment=1, starts_at=None, dutch=None, anti_snipe=None,
                        relist_of=None, relist_count=0, demo=False, verified_only=False) -> dict:
+        self._check_running()
         now = self.clock.now()
         seller = self.store.agents.get(seller_agent_id)
         if not seller or seller["agent_type"] != "SELLER":
@@ -75,6 +98,7 @@ class AuctionEngine:
             raise forbidden("AGENT_NOT_ACTIVE", "seller agent is not active")
 
         spec = self._clean_spec(product_spec)
+        check_prohibited(self.store, spec)
         if auction_type not in FORWARD_TYPES:
             raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(FORWARD_TYPES)} (use create_rfq for reverse auctions)")
         if auction_type not in seller["constraints"]["authorized_auction_types"]:
@@ -132,6 +156,7 @@ class AuctionEngine:
     def create_rfq(self, *, buyer_agent_id, product_spec, auction_type, duration_ms, max_price, min_decrement=1, starts_at=None,
                    anti_snipe=None, demo=False, verified_only=False) -> dict:
         """Post a request for quotes: suppliers (SELLER agents) bid the price DOWN from ``max_price``; the lowest valid bid wins."""
+        self._check_running()
         now = self.clock.now()
         buyer = self.store.agents.get(buyer_agent_id)
         if not buyer or buyer["agent_type"] != "BIDDER":
@@ -139,6 +164,7 @@ class AuctionEngine:
         if buyer["status"] != "ACTIVE":
             raise forbidden("AGENT_NOT_ACTIVE", "buyer agent is not active")
         spec = self._clean_spec(product_spec)
+        check_prohibited(self.store, spec)
         if auction_type not in REVERSE_TYPES:
             raise bad("INVALID_AUCTION_TYPE", f"auction_type must be one of {', '.join(REVERSE_TYPES)}")
         if not is_pos_int(max_price):
@@ -172,6 +198,33 @@ class AuctionEngine:
         self.store.auctions[a["auction_id"]] = a
         self.events.emit("auction.created", auction_id=a["auction_id"])
         return self.view(a, buyer_agent_id)
+
+    def repost(self, *, auction_id: str, agent_id: str, duration_ms: int | None = None, price_change_pct: float = 0) -> dict:
+        """Run a finished listing / RFQ again (the 'reorder' every B2B marketplace offers), optionally nudging the price.
+        For an RFQ the buyer's maximum moves by ``price_change_pct`` (e.g. +10 when nobody quoted); for a listing the reserve and start prices move."""
+        a = self._get(auction_id)
+        self._advance(a)
+        if poster_of(a) != agent_id:
+            raise forbidden("NOT_LISTING_OWNER", "only the agent that posted it can run it again")
+        if a["status"] not in ("SETTLED", "CANCELLED"):
+            raise AppError("STILL_RUNNING", "this one is still running", 409)
+        if not (-90 <= price_change_pct <= 500):
+            raise bad("INVALID_PRICE", "price change must be between -90% and +500%")
+        k = 1 + price_change_pct / 100
+        dur = duration_ms or (a["ends_at"] - a["starts_at"])
+        spec = dict(a["product_spec"])
+        if is_reverse(a):
+            return self.create_rfq(buyer_agent_id=agent_id, product_spec=spec, auction_type=a["auction_type"], duration_ms=dur, max_price=max(1, round(a["max_price"] * k)),
+                                   min_decrement=a["min_increment"], anti_snipe=a["anti_snipe"] if a["anti_snipe"]["window_ms"] else None, verified_only=a.get("verified_only", False))
+        kw = dict(seller_agent_id=agent_id, product_spec=spec, auction_type=a["auction_type"], duration_ms=dur, reserve_price=round(a["reserve_price"] * k),
+                  verified_only=a.get("verified_only", False))
+        if a["auction_type"] == "ENGLISH":
+            kw.update(start_price=min(kw["reserve_price"], round((a["start_price"] or 0) * k)), min_increment=a["min_increment"], anti_snipe=a["anti_snipe"] if a["anti_snipe"]["window_ms"] else None)
+        elif a["auction_type"] == "DUTCH":
+            d = a["dutch"]
+            floor = max(kw["reserve_price"], round(d["floor_price"] * k))
+            kw["dutch"] = {**d, "start_price": max(floor + 1, round(d["start_price"] * k)), "floor_price": floor}
+        return self.create_listing(**kw)
 
     @staticmethod
     def _clean_spec(spec) -> dict:
@@ -283,7 +336,7 @@ class AuctionEngine:
             "dutch": copy.deepcopy(a["dutch"]), "anti_snipe": dict(a["anti_snipe"]),
             "starts_at": a["starts_at"], "ends_at": a["ends_at"], "extended_until": a["extended_until"],
             "bid_count": len(a["bids"]), "created_at": a["created_at"], "relist_of": a["relist_of"], "demo": a.get("demo", False),
-            "verified_only": a.get("verified_only", False), "poster_verified": _verified(self.store, self.store.agents.get(poster_of(a) or "")),
+            "hidden": bool(a.get("hidden")), "verified_only": a.get("verified_only", False), "poster_verified": _verified(self.store, self.store.agents.get(poster_of(a) or "")),
             "reserve_met": (a["current_price"] >= a["reserve_price"] and bool(a["bids"]))
             if a["auction_type"] == "ENGLISH" else None,
             "result": copy.deepcopy(a["result"]) if a["result"] and (is_seller or a["status"] == "SETTLED") else None,
@@ -308,6 +361,8 @@ class AuctionEngine:
         for a in self.store.auctions.values():
             if a["status"] not in statuses:
                 continue
+            if a.get("hidden"):
+                continue  # under moderator review
             if direction and a.get("direction", "FORWARD") != direction:
                 continue  # bidder agents browse listings; supplier agents browse RFQs
             spec = a["product_spec"]
@@ -405,6 +460,8 @@ class AuctionEngine:
         def fail(code, message, **extra):
             return {"ok": False, "code": code, "message": message, **extra}
 
+        if self.store.settings.get("platform_paused"):
+            return fail("PLATFORM_PAUSED", "the marketplace is temporarily paused")
         a = self.store.auctions.get(auction_id)
         if not a:
             return fail("AUCTION_NOT_FOUND", "auction not found")
@@ -417,9 +474,11 @@ class AuctionEngine:
         self._advance(a)
         if not is_open(a):
             return fail("AUCTION_NOT_OPEN", f"auction is {a['status']}")
+        if a.get("hidden"):
+            return fail("AUCTION_UNDER_REVIEW", "this listing is under moderator review")
         poster = self.store.agents.get(poster_of(a))
-        if poster and poster["principal_user_id"] == agent["principal_user_id"]:
-            return fail("SELF_BID", "principal cannot bid on their own listing")
+        if same_party(self.store, poster, agent):
+            return fail("SELF_BID", "you cannot bid on your own listing (or one posted from an account sharing your phone or email)")
         if not is_pos_int(amount):
             return fail("INVALID_AMOUNT", "amount must be a positive integer")
         if not _verified(self.store, agent):  # trust gates: verified-only listings, and high-value deals for verified businesses

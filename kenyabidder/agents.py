@@ -22,7 +22,9 @@ import uuid
 
 from .engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from .errors import AppError, bad, conflict, forbidden, is_nonneg_int, not_found
+from . import totp
 from .phone import normalize_phone
+from .security import check_password
 
 TERMS_VERSION = "2026-09"
 STRATEGIES = ["baseline", "heuristic", "llm"]
@@ -71,14 +73,13 @@ class AgentService:
         name = (name or "").strip()
         if not re.fullmatch(r"[\w .'-]{2,40}", name):
             raise bad("INVALID_USER", "name must be 2-40 characters (letters, digits, space, . ' -)")
-        if len(password or "") < 8:
-            raise bad("INVALID_USER", "password must be at least 8 characters")
         if any(u["name"].lower() == name.lower() for u in self.store.users.values()):
             raise conflict("NAME_TAKEN", "that name is already registered")
         phone_n = self._phone(phone)
         email = (email or "").strip() or None
         if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
             raise bad("INVALID_EMAIL", "that email address does not look right")
+        check_password(password, name=name, phone=phone_n or "", email=email or "", policy=self.password_policy())
         first = not self.store.users
         u = {"id": str(uuid.uuid4()), "name": name, "password_hash": hash_password(password), "phone": phone_n, "email": email,
              "role": "admin" if first else (role if role in ("admin", "user") else "user"), "suspended": False,
@@ -182,13 +183,20 @@ class AgentService:
         u = self.store.users.get(user_id)
         if not u or not verify_password(old or "", u["password_hash"]):
             raise forbidden("WRONG_PASSWORD", "current password is incorrect")
-        if len(new or "") < 8:
-            raise bad("INVALID_USER", "password must be at least 8 characters")
         self.set_password(user_id, new)
+
+    def set_password_epoch(self, user_id: str) -> None:
+        """End every signed-in session of the account (e.g. 'sign out everywhere')."""
+        u = self._user(user_id)
+        u["session_version"] = u.get("session_version", 0) + 1
+
+    def password_policy(self) -> str:
+        return self.store.settings.get("password_policy") or os.environ.get("KENYABIDDER_PASSWORD_POLICY") or "strong"
 
     def set_password(self, user_id: str, new: str) -> None:
         """Store a new password, end every signed-in session of the account and clear its sign-in lockout."""
         u = self.store.users[user_id]
+        check_password(new, name=u["name"], phone=u.get("phone") or "", email=u.get("email") or "", policy=self.password_policy())
         u["password_hash"] = hash_password(new)
         u["session_version"] = u.get("session_version", 0) + 1
         self.store.settings.setdefault("login_failures", {}).pop(u["name"].lower(), None)
@@ -198,9 +206,80 @@ class AgentService:
         u = self.store.users.get(user_id)
         if not u:
             raise not_found("USER_NOT_FOUND", "user not found")
-        if len(new or "") < 8:
-            raise bad("INVALID_USER", "password must be at least 8 characters")
         self.set_password(user_id, new)
+
+    # ---------- two-factor authentication (TOTP + recovery codes) ----------
+
+    def admin_2fa_required(self) -> bool:
+        v = self.store.settings.get("require_admin_2fa")
+        return (os.environ.get("KENYABIDDER_ENV") == "production") if v is None else bool(v)
+
+    def totp_enabled(self, user: dict) -> bool:
+        return bool((user.get("totp") or {}).get("enabled"))
+
+    def admin_2fa_ok(self, user: dict) -> bool:
+        """May this admin use the console? (A required-but-missing second factor locks the admin pages until it is set up.)"""
+        return user["role"] != "admin" or not self.admin_2fa_required() or self.totp_enabled(user)
+
+    def totp_begin(self, user_id: str) -> dict:
+        u = self._user(user_id)
+        if self.totp_enabled(u):
+            raise conflict("ALREADY_ENABLED", "two-factor authentication is already on")
+        secret = totp.new_secret()
+        u["totp"] = {"secret": secret, "enabled": False, "last_counter": -1, "recovery": []}
+        return {"secret": secret, "uri": totp.provisioning_uri(secret, u["name"])}
+
+    def totp_confirm(self, user_id: str, code: str) -> list[str]:
+        """Finish enrolment with a code from the authenticator app; returns one-time recovery codes (shown once)."""
+        u = self._user(user_id)
+        t = u.get("totp")
+        if not t or t.get("enabled"):
+            raise bad("NOT_ENROLLING", "start two-factor setup first")
+        self._lockout_check(f"2fa:{u['id']}", self.clock.now())
+        c = totp.verify(t["secret"], code, self.clock.now() / 1000, t["last_counter"])
+        if c is None:
+            self._record_attempt(f"2fa:{u['id']}", self.clock.now())
+            raise forbidden("BAD_CODE", "that code is not right — check the time on your phone and try the next code")
+        codes = totp.new_recovery_codes()
+        t.update(enabled=True, last_counter=c, recovery=[totp.hash_code(x) for x in codes])
+        u["session_version"] = u.get("session_version", 0) + 1  # a new factor ends other sessions
+        return codes
+
+    def totp_check(self, user: dict, code: str) -> bool:
+        """Second step of sign-in: an authenticator code (single use) or a recovery code (single use). Lockout-protected."""
+        key, now = f"2fa:{user['id']}", self.clock.now()
+        self._lockout_check(key, now)
+        t = user.get("totp") or {}
+        ok = False
+        c = totp.verify(t.get("secret", ""), code, now / 1000, t.get("last_counter", -1)) if t.get("enabled") else None
+        if c is not None:
+            t["last_counter"], ok = c, True
+        else:
+            h = totp.hash_code(code or "")
+            for r in list(t.get("recovery", [])):
+                if hmac.compare_digest(r, h):
+                    t["recovery"].remove(r)
+                    ok = True
+                    break
+        if ok:
+            self.store.settings.setdefault("login_failures", {}).pop(key, None)
+        else:
+            self._record_attempt(key, now)
+        return ok
+
+    def totp_disable(self, user_id: str, password: str, code: str) -> None:
+        u = self._user(user_id)
+        if u["role"] == "admin" and self.admin_2fa_required():
+            raise forbidden("2FA_REQUIRED", "administrators must keep two-factor authentication on")
+        if not verify_password(password or "", u["password_hash"]) or not self.totp_check(u, code):
+            raise forbidden("BAD_CREDENTIALS", "password or code is not right")
+        u.pop("totp", None)
+
+    def _user(self, user_id: str) -> dict:
+        u = self.store.users.get(user_id)
+        if not u:
+            raise not_found("USER_NOT_FOUND", "user not found")
+        return u
 
     def set_suspended(self, user_id: str, suspended: bool, *, by: str | None = None) -> dict:
         """Suspend/reinstate an account. Suspension pauses every agent immediately (bid triggers cancelled)."""
@@ -417,6 +496,15 @@ class AgentService:
         if status is not None:
             self.set_status(agent_id, status)
         return agent
+
+    def pause_all(self, user_id: str) -> int:
+        """Kill switch: pause every agent of a user at once (cancels all live bid plans)."""
+        n = 0
+        for a in self.agents_for(user_id):
+            if a["status"] == "ACTIVE":
+                self.set_status(a["agent_id"], "PAUSED")
+                n += 1
+        return n
 
     def set_status(self, agent_id: str, status: str) -> dict:
         if status not in ("ACTIVE", "PAUSED", "SUSPENDED"):

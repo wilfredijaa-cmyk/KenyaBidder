@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 MAP_KEYS = ["users", "agents", "auctions", "matches", "triggers", "approvals", "idempotency", "breakers",
-            "llms", "mcps", "kbs", "packs", "verifications", "businesses", "disputes", "subscriptions"]
+            "llms", "mcps", "kbs", "packs", "verifications", "businesses", "disputes", "subscriptions", "reports"]
 LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log", "admin_log", "message_log"]
 
 

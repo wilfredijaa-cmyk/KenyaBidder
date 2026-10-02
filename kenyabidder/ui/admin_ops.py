@@ -115,6 +115,34 @@ def trust_panel() -> None:
                     body.refresh()
                 ui.button("Revoke", on_click=lambda u=u: _ask("Revoke badge", "Reason", lambda k, n, u=u: revoke(k, n, u), "Revoke")).props("outline dense no-caps color=negative")
 
+        ui.label(f"Listing reports ({len(c.moderation.open_reports())})").classes("text-lg font-medium mt-2")
+        for r in c.moderation.open_reports():
+            a = c.store.auctions.get(r["auction_id"], {"product_spec": {"title": "?"}, "status": "?"})
+            from ..moderation import REASONS
+            with ui.card().classes("w-full"):
+                ui.label(f"{a['product_spec']['title']} — {REASONS[r['reason']]}").classes("font-medium")
+                ui.label(f"{r['note'] or 'no details'} · {fmt_datetime(r['at'])} · listing is {a['status'].lower()}{' (hidden)' if a.get('hidden') else ''}").classes("text-xs opacity-70")
+
+                def act(kind, note, r=r):
+                    c.moderation.resolve(admin_user(), r["id"], kind, note)
+                    c.billing.log_admin(admin_user(), "moderation_" + kind.lower(), listing=a["product_spec"]["title"])
+                    body.refresh()
+                with ui.row().classes("gap-1"):
+                    ui.button("Take down", on_click=lambda r=r: _ask("Take down listing", "Reason (the poster sees it)", lambda k, n, r=r: act("TAKEDOWN", n, r), "Take down")).props("unelevated dense no-caps color=negative")
+                    ui.button("Ban poster", on_click=lambda r=r: _ask("Ban poster", "Reason", lambda k, n, r=r: act("BAN_POSTER", n, r), "Ban")).props("outline dense no-caps color=negative")
+                    ui.button("Dismiss", on_click=lambda r=r: act("DISMISS", "", r)).props("flat dense no-caps")
+        from ..moderation import prohibited_terms
+        with ui.card().classes("w-full"):
+            ui.label("Prohibited terms (one per line) — listings mentioning them are refused").classes("font-medium")
+            box = ui.textarea(value="\n".join(prohibited_terms(c.store))).props("rows=5").classes("w-full")
+
+            @guard_admin
+            def save_terms():
+                c.store.settings["prohibited_terms"] = [t.strip().lower() for t in box.value.splitlines() if t.strip()][:200]
+                c.billing.log_admin(admin_user(), "set_prohibited_terms", count=len(c.store.settings["prohibited_terms"]))
+                ui.notify("Saved", type="positive")
+            ui.button("Save list", icon="save", on_click=save_terms).props("unelevated color=primary no-caps")
+
         ui.label(f"Open disputes ({len(c.trust.open_disputes())})").classes("text-lg font-medium mt-2")
         ds = c.trust.open_disputes()
         if not ds:
@@ -158,6 +186,21 @@ def ops_panel() -> None:
             ui.label("✓ token ledger matches balances" if not problems else "✗ LEDGER PROBLEMS: " + "; ".join(problems[:3])).classes("text-sm " + ("" if not problems else "text-negative"))
             ui.label(f"Database: {r.db.dialect} · {'durable state on' if r.persistence else 'in-memory (data is lost on restart)'} · "
                      "scrape /metrics (set KENYABIDDER_METRICS_TOKEN) and alert on /readyz.").classes("text-xs opacity-70")
+        with ui.card().classes("w-full"):
+            paused = bool(c.store.settings.get("platform_paused"))
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Emergency stop").classes("font-medium")
+                badge("MARKETPLACE PAUSED" if paused else "running", "negative" if paused else "positive")
+            ui.label("Stops new listings and RFQs, all bidding and all agent planning, platform-wide, instantly. Use it during an incident or a fraud wave; "
+                     "auctions already running keep their clock and settle normally once resumed.").classes("text-xs opacity-70")
+
+            @guard_admin
+            def flip():
+                c.store.settings["platform_paused"] = not paused
+                c.billing.log_admin(admin_user(), "emergency_stop" if not paused else "resume_marketplace")
+                body.refresh()
+            ui.button("Resume the marketplace" if paused else "Pause the whole marketplace", icon="play_arrow" if paused else "emergency", on_click=flip).props(
+                "unelevated color=" + ("primary" if paused else "negative") + " no-caps")
         with ui.card().classes("w-full"):
             ui.label("Backups").classes("font-medium")
             if not r.backups:

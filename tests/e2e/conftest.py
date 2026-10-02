@@ -75,6 +75,7 @@ def base_url():
     # NiceGUI switches into a test mode when it sees PYTEST_* variables — the app under test must not inherit them
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST") and k != "KENYABIDDER_DATA"}
     env["PYTHONUNBUFFERED"] = "1"
+    env["KENYABIDDER_SIGNUPS_PER_IP_HOUR"] = "10000"  # every browser context here comes from 127.0.0.1
     env["KENYABIDDER_DEV_PAYMENTS"] = "1"  # instant test payments, so the browser can buy tokens without M-Pesa
     proc = subprocess.Popen([sys.executable, "-m", "kenyabidder", "--port", str(port), "--data", ""], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=Path(__file__).parents[2])

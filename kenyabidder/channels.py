@@ -187,6 +187,18 @@ async def handle_whatsapp_webhook(router: ChannelRouter, raw_body: bytes, signat
     messages = _whatsapp_messages(body)
     if not messages:
         return {"ok": True, "ignored": True}
+    seen = router.store.settings.setdefault("wa_seen", [])  # replay protection: Meta retries, and a captured valid request could be resent
+    fresh = []
+    for mid, sender, text in messages:
+        if mid and mid in seen:
+            continue
+        if mid:
+            seen.append(mid)
+        fresh.append((sender, text))
+    del seen[:-2000]
+    if not fresh:
+        return {"ok": True, "duplicate": True}
+    messages = fresh
     reply = None
     for sender, text in messages:  # Meta batches deliveries: EVERY message must run (an 'approve' may not be the first)
         out = await router.handle_inbound("WHATSAPP", str(sender), text)
@@ -196,18 +208,18 @@ async def handle_whatsapp_webhook(router: ChannelRouter, raw_body: bytes, signat
     return {"ok": True, "handled": len(messages), "reply": reply}
 
 
-def _whatsapp_messages(body) -> list[tuple[str, str]]:
-    """(sender, text) pairs from a Cloud API payload (all entries / changes / messages) or the simple {from, text} dev shape."""
-    out: list[tuple[str, str]] = []
+def _whatsapp_messages(body) -> list[tuple[str | None, str, str]]:
+    """(message id, sender, text) from a Cloud API payload (all entries / changes / messages) or the simple {from, text} dev shape."""
+    out: list[tuple[str | None, str, str]] = []
     try:
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
                 for m in change.get("value", {}).get("messages", []):
                     text = (m.get("text") or {}).get("body")
                     if m.get("from") and isinstance(text, str):
-                        out.append((m["from"], text))
+                        out.append((str(m["id"])[:128] if m.get("id") else None, m["from"], text))
     except (AttributeError, TypeError):
         return []
     if not out and isinstance(body, dict) and body.get("from") and isinstance(body.get("text"), str):
-        out.append((body["from"], body["text"]))
+        out.append((None, body["from"], body["text"]))
     return out

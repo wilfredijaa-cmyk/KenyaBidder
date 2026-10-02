@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 
 from nicegui import ui
 
 from ..engine import AUCTION_TYPES, FORWARD_TYPES, REVERSE_TYPES
 from ..i18n import Verbatim
 from .common import (active_agent, agent_picker, badge, core, current_user, empty, fmt_time, frame, guard, kes, left,
-                     lang_toggle, login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
+                     client_ip, lang_toggle, login_user, my_agents, pretty, require_user, rt, set_active_agent, theme)
 
 
 def register() -> None:
@@ -47,9 +48,15 @@ def login_page():
 
                     @guard
                     async def sign_in():
+                        ip = client_ip()
+                        core().throttle.check("login_fail_ip", ip, 25, 600, message="too many failed sign-in attempts from your network — try again in a few minutes")
                         u = await core().agents.authenticate_async(name.value, pw.value)
                         if not u:
+                            core().throttle.record("login_fail_ip", ip)
                             ui.notify("Wrong name or password", type="negative")
+                            return
+                        if core().agents.totp_enabled(u):
+                            two_factor_dialog(u, ip)
                             return
                         login_user(u)
                         ui.navigate.to("/")
@@ -60,7 +67,8 @@ def login_page():
                     if first:
                         ui.label("You are the first user, so this account becomes the administrator.").classes("text-sm text-primary")
                     n2 = ui.input("Name").classes("w-full")
-                    p2 = ui.input("Password (8+ characters)", password=True, password_toggle_button=True).classes("w-full")
+                    p2 = ui.input("Password (8+ characters)" if core().agents.password_policy() == "basic" else "Password (10+ characters)",
+                                  password=True, password_toggle_button=True).classes("w-full")
                     ph = ui.input("Phone (shown to a counterparty only after both confirm a match)").classes("w-full")
                     em = ui.input("Email").classes("w-full")
                     with ui.row().classes("items-center gap-1 no-wrap"):
@@ -69,10 +77,35 @@ def login_page():
 
                     @guard
                     def sign_up():
+                        core().throttle.hit("signup_ip", client_ip(), int(os.environ.get("KENYABIDDER_SIGNUPS_PER_IP_HOUR", 6)), 3600, message="too many accounts created from your network — try again later")
                         u = core().agents.create_user(name=n2.value, password=p2.value, phone=ph.value, email=em.value, accepted_terms=bool(agree.value))
                         login_user(u)
                         ui.navigate.to("/agents")
                     ui.button("Create account", on_click=sign_up).props("unelevated color=primary").classes("w-full")
+
+
+def two_factor_dialog(user: dict, ip: str) -> None:
+    """Second sign-in step for accounts with an authenticator app. The password alone never creates a session."""
+    with ui.dialog().props("persistent") as d, ui.card().classes("w-96 max-w-full"):
+        ui.label("Two-factor authentication").classes("text-lg font-medium")
+        ui.label("Enter the 6-digit code from your authenticator app (or a recovery code).").classes("text-sm opacity-70")
+        code = ui.input("Code").props("autofocus inputmode=numeric autocomplete=one-time-code").classes("w-full")
+
+        @guard
+        def verify():
+            core().throttle.check("login_fail_ip", ip, 25, 600)
+            if not core().agents.totp_check(user, code.value):
+                core().throttle.record("login_fail_ip", ip)
+                ui.notify("That code is not right", type="negative")
+                return
+            d.close()
+            login_user(user)
+            ui.navigate.to("/")
+        code.on("keydown.enter", verify)
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=d.close).props("flat no-caps")
+            ui.button("Verify", on_click=verify).props("unelevated color=primary no-caps")
+    d.open()
 
 
 def forgot_dialog(prefill: str = "") -> None:
@@ -86,6 +119,7 @@ def forgot_dialog(prefill: str = "") -> None:
 
         @guard
         async def send():
+            core().throttle.hit("reset_ip", client_ip(), 10, 3600)
             r = await core().verification.request_password_reset(nm.value)
             ui.notify(r["message"], type="info", multi_line=True)
 
@@ -330,13 +364,19 @@ def auction_page(auction_id: str):
                     won = r["winner_agent_id"] == agent["agent_id"]
                     ui.label((f"{'Awarded' if reverse else 'Sold'} at {kes(r['price'])}" + (" — you won! See Matches." if won else "")) if r["outcome"] == "SOLD"
                              else ("Closed without any quote." if reverse else "Closed without a sale.")).classes("font-medium text-primary")
+                    sv = core().insights.rfq_savings(core().store.auctions[auction_id])
+                    if sv and mine:
+                        ui.label(f"You saved {kes(sv['saved'])} ({sv['saved_pct']}%) against your maximum price.").classes("text-sm text-positive")
             with ui.card().classes("w-full"):
                 ui.label(f"{'Quotes' if reverse else 'Bids'} ({v['bid_count']})").classes("font-medium")
                 if v["bids"]:
+                    rows = core().insights.comparison(v, reverse)
                     ui.table(columns=[{"name": "who", "label": "Supplier" if reverse else "Bidder", "field": "who", "align": "left"}, {"name": "amount", "label": "Amount", "field": "amount", "align": "left"},
-                                      {"name": "at", "label": "Time", "field": "at", "align": "left"}],
-                             rows=[{"id": i, "who": "You" if b["agent_id"] == agent["agent_id"] else f"agent {b['agent_id'][:6]}", "amount": kes(b["amount"]), "at": fmt_time(b["at"])}
-                                   for i, b in enumerate(reversed(v["bids"]))], row_key="id").classes("w-full").props("dense flat")
+                                      {"name": "track", "label": "Track record", "field": "track", "align": "left"},
+                                      {"name": "at", "label": "Time", "field": "at", "align": "left"}, {"name": "after", "label": "Replied after", "field": "after", "align": "left"}],
+                             rows=[{"id": i, "who": "You" if r["agent_id"] == agent["agent_id"] else f"agent {r['agent_id'][:6]}", "amount": kes(r["amount"]), "track": r["summary"],
+                                    "at": fmt_time(r["at"]), "after": f"{r['after_s']}s" if r["after_s"] < 120 else f"{r['after_s'] // 60}m"} for i, r in enumerate(rows)],
+                             row_key="id").classes("w-full").props("dense flat")
                 else:
                     ui.label("Sealed bids stay hidden until the auction closes." if "SEALED" in v["auction_type"] and v["status"] != "SETTLED" else "No bids yet.").classes("opacity-70")
             return v
@@ -366,6 +406,29 @@ def auction_page(auction_id: str):
                 ui.button("Quote manually" if reverse else "Bid manually", on_click=manual).props("outline")
                 ui.label((f"Your agent's price floor is {kes(agent['constraints']['reserve_floor'])} — it will not quote below it." if reverse
                           else f"Your agent's hard ceiling is {kes(agent['constraints']['budget_ceiling'])}.") + " Manual bids still pass the guardrails.").classes("text-xs opacity-70")
+        if not mine and a["status"] in ("SCHEDULED", "ACTIVE", "EXTENDING"):
+            with ui.expansion("Report this listing", icon="flag").classes("w-full border rounded"):
+                from ..moderation import REASONS
+                f = {"reason": "FRAUD", "note": ""}
+                with ui.column().classes("p-2 gap-2 w-full"):
+                    ui.select(REASONS, value=f["reason"], label="Why?", on_change=lambda e: f.update(reason=e.value)).classes("w-72")
+                    ui.input("Details (optional)", on_change=lambda e: f.update(note=e.value)).classes("w-full")
+
+                    @guard
+                    def send_report():
+                        core().moderation.report(user["id"], auction_id, f["reason"], f["note"])
+                        ui.notify("Thanks — moderators will review it", type="positive")
+                    ui.button("Send report", icon="flag", on_click=send_report).props("outline no-caps color=negative")
+        if mine and a["status"] in ("SETTLED", "CANCELLED"):
+            with ui.row().classes("items-center gap-2"):
+                pct = ui.number("Price change (%)", value=0, min=-90, max=500, precision=0).classes("w-40")
+
+                @guard
+                def again():
+                    v2 = core().engine.repost(auction_id=auction_id, agent_id=agent["agent_id"], price_change_pct=float(pct.value or 0))
+                    ui.notify("Posted again", type="positive")
+                    ui.navigate.to(f"/auction/{v2['auction_id']}")
+                ui.button("Run it again", icon="replay", on_click=again).props("outline color=primary no-caps")
         if mine and not a["bids"] and a["status"] in ("ACTIVE", "SCHEDULED"):
             @guard
             def withdraw():

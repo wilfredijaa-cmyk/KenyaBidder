@@ -18,6 +18,7 @@ import time
 import uuid
 
 from .engine import effective_end, is_open, is_reverse
+from .insights import explain
 from .errors import bad, forbidden, not_found
 
 log = logging.getLogger("kenyabidder.execution")
@@ -219,6 +220,8 @@ class ExecutionEngine:
                 t["last_rejection"] = d["code"]
                 self.audit.record(agent_id=t["agent_id"], auction_id=a["auction_id"], proposed_action=proposal,
                                   guardrail_decision="REJECTED", rejection_reason=f"{d['code']}: {d['reason']}")
+                if d.get("permanent") and not d.get("notify"):
+                    self.notify(t["agent_id"], "blocked", f"Your agent stopped on \"{title}\": {explain(d['code'])}", auction_id=a["auction_id"])
                 if d.get("notify"):
                     self.notify(t["agent_id"], "anomaly",
                                 f"Autonomous bidding halted on \"{title}\": {d['reason']}. Please review and decide manually.",

@@ -69,6 +69,8 @@ async def main():
     port = free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
     env["KENYABIDDER_DEV_PAYMENTS"] = "1"
+    env["KENYABIDDER_SIGNUPS_PER_IP_HOUR"] = "10000"
+    env["KENYABIDDER_PASSWORD_POLICY"] = "basic"
     proc = subprocess.Popen([sys.executable, "-m", "kenyabidder", "--port", str(port), "--data", ""], env=env, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = f"http://127.0.0.1:{port}"
     for _ in range(80):

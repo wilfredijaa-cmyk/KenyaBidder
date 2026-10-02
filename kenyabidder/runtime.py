@@ -15,6 +15,7 @@ from .backups import BackupService
 from .db import open_database
 from .db.legacy import import_sqlite_wallet
 from .persist import StateLocked, StatePersistence
+from .secretbox import SecretBox
 from .store import Store
 
 log = logging.getLogger("kenyabidder.runtime")
@@ -33,7 +34,9 @@ class Runtime:
         self.persistence: StatePersistence | None = None
         self.backups: BackupService | None = None
         if url:  # durable mode: state lives in the database, guarded by a single-writer lease
-            self.persistence = StatePersistence(self.db)
+            key_dir = Path(data_file).parent if data_file else Path(os.environ.get("KENYABIDDER_DATA_DIR", "data"))
+            self.secretbox = SecretBox(key_file=os.environ.get("KENYABIDDER_KEY_FILE") or key_dir / ".encryption_key")
+            self.persistence = StatePersistence(self.db, box=self.secretbox)
             self.persistence.acquire_lease(force=os.environ.get("KENYABIDDER_FORCE_LEASE") == "1")
             legacy_dir = Path(data_file).parent if data_file else None
             if legacy_dir:

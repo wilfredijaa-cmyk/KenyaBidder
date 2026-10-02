@@ -9,6 +9,7 @@ from kenyabidder.clock import FakeClock
 from kenyabidder.store import Store
 
 _n = itertools.count(1)
+os.environ.setdefault("KENYABIDDER_PASSWORD_POLICY", "basic")  # fixtures use short passwords; policy tests switch to "strong" explicitly
 PG_URL = os.environ.get("KENYABIDDER_TEST_DATABASE_URL")
 _pg_dbs: list = []
 
@@ -40,7 +41,9 @@ class Env:
     def __init__(self, **kw):
         self.clock = FakeClock()
         kw.setdefault("database", fresh_database())
-        self.app = create_app(store=Store(), clock=self.clock, **kw)
+        store = kw.pop("store", None) or Store()
+        store.settings.setdefault("password_policy", "basic")  # the suite's fixtures use short, common passwords on purpose
+        self.app = create_app(store=store, clock=self.clock, **kw)
 
     def __getattr__(self, k):
         return getattr(self.app, k)

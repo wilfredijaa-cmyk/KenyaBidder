@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 from .db import Database, DatabaseError, IntegrityError
+from .secretbox import SecretBox, seal, seal_settings, unseal, unseal_settings
 from .store import LIST_KEYS, MAP_KEYS, Log, Store
 
 log = logging.getLogger("kenyabidder.persist")
@@ -45,9 +46,10 @@ def _digest(body: str) -> bytes:
 
 
 class StatePersistence:
-    def __init__(self, db: Database, clock=None):
+    def __init__(self, db: Database, clock=None, box: SecretBox | None = None):
         self.db = db
         self.clock = clock
+        self.box = box or SecretBox()  # no key given: ephemeral (nothing sensitive is then written in the clear either way)
         self.owner = uuid.uuid4().hex
         self._seen: dict[str, dict[str, bytes]] = {k: {} for k in MAP_KEYS}
         self._frozen: dict[str, set[str]] = {k: set() for k in MAP_KEYS}
@@ -97,7 +99,7 @@ class StatePersistence:
         for name in MAP_KEYS:
             target = getattr(s, name)
             for r in self.db.query("SELECT id, body FROM docs WHERE collection = ?", (name,)):
-                ent = json.loads(r["body"])
+                ent = unseal(self.box, name, json.loads(r["body"]))
                 target[r["id"]] = ent
                 self._seen[name][r["id"]] = _digest(_dump(ent))
                 self._maybe_freeze(name, r["id"], ent)
@@ -121,6 +123,7 @@ class StatePersistence:
         for key, attr in (("considered", "considered"), ("settings", "settings")):
             body = self._kv_get(key)
             if body is not None:
+                body = unseal_settings(self.box, body) if key == "settings" else body
                 setattr(s, attr, set(body) if key == "considered" else body)
                 self._kv_seen[key] = _digest(_dump(sorted(body) if key == "considered" else body))
         return s.upgrade()
@@ -170,10 +173,9 @@ class StatePersistence:
             for eid, ent in cur.items():
                 if eid in frozen:
                     continue
-                body = _dump(ent)
-                d = _digest(body)
+                d = _digest(_dump(ent))  # change detection on the PLAINTEXT (ciphertext differs on every encryption)
                 if seen.get(eid) != d:
-                    op["upserts"].append((eid, body))
+                    op["upserts"].append((eid, _dump(seal(self.box, name, ent))))
                     op["seen"][eid] = d
                 if self._freezable(name, ent, now):
                     op["freeze"].append(eid)
@@ -208,10 +210,9 @@ class StatePersistence:
         else:  # kv
             op["kv"] = {}
             for key, val in (("considered", sorted(store.considered)), ("settings", store.settings)):
-                body = _dump(val)
-                d = _digest(body)
+                d = _digest(_dump(val))
                 if self._kv_seen.get(key) != d:
-                    op["kv"][key] = (body, d)
+                    op["kv"][key] = (_dump(seal_settings(self.box, val) if key == "settings" else val), d)
         return op
 
     def apply(self, ops: list[dict]) -> None:

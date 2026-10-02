@@ -9,7 +9,7 @@ import asyncio
 import logging
 import uuid
 
-from .engine import effective_end, is_open, is_reverse, poster_of
+from .engine import effective_end, is_open, is_reverse, poster_of, same_party
 
 log = logging.getLogger("kenyabidder.orchestrator")
 
@@ -59,7 +59,12 @@ class Orchestrator:
         for agent in list(self.store.agents.values()):
             mem = agent["durable_memory"]
             a = self.store.auctions.get(auction_id)
-            if not a or agent["agent_type"] != ("SELLER" if is_reverse(a) else "BIDDER") or agent["status"] != "ACTIVE" or not mem.get("auto_bid") or not mem.get("watch"):
+            if not a or agent["agent_type"] != ("SELLER" if is_reverse(a) else "BIDDER") or agent["status"] != "ACTIVE" or not mem.get("watch"):
+                continue
+            if not mem.get("auto_bid"):  # not auto-bidding: still tell the owner when something matching their watch appears
+                if not self.prefilter(agent, a):
+                    self.notify(agent["agent_id"], "watch", f"New {'request for quotes' if is_reverse(a) else 'listing'} matching your watch: \"{a['product_spec']['title']}\" "
+                                f"({a['product_spec']['quantity']} × {a['product_spec']['category']}).", auction_id=auction_id)
                 continue
             try:
                 await self.consider(agent["agent_id"], auction_id)
@@ -99,14 +104,15 @@ class Orchestrator:
         """Deterministic pre-filter (§11.3). None if eligible, else a human-readable reason."""
         w = agent["durable_memory"].get("watch") if spec else None
         now = self.clock.now()
+        if self.store.settings.get("platform_paused"):
+            return "the marketplace is paused"
         if agent["status"] != "ACTIVE":
             return "agent not active"
         if not is_open(a) and a["status"] != "SCHEDULED":
             return f"auction is {a['status']}"
         if agent["agent_type"] != ("SELLER" if is_reverse(a) else "BIDDER"):
             return "this agent's type cannot take part in this kind of auction"
-        poster = self.store.agents.get(poster_of(a))
-        if poster and poster["principal_user_id"] == agent["principal_user_id"]:
+        if same_party(self.store, self.store.agents.get(poster_of(a)), agent):
             return "own listing"
         if a.get("verified_only") and not (self.store.users.get(agent["principal_user_id"]) or {}).get("verified_business"):
             return "this listing accepts verified businesses only"

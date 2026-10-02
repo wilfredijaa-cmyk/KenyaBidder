@@ -111,7 +111,7 @@ class WalletDB:
 
         def run(conn):
             if ref is not None:
-                row = conn.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind=? AND ref=?", (kind, ref))
+                row = conn.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind=? AND ref=?", (kind, ref))  # nosec B608
                 if row:
                     return {**_entry(row), "duplicate": True}
             return self._write(conn, user_id=user_id, llm_id=llm_id, kind=kind, delta=tokens, ref=ref, meta=meta)
@@ -127,7 +127,7 @@ class WalletDB:
             raise bad("INVALID_TOKENS", "delta must be a non-zero integer")
         with self.tx() as c:
             if ref is not None:
-                row = c.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind='ADJUST' AND ref=?", (ref,))
+                row = c.query_one(f"SELECT {LEDGER_COLS} FROM ledger WHERE kind='ADJUST' AND ref=?", (ref,))  # nosec B608
                 if row:
                     return {**_entry(row), "duplicate": True}
             return self._write(c, user_id=user_id, llm_id=llm_id, kind="ADJUST", delta=delta, ref=ref, meta=meta)
@@ -156,7 +156,7 @@ class WalletDB:
             if v is not None:
                 where.append(f"{col}=?")
                 args.append(v)
-        sql = f"SELECT {LEDGER_COLS} FROM ledger" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY seq DESC LIMIT ?"
+        sql = f"SELECT {LEDGER_COLS} FROM ledger" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY seq DESC LIMIT ?"  # nosec B608
         return [_entry(r) for r in self.database.query(sql, (*args, max(1, min(limit, 100_000))))]
 
     def used_since(self, agent_id: str, since_ms: int) -> int:

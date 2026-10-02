@@ -182,3 +182,40 @@ def test_considered_keys_of_closed_auctions_are_pruned():
     s.considered.update({"a1:open", "a1:done", "a2:gone"})
     s.prune(0)
     assert s.considered == {"a1:open"}
+
+
+def test_secrets_are_encrypted_at_rest_and_roundtrip(db):
+    from kenyabidder.secretbox import SecretBox
+    box = SecretBox(key=__import__('cryptography.fernet', fromlist=['Fernet']).Fernet.generate_key())
+    s = Store()
+    s.llms["l1"] = {"id": "l1", "name": "Claude", "api_key": "sk-ant-supersecret-123456"}
+    s.mcps["m1"] = {"id": "m1", "bearer_token": "tok-abcdef-123456", "env": {"K": "v-secret-value"}, "url": "http://x"}
+    s.users["u1"] = {"id": "u1", "name": "A", "totp": {"secret": "JBSWY3DPEHPK3PXP", "enabled": True}}
+    s.settings.update(otp_secret="otp-hmac-key", mcp_key="mcp-bearer-key", note="visible")
+    p = StatePersistence(db, box=box)
+    p.flush_all(s)
+    raw = " ".join(r["body"] for r in db.query("SELECT body FROM docs")) + " ".join(r["body"] for r in db.query("SELECT body FROM kv"))
+    for secret in ("sk-ant-supersecret-123456", "tok-abcdef-123456", "v-secret-value", "JBSWY3DPEHPK3PXP", "otp-hmac-key", "mcp-bearer-key"):
+        assert secret not in raw, secret
+    assert "visible" in raw and "enc:v1:" in raw
+    assert s.llms["l1"]["api_key"] == "sk-ant-supersecret-123456"  # the in-memory working copy is untouched
+    back = StatePersistence(db, box=box).load()
+    assert back.llms["l1"]["api_key"] == "sk-ant-supersecret-123456" and back.mcps["m1"]["env"] == {"K": "v-secret-value"}
+    assert back.users["u1"]["totp"]["secret"] == "JBSWY3DPEHPK3PXP" and back.settings["otp_secret"] == "otp-hmac-key"
+    assert p.collect(s, "llms")["upserts"] == []  # unchanged plaintext → nothing re-written despite non-deterministic ciphertext
+    from cryptography.fernet import Fernet
+    with pytest.raises(ValueError):
+        StatePersistence(db, box=SecretBox(key=Fernet.generate_key())).load()  # a different key cannot read them (and says so clearly)
+
+
+def test_legacy_plaintext_secrets_still_load_and_get_sealed_on_next_write(db):
+    from kenyabidder.secretbox import SecretBox
+    import json
+    db.execute("INSERT INTO docs(collection, id, body, updated_at) VALUES ('llms','l1',?,0)", (json.dumps({"id": "l1", "api_key": "plain-key-123456"}),))
+    box = SecretBox()
+    p = StatePersistence(db, box=box)
+    s = p.load()
+    assert s.llms["l1"]["api_key"] == "plain-key-123456"
+    s.llms["l1"]["name"] = "touched"
+    p.flush_all(s)
+    assert "plain-key-123456" not in db.query_one("SELECT body FROM docs")["body"]

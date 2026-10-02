@@ -24,8 +24,8 @@ def import_sqlite_wallet(db: Database, path: str) -> bool:
             for r in src.execute("SELECT entry_id, user_id, llm_id, agent_id, kind, tokens, used, balance_after, ref, at, meta FROM ledger ORDER BY seq"):
                 c.execute("INSERT INTO ledger(entry_id, user_id, llm_id, agent_id, kind, tokens, used, balance_after, ref, ts, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?)", tuple(r))
             cols = "id, user_id, pack_id, pack_name, llm_id, tokens, amount_kes, provider, status, phone, external_ref, receipt, note, created_at, updated_at, data"
-            for r in src.execute(f"SELECT {cols} FROM orders"):
-                c.execute(f"INSERT INTO orders({cols}) VALUES ({','.join('?' * 16)})", tuple(r))
+            for r in src.execute(f"SELECT {cols} FROM orders"):  # nosec B608
+                c.execute(f"INSERT INTO orders({cols}) VALUES ({','.join('?' * 16)})", tuple(r))  # nosec B608
                 if r["receipt"] and r["status"] in ("AWAITING_REVIEW", "PAID"):
                     c.execute("INSERT INTO receipt_claims(receipt, order_id) VALUES (?,?)", (r["receipt"], r["id"]))
     finally:

@@ -40,7 +40,8 @@ class MatchService:
         m = {"match_id": str(uuid.uuid4()), "auction_id": auction_id, "seller_agent_id": seller_id,
              "buyer_agent_id": buyer_id, "direction": "REVERSE" if reverse else "FORWARD",
              "agreed_terms": {"price": a["result"]["price"], "quantity": a["product_spec"]["quantity"],
-                              "title": a["product_spec"]["title"], "delivery_terms": None},
+                              "title": a["product_spec"]["title"], "delivery_terms": None,
+                              **({"max_price": a["max_price"], "saved": a["max_price"] - a["result"]["price"]} if reverse else {})},
              "status": "PROPOSED", "confirmations": {"seller_at": None, "buyer_at": None},
              "contact_reveal": None, "outcome_reports": [], "fault_agent_ids": [], "created_at": now, "updated_at": now}
         self.store.matches[m["match_id"]] = m

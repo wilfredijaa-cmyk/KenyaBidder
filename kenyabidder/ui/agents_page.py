@@ -33,6 +33,13 @@ def agents_page():
         with ui.row():
             ui.button("New buyer agent", icon="shopping_cart", on_click=create("BIDDER")).props("unelevated color=primary")
             ui.button("New seller agent", icon="storefront", on_click=create("SELLER")).props("outline color=primary")
+
+            @guard
+            def stop_all():
+                n = core().agents.pause_all(user["id"])
+                ui.notify(f"Paused {n} agent(s); their live plans were cancelled", type="warning")
+                ui.navigate.reload()
+            ui.button("Pause ALL my agents", icon="pan_tool", on_click=stop_all).props("outline color=negative no-caps")
         agents = core().agents.agents_for(user["id"])
         if not agents:
             empty("No agents yet.")

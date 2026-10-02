@@ -26,6 +26,9 @@ from .errors import AppError
 from .matches import MatchService
 from .messaging import Messenger
 from .privacy import PrivacyService
+from .insights import Insights
+from .moderation import ModerationService
+from .security import ClientIP, Throttle
 from .subscriptions import SubscriptionService
 from .trust import TrustService
 from .verification import VerificationService
@@ -44,6 +47,7 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
                llm_provider_factory=None, allow_stdio=None, report_grace_ms=None, database=":memory:", listing_limits=None, mpesa_client=None, dev_payments=None) -> SimpleNamespace:
     store = store or Store()
     clock = clock or SystemClock()
+    throttle = Throttle(clock)
     events = Events()
     messenger = Messenger(store, clock, sms, email)
     router = ChannelRouter(store, clock, whatsapp or WhatsAppAdapter(store, clock), messenger)
@@ -87,6 +91,9 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
 
     app.billing = BillingService(store, clock, wallet, llms, meter, notify, mpesa_client, dev_payments, on_credit)
     app.agents.on_identity_change = app.billing.grant_signup_tokens
+    app.throttle, app.client_ip = throttle, ClientIP()
+    app.insights = Insights(store, clock)
+    app.moderation = ModerationService(store, clock, notify, app.agents)
     app.trust = TrustService(store, clock, matches, notify)
     app.subscriptions = SubscriptionService(store, clock, notify)
     app.privacy = PrivacyService(store, clock, wallet, app.billing, app.agents)

@@ -17,6 +17,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from ..errors import bad, conflict, not_found
+from ..security import check_outbound_url
 
 BUILTIN_ID = "builtin"
 ROLES = ["BIDDER", "SELLER"]
@@ -56,6 +57,8 @@ class McpManager:
             raise bad("INVALID_MCP", "transport must be http or stdio")
         if transport == "http" and not url.startswith(("http://", "https://")):
             raise bad("INVALID_MCP", "url (http/https) is required for HTTP MCP servers")
+        if transport == "http":
+            check_outbound_url(url.strip(), "url")
         if transport == "stdio":
             if not self.allow_stdio:
                 raise bad("STDIO_DISABLED", "stdio MCP servers run local commands and are disabled — start the app with KENYABIDDER_ALLOW_STDIO=1 to enable")

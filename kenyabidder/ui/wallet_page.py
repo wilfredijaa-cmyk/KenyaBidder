@@ -260,6 +260,66 @@ def data_card(user: dict) -> None:
                 ui.button("Delete my account permanently", icon="delete_forever", on_click=delete).props("unelevated color=negative no-caps")
 
 
+def security_card(user: dict) -> None:
+    """Two-factor authentication (authenticator app) and 'sign out everywhere'."""
+    import segno
+    c = core()
+    state: dict = {"seed": None, "codes": None}
+
+    @ui.refreshable
+    def card():
+        u = c.store.users[user["id"]]
+        enabled = c.agents.totp_enabled(u)
+        with ui.card().classes("w-full max-w-xl"):
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Two-factor authentication").classes("font-medium")
+                badge("on" if enabled else "off", "positive" if enabled else "warning")
+            if u["role"] == "admin" and c.agents.admin_2fa_required() and not enabled:
+                ui.label("Required for administrators: set it up to use the admin console.").classes("text-sm text-negative")
+            ui.label("Sign-in needs a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password…) as well as your password.").classes("text-xs opacity-70")
+            if state["codes"]:
+                ui.label("Save these recovery codes somewhere safe — each works once if you lose your phone. They are shown only now.").classes("text-sm text-amber-700")
+                ui.label("   ".join(state["codes"])).classes("font-mono text-sm")
+                ui.button("I saved them", on_click=lambda: (state.update(codes=None), card.refresh())).props("outline no-caps dense")
+                return
+            if not enabled and state["seed"]:
+                ui.html(f'<img src="{segno.make(state["seed"]["uri"]).svg_data_uri(scale=4)}" width="180" height="180" alt="2FA QR code">')
+                ui.label(f"Or enter this key manually: {state['seed']['secret']}").classes("font-mono text-xs")
+                code = ui.input("6-digit code from the app").classes("w-48")
+
+                @guard
+                def confirm():
+                    state["codes"] = c.agents.totp_confirm(user["id"], code.value)
+                    state["seed"] = None
+                    login_user(c.store.users[user["id"]])  # enrolling ends other sessions; keep this one
+                    card.refresh()
+                ui.button("Turn on", icon="verified_user", on_click=confirm).props("unelevated color=primary no-caps")
+            elif not enabled:
+                @guard
+                def begin():
+                    state["seed"] = c.agents.totp_begin(user["id"])
+                    card.refresh()
+                ui.button("Set up", icon="qr_code", on_click=begin).props("unelevated color=primary no-caps")
+            else:
+                pw = ui.input("Password", password=True).classes("w-48")
+                cd = ui.input("Current code").classes("w-40")
+
+                @guard
+                def off():
+                    c.agents.totp_disable(user["id"], pw.value, cd.value)
+                    card.refresh()
+                ui.button("Turn off", on_click=off).props("outline no-caps dense")
+            ui.separator()
+
+            @guard
+            def everywhere():
+                c.agents.set_password_epoch(user["id"])
+                login_user(c.store.users[user["id"]])
+                ui.notify("Every other session was signed out", type="positive")
+            ui.button("Sign out everywhere else", icon="devices", on_click=everywhere).props("flat no-caps dense")
+    card()
+
+
 def business_card(user: dict) -> None:
     """Apply for the verified-business badge; an administrator checks the registration out-of-band (iTax / BRS / eCitizen)."""
     from ..trust import KINDS
@@ -357,6 +417,7 @@ def profile_page():
                         ui.button("Confirm", on_click=confirm_it).props("unelevated dense no-caps color=primary")
         verify_card()
         business_card(user)
+        security_card(user)
         with ui.card().classes("w-full max-w-xl"):
             ui.label("Change password").classes("font-medium")
             old = ui.input("Current password", password=True, password_toggle_button=True).classes("w-full")

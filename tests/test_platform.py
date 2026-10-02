@@ -433,3 +433,16 @@ async def test_changing_the_phone_cuts_the_old_numbers_control_of_the_agent(env)
     env.agents.set_phone(ua["id"], "0722 111 222")
     assert (await env.router.handle_inbound("WHATSAPP", "254711000888", "pause"))["agent_id"] is None  # the old number no longer commands the agent
     assert a["status"] == "ACTIVE" and a["channel_identity_map"] == [] and a["durable_memory"]["preferred_channel"] == "WEB"
+
+
+async def test_whatsapp_replays_are_ignored_by_message_id(env):
+    import json
+    from kenyabidder.channels import handle_whatsapp_webhook
+    _, b = env.bidder(ceiling=50_000, phone="+254711000321")
+    env.link_whatsapp(b, "254711000321")
+    body = json.dumps({"entry": [{"changes": [{"value": {"messages": [{"id": "wamid.ABC", "from": "254711000321", "text": {"body": "ceiling 60000"}}]}}]}]}).encode()
+    first = await handle_whatsapp_webhook(env.router, body, None, secret="", allow_unsigned=True)
+    assert first["handled"] == 1 and b["constraints"]["budget_ceiling"] == 60_000
+    b["constraints"]["budget_ceiling"] = 1_000  # someone changes it back…
+    again = await handle_whatsapp_webhook(env.router, body, None, secret="", allow_unsigned=True)  # …and the captured request is replayed
+    assert again.get("duplicate") and b["constraints"]["budget_ceiling"] == 1_000
