@@ -8,7 +8,8 @@ from kenyabidder.store import Store
 
 @pytest.fixture
 def db(tmp_path):
-    d = open_database(f"duckdb://{tmp_path}/s.duckdb")
+    from conftest import PG_URL, fresh_database
+    d = fresh_database() if PG_URL else open_database(f"duckdb://{tmp_path}/s.duckdb")
     yield d
     d.close()
 

@@ -1,4 +1,6 @@
 import itertools
+import os
+import uuid
 
 import pytest
 
@@ -7,11 +9,37 @@ from kenyabidder.clock import FakeClock
 from kenyabidder.store import Store
 
 _n = itertools.count(1)
+PG_URL = os.environ.get("KENYABIDDER_TEST_DATABASE_URL")
+_pg_dbs: list = []
+
+
+def fresh_database():
+    """In-memory DuckDB, or — when KENYABIDDER_TEST_DATABASE_URL is set — a throw-away schema on that PostgreSQL server."""
+    from kenyabidder.db import open_database
+    if not PG_URL:
+        return open_database(":memory:")
+    db = open_database(PG_URL, schema="t" + uuid.uuid4().hex[:12])
+    _pg_dbs.append(db)
+    return db
+
+
+@pytest.fixture(autouse=True)
+def _release_pg_schemas():
+    """Each test's PostgreSQL schema is dropped and its connection closed afterwards (the server has a connection limit)."""
+    yield
+    while _pg_dbs:
+        db = _pg_dbs.pop()
+        try:
+            db.drop_schema()
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class Env:
     def __init__(self, **kw):
         self.clock = FakeClock()
+        kw.setdefault("database", fresh_database())
         self.app = create_app(store=Store(), clock=self.clock, **kw)
 
     def __getattr__(self, k):

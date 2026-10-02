@@ -87,13 +87,13 @@ def test_the_only_administrator_cannot_delete_themselves(env):
 
 
 def test_deleted_users_notifications_do_not_come_back_from_the_database(env):
-    from kenyabidder.db import open_database
+    from conftest import fresh_database
     from kenyabidder.persist import StatePersistence
     us, seller, ub, buyer, m = deal(env)
     env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
     env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
     assert any(n["agent_id"] == buyer["agent_id"] for n in env.store.notifications)
-    db = open_database(":memory:")
+    db = fresh_database()
     p = StatePersistence(db)
     p.flush_all(env.store)  # the notifications were durable before the deletion…
     env.privacy.delete_account(ub["id"], "password123")
@@ -159,13 +159,13 @@ def test_deletion_takes_down_unbid_listings_and_is_blocked_while_leading_an_auct
 
 def test_erasure_reaches_old_frozen_matches_in_the_database(env):
     """Matches older than the dispute window are frozen (never re-written) — deleting an account must still scrub them."""
-    from kenyabidder.db import open_database
+    from conftest import fresh_database
     from kenyabidder.persist import StatePersistence
     us, seller, ub, buyer, m = deal(env)
     env.matches.report_outcome(m["match_id"], seller["agent_id"], "COMPLETED")
     env.matches.report_outcome(m["match_id"], buyer["agent_id"], "COMPLETED")
     env.clock.advance(45 * 24 * 3600_000)
-    db = open_database(":memory:")
+    db = fresh_database()
     p = StatePersistence(db, env.clock)
     p.flush_all(env.store)
     assert m["match_id"] in p._frozen["matches"]

@@ -7,16 +7,13 @@ from kenyabidder.db import DatabaseError, IntegrityError, open_database
 from kenyabidder.db.postgres_backend import translate
 
 
-def backends(tmp_path):
-    yield "duckdb", lambda: open_database(f"duckdb://{tmp_path}/t.duckdb")
-    url = os.environ.get("KENYABIDDER_TEST_DATABASE_URL")
-    if url:
-        yield "postgres", lambda: open_database(url)
-
-
 @pytest.fixture(params=["duckdb"] + (["postgres"] if os.environ.get("KENYABIDDER_TEST_DATABASE_URL") else []))
 def db(request, tmp_path):
-    d = open_database(f"duckdb://{tmp_path}/t.duckdb") if request.param == "duckdb" else open_database(os.environ["KENYABIDDER_TEST_DATABASE_URL"])
+    if request.param == "duckdb":
+        d = open_database(f"duckdb://{tmp_path}/t.duckdb")
+    else:
+        from conftest import fresh_database
+        d = fresh_database()
     yield d
     d.close()
 

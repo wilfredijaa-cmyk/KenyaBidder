@@ -5,7 +5,7 @@ from .base import Database, DatabaseError, IntegrityError, Tx  # noqa: F401
 from .schema import migrate  # noqa: F401
 
 
-def open_database(url: str | None = None) -> Database:
+def open_database(url: str | None = None, *, schema: str | None = None) -> Database:
     """``:memory:`` | ``duckdb:///relative-or-absolute/file.duckdb`` | ``postgresql://user:pw@host/db``."""
     url = url or ":memory:"
     if url == ":memory:" or url == "duckdb://:memory:":
@@ -16,7 +16,7 @@ def open_database(url: str | None = None) -> Database:
         db = DuckDatabase(url[len("duckdb://"):])
     elif url.startswith(("postgresql://", "postgres://")):
         from .postgres_backend import PostgresDatabase
-        db = PostgresDatabase(url)
+        db = PostgresDatabase(url, schema=schema)
     else:
         raise DatabaseError(f"unsupported database URL {url!r} (use duckdb:///path.duckdb or postgresql://…)")
     migrate(db)

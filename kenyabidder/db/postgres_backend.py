@@ -1,8 +1,7 @@
 """PostgreSQL backend (``pip install "psycopg[binary]"``).
 
-NOTE: written against psycopg 3's documented API and the portable SQL subset, but **not exercised in this repository's
-test-suite** (no Postgres server here). Run the whole test-suite with ``KENYABIDDER_TEST_DATABASE_URL`` pointing at a
-scratch database before relying on it: ``tests/test_db.py::test_backend_contract`` runs against whatever that URL is.
+Run the whole test-suite against a server with ``KENYABIDDER_TEST_DATABASE_URL=postgresql://…`` (every test gets its own
+throw-away schema). CI does this against a PostgreSQL service container.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ def translate(sql: str) -> str:
 class PostgresDatabase(Database):
     dialect = "postgres"
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, schema: str | None = None):
         super().__init__()
         if psycopg is None:
             raise DatabaseError('PostgreSQL support needs `pip install "psycopg[binary]"`')
@@ -34,6 +33,17 @@ class PostgresDatabase(Database):
             self._conn = psycopg.connect(url, autocommit=True, row_factory=dict_row)
         except psycopg.Error as e:
             raise DatabaseError(f"cannot connect to PostgreSQL: {e}") from e
+        if schema:  # isolate everything in one schema (tests; multi-tenant hosting)
+            if not schema.replace("_", "").isalnum():
+                raise DatabaseError("invalid schema name")
+            self._conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            self._conn.execute(f'SET search_path TO "{schema}"')
+        self.schema = schema
+
+    def drop_schema(self) -> None:
+        if self.schema:
+            with self._lock:
+                self._conn.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
 
     @staticmethod
     def _wrap(e: Exception) -> Exception:
