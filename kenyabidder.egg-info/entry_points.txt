@@ -1,0 +1,2 @@
+[console_scripts]
+kenyabidder = kenyabidder.__main__:main
