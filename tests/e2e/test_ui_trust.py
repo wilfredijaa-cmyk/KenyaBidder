@@ -96,7 +96,7 @@ async def test_delete_account_from_profile(make_session):
     user = await make_session("Leaver")
     await user.goto("/profile")
     await user.p.get_by_text("Delete my account").first.click()
-    await user.p.get_by_label("Your password").fill("password123")
+    await user.p.get_by_label("Your password").last.fill("password123")
     await user.p.get_by_role("button", name="Delete my account permanently").click()
     await user.p.wait_for_url("**/login")
     await user.p.get_by_label("Name").last.fill(user.name)

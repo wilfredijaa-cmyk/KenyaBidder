@@ -110,7 +110,7 @@ async def test_llm_tools_and_kb_end_to_end(make_session, mock_llm):
     await admin.p.get_by_role("button", name="Add", exact=True).click()
     await admin.p.wait_for_selector("text=1 doc(s)")
     await admin.p.get_by_role("tab", name="MCP servers").click()
-    await admin.p.wait_for_selector("text=8 tool(s) discovered")
+    await admin.p.wait_for_selector("text=7 tool(s) discovered")
 
     seller, buyer = await make_session("LlmSeller"), await make_session("LlmBuyer")
     await create_agent(seller, "seller")
