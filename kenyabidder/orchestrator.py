@@ -171,6 +171,17 @@ class Orchestrator:
         if why:
             return {"status": "FILTERED", "reason": why}
         self.store.considered.add(key)
+        try:
+            return await self._plan(agent, a, auction_id, key, manual)
+        except Exception:
+            # The pair is marked considered BEFORE the strategy runs so two events cannot plan twice. If anything then fails
+            # (a provider blow-up, a database hiccup, a trigger refused by a race), release it: a transient error must not
+            # retire this auction for this agent for good — nobody would ever look at it again.
+            self.store.considered.discard(key)
+            raise
+
+    async def _plan(self, agent: dict, a: dict, auction_id: str, key: str, manual: bool) -> dict:
+        agent_id = agent["agent_id"]
         one_off = agent["durable_memory"].setdefault("one_off_authorizations", [])
         if manual and auction_id not in one_off:
             one_off.append(auction_id)  # an explicit user request authorizes this one auction

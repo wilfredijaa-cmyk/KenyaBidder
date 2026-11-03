@@ -101,6 +101,9 @@ def current_user() -> dict | None:
     st = ng_app.storage.user
     uid = st.get("uid")
     u = core().store.users.get(uid) if uid else None
+    if uid and not u:
+        st.clear()  # the account was deleted: drop the stale cookie instead of re-checking it on every page load
+        return None
     if u:
         now = core().clock.now()
         idle = ADMIN_IDLE_MS if u["role"] == "admin" else SESSION_IDLE_MS

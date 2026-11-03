@@ -101,6 +101,8 @@ def _check_public_url(url: str) -> None:
 class KnowledgeBaseService:
     def __init__(self, store, clock):
         self.store, self.clock = store, clock
+        self._tok_cache: dict[str, list[tuple[int, Counter]]] = {}  # doc id -> per-chunk term counts (documents are immutable once added)
+        self._corpus_cache: dict[tuple, tuple] = {}        # searchable set -> its BM25 statistics
 
     # ---------- KBs ----------
 
@@ -213,36 +215,60 @@ class KnowledgeBaseService:
         if doc_id not in kb["docs"]:
             raise not_found("DOC_NOT_FOUND", "document not found")
         del kb["docs"][doc_id]
+        self._tok_cache.pop(doc_id, None)
 
     # ---------- retrieval (BM25) ----------
+
+    def _doc_tokens(self, doc: dict) -> list[tuple[int, Counter]]:
+        """(length, term counts) per chunk, computed once per document instead of once per search (a document never changes after it is added)."""
+        hit = self._tok_cache.get(doc["id"])
+        if hit is None:
+            hit = self._tok_cache[doc["id"]] = [(len(t), Counter(t)) for t in (tokenize(ch) for ch in doc["chunks"])]
+        return hit
+
+    def _corpus(self, kb_ids: list[str] | None) -> tuple[list, int, float, Counter]:
+        """Chunks plus the BM25 statistics for one searchable set.
+
+        Re-tokenising and re-counting every document on every search put the whole knowledge base on the event loop for each
+        agent decision; the corpus only changes when a document is added or removed, so key the cache on exactly that."""
+        kbs = [kb for kb in self.store.kbs.values() if kb["enabled"] and (kb_ids is None or kb["id"] in kb_ids)]
+        key = tuple(sorted((kb["id"], tuple(sorted(kb["docs"]))) for kb in kbs))
+        hit = self._corpus_cache.get(key)
+        if hit is not None:
+            return hit
+        entries = []
+        for kb in kbs:
+            for doc in kb["docs"].values():
+                stats = self._doc_tokens(doc)
+                for i, ch in enumerate(doc["chunks"]):
+                    length, tf = stats[i]
+                    entries.append((kb, doc, i, ch, length, tf))
+        df: Counter = Counter()
+        for e in entries:
+            df.update(e[5].keys())
+        n = len(entries)
+        avg = (sum(e[4] for e in entries) / n) if n else 1.0
+        if len(self._corpus_cache) > 8:  # one entry per distinct agent assignment; bounded, not a leak
+            self._corpus_cache.clear()
+        self._corpus_cache[key] = out = (entries, n, avg or 1.0, df)
+        return out
 
     def search(self, query: str, kb_ids: list[str] | None = None, k: int = 4) -> list[dict]:
         q = tokenize(query)
         if not q:
             return []
-        entries = []
-        for kb in self.store.kbs.values():
-            if not kb["enabled"] or (kb_ids is not None and kb["id"] not in kb_ids):
-                continue
-            for doc in kb["docs"].values():
-                for i, ch in enumerate(doc["chunks"]):
-                    entries.append((kb, doc, i, ch, tokenize(ch)))
+        entries, n, avg, df = self._corpus(kb_ids)
         if not entries:
             return []
-        n = len(entries)
-        avg = sum(len(e[4]) for e in entries) / n or 1
-        df: Counter = Counter()
-        for e in entries:
-            df.update(set(e[4]))
-        scored = []
-        for kb, doc, i, ch, toks in entries:
-            tf = Counter(toks)
+        scored, terms = [], set(q)
+        for kb, doc, i, ch, length, tf in entries:
             s = 0.0
-            for term in set(q):
-                if term not in tf:
+            for term in terms:
+                hits = tf.get(term)
+                if not hits:
                     continue
                 idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
-                s += idf * tf[term] * 2.2 / (tf[term] + 1.2 * (0.25 + 0.75 * len(toks) / avg))
+                s += idf * hits * 2.2 / (hits + 1.2 * (0.25 + 0.75 * length / avg))
             if s > 0:
                 scored.append((s, kb, doc, i, ch))
         scored.sort(key=lambda x: -x[0])

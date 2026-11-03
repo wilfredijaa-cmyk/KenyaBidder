@@ -7,8 +7,7 @@ def recompute_reputation(store, agent_id: str) -> dict | None:
     agent = store.agents.get(agent_id)
     if not agent:
         return None
-    final = sorted((m for m in store.matches.values()
-                    if agent_id in (m["seller_agent_id"], m["buyer_agent_id"]) and m["status"] in FINAL),
+    final = sorted((m for m in store.match_index.for_agent(agent_id) if m["status"] in FINAL),
                    key=lambda m: -m["updated_at"])
     completed = sum(1 for m in final if m["status"] == "COMPLETED")
     w_sum = w_fail = 0.0

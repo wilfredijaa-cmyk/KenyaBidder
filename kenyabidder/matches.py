@@ -44,7 +44,7 @@ class MatchService:
                               **({"max_price": a["max_price"], "saved": a["max_price"] - a["result"]["price"]} if reverse else {})},
              "status": "PROPOSED", "confirmations": {"seller_at": None, "buyer_at": None},
              "contact_reveal": None, "outcome_reports": [], "fault_agent_ids": [], "created_at": now, "updated_at": now}
-        self.store.matches[m["match_id"]] = m
+        self.store.match_index.insert(m)
         text = f"Match created for \"{a['product_spec']['title']}\" at {a['result']['price']} KES. Confirm to exchange contact details"
         self.notify(m["seller_agent_id"], "match", f"{text} — you are the seller" + (" (your quote won the RFQ)." if reverse else "."), match_id=m["match_id"])
         self.notify(m["buyer_agent_id"], "match", f"{text} — " + ("the lowest supplier quote on your RFQ." if reverse else "you won this auction."), match_id=m["match_id"])
@@ -66,8 +66,7 @@ class MatchService:
         return m
 
     def matches_for(self, agent_id: str) -> list[dict]:
-        return sorted((m for m in self.store.matches.values() if agent_id in (m["seller_agent_id"], m["buyer_agent_id"])),
-                      key=lambda m: -m["created_at"])
+        return sorted(self.store.match_index.for_agent(agent_id), key=lambda m: -m["created_at"])
 
     def confirm_match(self, match_id: str, agent_id: str) -> dict:
         m = self.get_match(match_id, agent_id)
@@ -170,7 +169,8 @@ class MatchService:
     def expire_stale(self) -> None:
         """Unconfirmed matches lapse into NO_RESPONSE, attributed to whoever did not confirm."""
         now = self.clock.now()
-        for m in self.store.matches.values():
+        live = self.store.match_index.active()  # O(open matches), not O(every deal ever introduced): this runs on every tick
+        for m in live:
             if m["status"] not in PRE_REVEAL or now - m["created_at"] < self.match_ttl_ms:
                 continue
             m["status"] = "NO_RESPONSE"
@@ -179,6 +179,6 @@ class MatchService:
             m["updated_at"] = now
             recompute_reputation(self.store, m["seller_agent_id"])
             recompute_reputation(self.store, m["buyer_agent_id"])
-        for m in self.store.matches.values():  # a lone report stands once the other side has been silent for the whole grace period
+        for m in live:  # a lone report stands once the other side has been silent for the whole grace period
             if m["status"] == "CONTACT_REVEALED" and len(m["outcome_reports"]) == 1 and now - m.get("first_report_at", now) >= self.report_grace_ms:
                 self._finalize(m, force=True)

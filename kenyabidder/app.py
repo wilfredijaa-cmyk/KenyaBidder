@@ -170,6 +170,17 @@ def create_app(*, store=None, clock=None, guardrail_config=None, transport=None,
 
     app.manual_bid = manual_bid
     app.tick = tick
-    app.kpis = lambda: compute_kpis(store)
+
+    _kpis: dict = {}
+
+    def kpis(max_age_ms: int = 2_000) -> dict:
+        """Platform KPIs, shared between viewers: the figures are a whole-marketplace scan, and the health page refreshes
+        every few seconds for everyone watching — they must be computed once per window, not once per watcher."""
+        now = clock.now()
+        if not _kpis or now - _kpis["at"] >= max_age_ms:  # max_age_ms=0 always recomputes
+            _kpis.update(at=now, data=compute_kpis(store))
+        return _kpis["data"]
+
+    app.kpis = kpis
     app.recompute_reputation = lambda agent_id: recompute_reputation(store, agent_id)
     return app

@@ -3,18 +3,20 @@ name = "kenyabidder"
 version = "0.2.0"
 description = "AI auction matchmaking: seller/bidder agents, deterministic execution harness, FastMCP tool servers, NiceGUI console"
 requires-python = ">=3.11"
+# Upper bounds on purpose: `anthropic>=1.0` silently resolved to 2.x, which changed its auth header and vendored its own
+# HTTP layer. A deployment must get the library the code was tested against, not whatever was released since.
 dependencies = [
-  "nicegui>=3.0",
-  "fastmcp>=4.0",
-  "anthropic>=1.0",
-  "httpx>=0.27",
-  "duckdb>=1.1",
+  "nicegui>=3.0,<4",
+  "fastmcp>=4.0,<5",
+  "anthropic>=2.4,<3",
+  "httpx>=0.27,<0.29",
+  "duckdb>=1.1,<2",
   "cryptography>=42",
-  "segno>=1.6",
+  "segno>=1.6,<2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2"]
 postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]

@@ -8,6 +8,69 @@ MAP_KEYS = ["users", "agents", "auctions", "matches", "triggers", "approvals", "
 LIST_KEYS = ["audit", "notifications", "market_history", "outbox", "reveal_log", "admin_log", "message_log"]
 
 
+ACTIVE_MATCH = ("PROPOSED", "SELLER_CONFIRMED", "BUYER_CONFIRMED", "CONTACT_REVEALED")
+
+
+class MatchIndex:
+    """Matches by party, and the ones still in flight.
+
+    The marketplace keeps every deal it ever introduced, so the per-tick maintenance pass and every reputation recompute must
+    cost what is *open*, not what is history. Rebuilt whenever the collection's size changes (a load, a demo purge)."""
+
+    def __init__(self, store: "Store"):
+        self.store = store
+        self._n = -1
+        self._by_agent: dict[str, list[str]] = {}
+        self._active: set[str] = set()
+
+    def _add(self, mid: str, m: dict) -> None:
+        for aid in (m["seller_agent_id"], m["buyer_agent_id"]):
+            self._by_agent.setdefault(aid, []).append(mid)
+        if m["status"] in ACTIVE_MATCH:
+            self._active.add(mid)
+
+    def _sync(self) -> None:
+        if self._n == len(self.store.matches):
+            return
+        self._by_agent, self._active = {}, set()
+        for mid, m in self.store.matches.items():
+            self._add(mid, m)
+        self._n = len(self.store.matches)
+
+    def insert(self, m: dict) -> None:
+        """Store a new match and index it (sync first, so the size check stays meaningful)."""
+        self._sync()
+        self.store.matches[m["match_id"]] = m
+        self._add(m["match_id"], m)
+        self._n = len(self.store.matches)
+
+    def for_agent(self, agent_id: str) -> list[dict]:
+        self._sync()
+        ids = self._by_agent.get(agent_id)
+        if not ids:
+            return []
+        out = []
+        for mid in list(ids):
+            m = self.store.matches.get(mid)
+            if m is None:
+                ids.remove(mid)  # deleted (demo purge)
+            else:
+                out.append(m)
+        return out
+
+    def active(self) -> list[dict]:
+        """Matches that can still change by themselves: awaiting confirmation, or revealed and awaiting outcome reports."""
+        self._sync()
+        out = []
+        for mid in list(self._active):
+            m = self.store.matches.get(mid)
+            if m is None or m["status"] not in ACTIVE_MATCH:
+                self._active.discard(mid)
+            else:
+                out.append(m)
+        return out
+
+
 class Log(list):
     """Append-mostly list. Front trims are counted (``dropped``) so the durable copy stays aligned; every OTHER kind of change
     (in-place edit far from the end, insert, sort, slice assignment…) bumps ``version`` so the durable copy is rewritten wholesale."""
@@ -82,6 +145,13 @@ class Store:
         self.considered: set[str] = set()
         self.rate_windows: dict[str, list[int]] = {}
         self.settings: dict = {}
+        self._match_index: MatchIndex | None = None
+
+    @property
+    def match_index(self) -> MatchIndex:
+        if self._match_index is None:
+            self._match_index = MatchIndex(self)
+        return self._match_index
 
     def snapshot(self) -> dict:
         out = {k: getattr(self, k) for k in MAP_KEYS + LIST_KEYS}

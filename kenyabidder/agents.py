@@ -229,7 +229,9 @@ class AgentService:
         check_password(new, name=u["name"], phone=u.get("phone") or "", email=u.get("email") or "", policy=self.password_policy())
         u["password_hash"] = hash_password(new)
         u["session_version"] = u.get("session_version", 0) + 1
-        self.store.settings.setdefault("login_failures", {}).pop(u["name"].lower(), None)
+        book = self.store.settings.setdefault("login_failures", {})
+        book.pop(u["name"].lower(), None)
+        book.pop(f"pw:{user_id}", None)  # the re-auth counter is about the old password
 
     def admin_reset_password(self, user_id: str, new: str) -> None:
         """Support tool: there is no email reset flow yet, so an admin sets a temporary password and tells the user."""

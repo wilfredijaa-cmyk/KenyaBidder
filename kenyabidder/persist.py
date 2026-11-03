@@ -27,7 +27,10 @@ log = logging.getLogger("kenyabidder.persist")
 TERMINAL_AUCTION = {"SETTLED", "CANCELLED"}
 FINAL_MATCH = {"COMPLETED", "FELL_THROUGH", "NO_RESPONSE", "DISPUTED"}
 DEAD_TRIGGER = {"DONE", "CANCELLED", "EXHAUSTED"}
-MATCH_FREEZE_MS = 40 * 24 * 3600_000  # past the 30-day dispute window nothing can touch a finished match any more
+# A finished match changes again only through a dispute ruling or a data erasure, and both call ``Store.thaw`` — so it can be
+# frozen as soon as it settles instead of being re-serialised on every flush for the whole dispute window. The short grace is
+# belt-and-braces for an edit landing in the same second.
+MATCH_FREEZE_MS = 60_000
 SLOW = {"kbs": 30_000, "llms": 10_000, "mcps": 10_000, "packs": 10_000}  # big or rarely-edited documents: look at them every N ms, not every flush
 TAIL_RECHECK = 100  # newest log rows are re-compared on every flush (a few histories flip a flag after being appended)
 LEASE_MS = 30_000

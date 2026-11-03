@@ -114,7 +114,8 @@ async def test_anthropic_provider_wire_format():
     seen = {}
 
     def handler(req):
-        seen["body"], seen["key"] = json.loads(req.content), req.headers["x-api-key"]
+        seen["body"] = json.loads(req.content)
+        seen["key"] = req.headers.get("x-api-key") or req.headers.get("authorization", "").removeprefix("Bearer ")  # 1.x vs 2.x of the SDK
         return httpx2.Response(200, json={"id": "m", "type": "message", "role": "assistant", "model": "x", "stop_reason": "tool_use",
                                          "content": [{"type": "text", "text": "thinking"}, {"type": "tool_use", "id": "tu1", "name": "propose_action", "input": {"action": "SKIP", "reasoning": "r"}}],
                                          "usage": {"input_tokens": 7, "output_tokens": 2}})

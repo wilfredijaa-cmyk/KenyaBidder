@@ -145,6 +145,7 @@ class TrustService:
              "ruling": None, "resolved_at": None}
         self.store.disputes[d["id"]] = d
         m["dispute_open"], m["dispute_id"] = True, d["id"]
+        self.store.thaw("matches", match_id)  # the match may be finished (and frozen): this edit must reach the database
         self.notify(other, "dispute", f"A dispute was opened on \"{m['agreed_terms']['title']}\" ({CATEGORIES[category]}). "
                     f"Please give your side within {RESPONSE_WINDOW_MS // (24 * 3600_000)} days.", match_id=match_id, dispute_id=d["id"])
         return d
@@ -175,6 +176,7 @@ class TrustService:
         d.update(status="WITHDRAWN", resolved_at=self.clock.now())
         m = self.store.matches[d["match_id"]]
         m["dispute_open"] = False
+        self.store.thaw("matches", m["match_id"])
         if m["status"] == "CONTACT_REVEALED" and m["outcome_reports"]:
             self.matches._finalize(m)  # outcome reports made while the dispute was open can now take effect
         self.notify(d["against"], "dispute", "The dispute against you was withdrawn.", dispute_id=d["id"])
@@ -196,6 +198,7 @@ class TrustService:
         m["fault_agent_ids"] = {"COMPLETED": [], "NO_FAULT": [], "SELLER_AT_FAULT": [seller], "BUYER_AT_FAULT": [buyer], "BOTH_AT_FAULT": sorted([seller, buyer])}[outcome]
         m["status"] = {"COMPLETED": "COMPLETED", "NO_FAULT": "DISPUTED"}.get(outcome, "FELL_THROUGH")
         m["dispute_open"], m["updated_at"] = False, now
+        self.store.thaw("matches", m["match_id"])  # a ruling can land long after the match was frozen
         d.update(status="RULED", resolved_at=now, ruling={"outcome": outcome, "note": note[:1000], "by": admin["name"], "at": now})
         recompute_reputation(self.store, seller)
         recompute_reputation(self.store, buyer)
