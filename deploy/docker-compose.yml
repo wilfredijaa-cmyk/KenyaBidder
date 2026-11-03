@@ -1,0 +1,76 @@
+# Production-shaped stack: Caddy (automatic HTTPS) -> KenyaBidder -> PostgreSQL.
+#   cp deploy/.env.example deploy/.env   # fill in every value
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kenyabidder
+      POSTGRES_USER: kenyabidder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kenyabidder -d kenyabidder"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  app:
+    build: {context: .., dockerfile: Dockerfile}
+    restart: unless-stopped
+    depends_on: {db: {condition: service_healthy}}
+    env_file: .env
+    environment:
+      KENYABIDDER_DATABASE_URL: postgresql://kenyabidder:${POSTGRES_PASSWORD}@db:5432/kenyabidder
+      KENYABIDDER_TRUSTED_PROXIES: "172.16.0.0/12,10.0.0.0/8"
+      HOST: 0.0.0.0
+    volumes: [appdata:/data]          # encryption key file, NiceGUI sessions, backups dir
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  # Nightly verified dumps with retention. The app's own backup service only covers DuckDB, so a PostgreSQL stack would
+  # otherwise run with no backups at all. Each dump is listed back to prove it is readable; a dump that fails is renamed
+  # to .bad and kept for inspection rather than deleted.
+  # The volume still has to be copied off this host — a dump beside the database is not a backup. And keep
+  # KENYABIDDER_ENCRYPTION_KEY somewhere else: without it the API keys and 2FA seeds inside a restored dump stay unreadable.
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on: {db: {condition: service_healthy}}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      KEEP_DAYS: ${KENYABIDDER_BACKUP_KEEP:-14}
+    volumes: [dbbackups:/backups]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        while true; do
+          f="/backups/kenyabidder-$$(date -u +%Y%m%d-%H%M%S).dump"
+          if pg_dump -h db -U kenyabidder -d kenyabidder -Fc -f "$$f" && pg_restore --list "$$f" > /dev/null; then
+            echo "backup ok: $$f"
+            find /backups -name 'kenyabidder-*.dump' -mtime "+$${KEEP_DAYS}" -delete
+          else
+            echo "BACKUP FAILED OR UNREADABLE: $$f (kept as .bad for inspection; retention skipped)"
+            mv -f "$$f" "$$f.bad" || true
+          fi
+          sleep 86400
+        done
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    ports: ["80:80", "443:443"]
+    environment: {KENYABIDDER_DOMAIN: "${KENYABIDDER_DOMAIN:?set KENYABIDDER_DOMAIN}"}
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy_data:/data, caddy_config:/config]
+    networks: [internal]
+
+volumes: {pgdata: {}, appdata: {}, dbbackups: {}, caddy_data: {}, caddy_config: {}}
+networks: {internal: {}}

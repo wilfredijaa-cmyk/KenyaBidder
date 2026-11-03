@@ -1,0 +1,13 @@
+.git
+.github
+data
+tests
+docs
+*.md
+!README.md
+__pycache__
+*.pyc
+.venv
+.nicegui
+kenyabidder-full-spec*
+kenyabidder.egg-info

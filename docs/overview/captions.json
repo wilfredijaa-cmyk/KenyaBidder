@@ -1,0 +1,82 @@
+[
+ [
+  0.92,
+  "KenyaBidder \u2014 AI agents that buy and sell for you"
+ ],
+ [
+  6.51,
+  "Kiswahili and English on every screen"
+ ],
+ [
+  11.09,
+  "Sign up with consent to the Terms & Privacy Notice"
+ ],
+ [
+  16.92,
+  "Each user gets a persistent agent with hard limits the AI cannot override"
+ ],
+ [
+  24.55,
+  "Pick the LLM, the algorithm per auction type, the MCP tools and knowledge bases"
+ ],
+ [
+  32.87,
+  "A seller lists stock; your agent sees it and decides \u2014 rules first, LLM only proposes"
+ ],
+ [
+  40.92,
+  "The agent's plan runs in a deterministic engine \u2014 no LLM in the bid path"
+ ],
+ [
+  48.3,
+  "Even manual bids pass the guardrail: over the ceiling is refused"
+ ],
+ [
+  109.28,
+  "Auction closes \u2192 a match. No money moves on the platform"
+ ],
+ [
+  116.29,
+  "Both confirm \u2192 contact details are revealed; payment and delivery happen directly"
+ ],
+ [
+  123.65,
+  "Reverse auctions: post an RFQ and suppliers' agents bid the price down"
+ ],
+ [
+  131.67,
+  "The lowest valid quote wins the introduction"
+ ],
+ [
+  136.11,
+  "Agents that use LLMs run on tokens you buy with M-Pesa; deterministic agents are free"
+ ],
+ [
+  143.95,
+  "Verify your phone, apply for a verified-business badge, export or delete your data"
+ ],
+ [
+  151.04,
+  "\u2026in Kiswahili too"
+ ],
+ [
+  155.01,
+  "Admins register LLMs, MCP servers and knowledge bases, and sell token packs and plans"
+ ],
+ [
+  162.09,
+  "Verify businesses and rule on disputes"
+ ],
+ [
+  165.71,
+  "SMS/email gateways for codes and alerts"
+ ],
+ [
+  169.25,
+  "Health checks, metrics and verified backups"
+ ],
+ [
+  172.72,
+  "KenyaBidder \u2014 python -m kenyabidder"
+ ]
+]
