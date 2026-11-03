@@ -16,8 +16,13 @@ The first account registered becomes the administrator — register it immediate
 * Logs are JSON when `KENYABIDDER_LOG_JSON=1`; secrets/phones are redacted.
 
 ## Backups and restore
-* DuckDB: automatic verified backups (Admin → Health & backups) — copy them off the host. PostgreSQL: use `pg_dump`/managed snapshots (`pg_dump -Fc`), and keep `KENYABIDDER_ENCRYPTION_KEY` **separately** (without it encrypted keys in a restored DB are unreadable).
-* Restore (DuckDB, app stopped): `python -m kenyabidder restore data/backups/<file>`. Restore-test monthly.
+* DuckDB: automatic verified backups (Admin → Health & backups) — copy them off the host.
+* PostgreSQL (the compose stack): the `backup` service dumps nightly to the `dbbackups` volume, proves each dump readable with `pg_restore --list`, and keeps `KENYABIDDER_BACKUP_KEEP` days (default 14). A failed dump is kept as `.bad` and retention is skipped that night, so a broken backup run cannot quietly age out the last good copy. On a managed database use its snapshots instead and remove the service.
+* **Copy the dumps off the host.** A dump sitting beside the database is not a backup, and nothing in the stack moves it for you.
+* Either engine: keep `KENYABIDDER_ENCRYPTION_KEY` **separately** from the backups — without it the API keys and 2FA seeds in a restored database stay unreadable.
+* Restore (DuckDB, app stopped): `python -m kenyabidder restore data/backups/<file>`.
+* Restore (PostgreSQL, app stopped so the writer lease is free): `pg_restore -d kenyabidder -c /backups/<file>.dump`.
+* Restore-test monthly, into a scratch database, and sign in afterwards: that is the only way to find out that the encryption key was never copied.
 
 ## Incidents
 | Situation | Action |

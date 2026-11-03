@@ -33,6 +33,36 @@ services:
     security_opt: ["no-new-privileges:true"]
     networks: [internal]
 
+  # Nightly verified dumps with retention. The app's own backup service only covers DuckDB, so a PostgreSQL stack would
+  # otherwise run with no backups at all. Each dump is listed back to prove it is readable; a dump that fails is renamed
+  # to .bad and kept for inspection rather than deleted.
+  # The volume still has to be copied off this host — a dump beside the database is not a backup. And keep
+  # KENYABIDDER_ENCRYPTION_KEY somewhere else: without it the API keys and 2FA seeds inside a restored dump stay unreadable.
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on: {db: {condition: service_healthy}}
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      KEEP_DAYS: ${KENYABIDDER_BACKUP_KEEP:-14}
+    volumes: [dbbackups:/backups]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        while true; do
+          f="/backups/kenyabidder-$$(date -u +%Y%m%d-%H%M%S).dump"
+          if pg_dump -h db -U kenyabidder -d kenyabidder -Fc -f "$$f" && pg_restore --list "$$f" > /dev/null; then
+            echo "backup ok: $$f"
+            find /backups -name 'kenyabidder-*.dump' -mtime "+$${KEEP_DAYS}" -delete
+          else
+            echo "BACKUP FAILED OR UNREADABLE: $$f (kept as .bad for inspection; retention skipped)"
+            mv -f "$$f" "$$f.bad" || true
+          fi
+          sleep 86400
+        done
+    networks: [internal]
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -42,5 +72,5 @@ services:
     volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy_data:/data, caddy_config:/config]
     networks: [internal]
 
-volumes: {pgdata: {}, appdata: {}, caddy_data: {}, caddy_config: {}}
+volumes: {pgdata: {}, appdata: {}, dbbackups: {}, caddy_data: {}, caddy_config: {}}
 networks: {internal: {}}
